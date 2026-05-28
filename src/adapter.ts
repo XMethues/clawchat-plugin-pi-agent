@@ -42,6 +42,7 @@ export class ClawchatPiAdapter {
 
   async handleInboundMessage(message: ClawchatInboundMessage): Promise<void> {
     const text = renderInboundPrompt(message);
+    if (!text) return;
     this.activeReply = {
       chatId: message.chat_id,
       inboundMessageId: message.payload.message_id,
@@ -52,6 +53,16 @@ export class ClawchatPiAdapter {
     try {
       await this.session.prompt(text, { source: "extension" });
       await this.pendingEvents;
+    } catch (error: unknown) {
+      await this.send({
+        event: "message.failed",
+        chat_id: this.activeReply.chatId,
+        payload: {
+          message_id: this.activeReply.outboundMessageId,
+          reply_to_message_id: this.activeReply.inboundMessageId,
+          error: error instanceof Error ? error.message : String(error)
+        }
+      });
     } finally {
       this.activeReply = undefined;
     }
@@ -118,10 +129,13 @@ export class ClawchatPiAdapter {
 
 export function renderInboundPrompt(message: ClawchatInboundMessage): string {
   const senderName = message.sender.nick_name?.trim() || message.sender.id;
-  const text = message.payload.fragments
-    .filter((fragment) => fragment.type === "text")
+  const fragments = message.payload.fragments ?? message.payload.message?.body?.fragments ?? [];
+  const text = fragments
+    .filter((fragment) => fragment.type === "text" || fragment.kind === "text")
     .map((fragment) => fragment.text)
-    .join("");
+    .join("")
+    .trim();
+  if (!text) return "";
 
   return [`ClawChat ${message.chat_type} message from ${senderName}:`, text].join("\n");
 }

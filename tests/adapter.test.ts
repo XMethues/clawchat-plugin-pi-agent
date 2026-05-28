@@ -13,7 +13,9 @@ function inboundMessage(overrides: Partial<ClawchatInboundMessage> = {}): Clawch
     sender: { id: "user-1", type: "direct", nick_name: "Alice" },
     payload: {
       message_id: "message-1",
-      fragments: [{ type: "text", text: "hello pi" }]
+      message: {
+        body: { fragments: [{ kind: "text", text: "hello pi" }] }
+      }
     },
     ...overrides
   };
@@ -72,6 +74,70 @@ describe("ClawchatPiAdapter", () => {
       expect.objectContaining({
         event: "message.done",
         chat_id: "chat-1"
+      })
+    );
+  });
+
+  it("ignores inbound messages without renderable fragments", async () => {
+    const session: PiAgentSession = {
+      subscribe() {
+        return () => undefined;
+      },
+      prompt: vi.fn(async () => undefined)
+    };
+    const transport: ClawchatTransport = {
+      send: vi.fn(async () => undefined)
+    };
+
+    const adapter = new ClawchatPiAdapter({
+      session,
+      transport
+    });
+    await adapter.handleInboundMessage(
+      inboundMessage({
+        payload: {
+          message_id: "message-2",
+          message: {
+            body: {}
+          }
+        } as never
+      })
+    );
+
+    expect(session.prompt).not.toHaveBeenCalled();
+    expect(transport.send).not.toHaveBeenCalled();
+  });
+
+  it("keeps the adapter alive and sends message.failed when pi prompt fails", async () => {
+    const session: PiAgentSession = {
+      subscribe() {
+        return () => undefined;
+      },
+      prompt: vi.fn(async () => {
+        throw new Error("missing provider auth");
+      })
+    };
+    const transport: ClawchatTransport = {
+      send: vi.fn(async () => undefined)
+    };
+
+    const adapter = new ClawchatPiAdapter({
+      session,
+      transport,
+      idFactory: () => "outbound-1",
+      now: () => 123
+    });
+
+    await expect(adapter.handleInboundMessage(inboundMessage())).resolves.toBeUndefined();
+    expect(transport.send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "message.failed",
+        chat_id: "chat-1",
+        payload: expect.objectContaining({
+          message_id: "outbound-1",
+          reply_to_message_id: "message-1",
+          error: "missing provider auth"
+        })
       })
     );
   });

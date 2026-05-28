@@ -1,10 +1,9 @@
 # ClawChat Pi
 
-Pi SDK adapter for ClawChat Protocol v2.
+Pi package for ClawChat Protocol v2.
 
-This project embeds Pi with `@earendil-works/pi-coding-agent`, connects to
-ClawChat as a Protocol v2 client, and bridges ClawChat messages into Pi agent
-sessions.
+This project provides a Pi extension that connects Pi to ClawChat as a Protocol
+v2 client.
 
 ## Status
 
@@ -12,7 +11,7 @@ Initial adapter skeleton. The intended MVP is:
 
 - exchange ClawChat invite codes with `platform: "pi"`
 - connect to ClawChat Protocol v2 WebSocket
-- dispatch inbound ClawChat messages to a Pi SDK `AgentSession`
+- dispatch inbound ClawChat messages into the active Pi session
 - stream Pi assistant text back to ClawChat
 
 ## Commands
@@ -24,15 +23,15 @@ npm run typecheck
 npm run build
 ```
 
-## Connect
+## Pi Extension
 
-The adapter defaults to the same production ClawChat endpoints used by the
+The package declares a Pi extension at `./dist/src/extension.js`.
+
+The extension defaults to the same production ClawChat endpoints used by the
 OpenClaw and Hermes plugins:
 
 - REST: `https://app.clawling.com`
 - WebSocket: `wss://app.clawling.com/ws`
 
-```bash
-node dist/bin/clawchat-pi.js activate <invite-code>
-CLAWCHAT_TOKEN=<access-token-from-activation> node dist/bin/clawchat-pi.js start
-```
+Inside Pi, run `/clawchat-activate <invite-code>`. ClawChat credentials are
+stored in `~/.pi/agent/clawchat.json`.

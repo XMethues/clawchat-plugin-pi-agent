@@ -3,9 +3,10 @@
   "version": "0.1.0",
   "description": "Pi SDK adapter for ClawChat Protocol v2.",
   "type": "module",
-  "bin": {
-    "clawchat-pi": "./dist/bin/clawchat-pi.js"
-  },
+  "keywords": [
+    "pi-package",
+    "clawchat"
+  ],
   "files": [
     "dist",
     "README.md",
@@ -29,5 +30,10 @@
   "engines": {
     "node": ">=20"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./dist/src/extension.js"
+    ]
+  }
 }

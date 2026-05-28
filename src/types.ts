@@ -13,8 +13,10 @@ export interface ClawchatPeer {
 }
 
 export interface TextFragment {
-  type: "text";
+  kind?: "text";
+  type?: "text";
   text: string;
+  delta?: string;
 }
 
 export type ClawchatFragment = TextFragment;
@@ -29,7 +31,13 @@ export interface ClawchatInboundMessage {
   sender: ClawchatPeer;
   payload: {
     message_id: string;
-    fragments: ClawchatFragment[];
+    fragments?: ClawchatFragment[];
+    message?: {
+      body?: {
+        fragments?: ClawchatFragment[];
+      };
+      context?: Record<string, unknown>;
+    };
   };
 }
 
