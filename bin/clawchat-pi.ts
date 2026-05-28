@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 import { activateClawchat, ClawchatPiAdapter, ClawchatWebSocketClient, createPiSdkSession } from "../src/index.js";
+import { DEFAULT_BASE_URL, DEFAULT_WEBSOCKET_URL } from "../src/config.js";
 
 async function main(): Promise<void> {
   const [command, arg] = process.argv.slice(2);
 
   if (command === "activate") {
-    const baseUrl = process.env.CLAWCHAT_BASE_URL ?? "http://localhost:8081";
+    const baseUrl = process.env.CLAWCHAT_BASE_URL ?? DEFAULT_BASE_URL;
     const result = await activateClawchat({
       code: arg ?? "",
       baseUrl
@@ -31,7 +32,7 @@ async function main(): Promise<void> {
 
   let adapter: ClawchatPiAdapter | undefined;
   const client = new ClawchatWebSocketClient({
-    websocketUrl: process.env.CLAWCHAT_WS_URL ?? "ws://localhost:8080/ws",
+    websocketUrl: process.env.CLAWCHAT_WS_URL ?? DEFAULT_WEBSOCKET_URL,
     accessToken,
     deviceId: process.env.CLAWCHAT_DEVICE_ID ?? "clawchat-pi",
     onStatus: (message) => console.error(message),

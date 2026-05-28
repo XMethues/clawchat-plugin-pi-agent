@@ -40,4 +40,32 @@ describe("activateClawchat", () => {
       })
     );
   });
+
+  it("accepts the production response envelope", async () => {
+    const fetchFn = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          data: {
+            access_token: "token-2",
+            agent: {
+              user_id: "user-2",
+              owner_id: "owner-2"
+            }
+          },
+          msg: "ok"
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    });
+
+    const result = await activateClawchat({
+      code: "invite-2",
+      baseUrl: "https://app.clawling.com",
+      fetchFn
+    });
+
+    expect(result.accessToken).toBe("token-2");
+    expect(result.agent.userId).toBe("user-2");
+  });
 });

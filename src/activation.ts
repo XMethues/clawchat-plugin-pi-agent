@@ -17,6 +17,9 @@ export interface ActivationResult {
 }
 
 interface RawActivationResponse {
+  code?: unknown;
+  data?: unknown;
+  msg?: unknown;
   access_token?: unknown;
   refresh_token?: unknown;
   agent?: {
@@ -35,6 +38,20 @@ function requireTrimmedString(value: unknown, field: string): string {
 
 function optionalTrimmedString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
+
+function unwrapActivationResponse(raw: RawActivationResponse): RawActivationResponse {
+  if ("data" in raw || "code" in raw || "msg" in raw) {
+    if (raw.code !== 0 && raw.code !== "0") {
+      const message = typeof raw.msg === "string" && raw.msg.trim() ? raw.msg.trim() : "activation failed";
+      throw new Error(`ClawChat activation failed: ${message}`);
+    }
+    if (!raw.data || typeof raw.data !== "object") {
+      throw new Error("ClawChat activation response missing data");
+    }
+    return raw.data as RawActivationResponse;
+  }
+  return raw;
 }
 
 export async function activateClawchat(options: ActivateClawchatOptions): Promise<ActivationResult> {
@@ -62,7 +79,7 @@ export async function activateClawchat(options: ActivateClawchatOptions): Promis
     throw new Error(`ClawChat activation failed with HTTP ${response.status}`);
   }
 
-  const raw = (await response.json()) as RawActivationResponse;
+  const raw = unwrapActivationResponse((await response.json()) as RawActivationResponse);
   const agent = raw.agent ?? {};
   const result: ActivationResult = {
     accessToken: requireTrimmedString(raw.access_token, "access_token"),
