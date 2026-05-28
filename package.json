@@ -1,0 +1,33 @@
+{
+  "name": "@newbase-clawchat/clawchat-pi",
+  "version": "0.1.0",
+  "description": "Pi SDK adapter for ClawChat Protocol v2.",
+  "type": "module",
+  "bin": {
+    "clawchat-pi": "./dist/bin/clawchat-pi.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "docs"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.12",
+    "typescript": "^5.4.0",
+    "vitest": "^1.4.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
