@@ -210,7 +210,11 @@ class ClawchatPiExtensionBridge {
 export default createClawchatPiExtension();
 
 function setStatus(ctx: ExtensionContext, message: string | undefined): void {
-  ctx.ui.setStatus?.("clawchat", message);
+  try {
+    ctx.ui.setStatus?.("clawchat", message);
+  } catch {
+    // Pi can mark the session UI context stale while a websocket shutdown callback is still unwinding.
+  }
 }
 
 function errorMessage(error: unknown): string {

@@ -108,4 +108,42 @@ describe("clawchat pi extension", () => {
     expect(pi.api.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining("hello pi plugin"), undefined);
     expect(sent.map((message) => message.event)).toEqual(["message.created", "message.add", "message.done"]);
   });
+
+  it("does not throw when Pi marks the UI context stale while the websocket closes", async () => {
+    const pi = fakePi();
+    let onStatus: ((message: string) => void) | undefined;
+    const client = {
+      connect: vi.fn(async () => undefined),
+      close: vi.fn(() => {
+        onStatus?.("ClawChat WebSocket closed with code 1000");
+      }),
+      send: vi.fn(async () => undefined)
+    };
+
+    createClawchatPiExtension({
+      loadState: vi.fn(async () => ({
+        accessToken: "token-1",
+        baseUrl: "https://app.clawling.com",
+        websocketUrl: "wss://app.clawling.com/ws",
+        agent: { userId: "user-1", ownerId: "owner-1" }
+      })),
+      clientFactory: (options) => {
+        onStatus = options.onStatus;
+        return client;
+      }
+    })(pi.api as never);
+
+    const ctx = {
+      isIdle: () => true,
+      ui: {
+        setStatus: vi.fn(() => {
+          throw new Error("stale ctx");
+        }),
+        notify: vi.fn()
+      }
+    };
+
+    await expect(pi.handlers.get("session_start")!({}, ctx)).resolves.toBeUndefined();
+    expect(() => pi.handlers.get("session_shutdown")!({}, ctx)).not.toThrow();
+  });
 });
