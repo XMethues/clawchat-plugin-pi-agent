@@ -1,8 +1,16 @@
 {
   "name": "@newbase-clawchat/clawchat-pi",
   "version": "0.1.0",
-  "description": "Pi SDK adapter for ClawChat Protocol v2.",
+  "description": "ClawChat Protocol v2 extension and headless multi-session host for Pi.",
   "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
   "keywords": [
     "pi-package",
     "clawchat"
@@ -12,23 +20,27 @@
     "README.md",
     "docs"
   ],
+  "bin": {
+    "clawchat-pi": "./dist/src/bin.js"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-coding-agent": "^0.81.1",
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
+    "@types/node": "^22.19.0",
     "@types/ws": "^8.5.12",
     "typescript": "^5.4.0",
     "vitest": "^1.4.0"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "license": "MIT",
   "pi": {

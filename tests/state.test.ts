@@ -1,41 +1,42 @@
-import { mkdtemp, readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, mkdtemp, realpath, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { loadClawchatState, saveClawchatState } from "../src/state.js";
+import {
+  getClawchatStatePath,
+  loadClawchatState,
+  prepareClawchatState,
+  saveClawchatState
+} from "../src/state.js";
 
-describe("ClawChat Pi state", () => {
-  it("stores activation credentials in a Pi agent state file with owner-only permissions", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "clawchat-pi-state-"));
-    const path = join(dir, "clawchat.json");
+describe("ClawChat Extension profile state", () => {
+  it("shares the activated Host Profile and stable device with the CLI", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-state-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const options = { agentDir, profile: "work", workspace };
 
+    const prepared = await prepareClawchatState(options);
     await saveClawchatState(
       {
         baseUrl: "https://app.clawling.com",
-        websocketUrl: "wss://app.clawling.com/ws",
         accessToken: "token-1",
         refreshToken: "refresh-1",
-        agent: {
-          id: "agent-1",
-          userId: "user-1",
-          ownerId: "owner-1"
-        }
+        agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" }
       },
-      { path }
+      { ...options, websocketUrl: "wss://app.clawling.com/ws" }
     );
 
-    await expect(loadClawchatState({ path })).resolves.toMatchObject({
-      accessToken: "token-1",
+    await expect(loadClawchatState(options)).resolves.toEqual({
+      baseUrl: "https://app.clawling.com",
       websocketUrl: "wss://app.clawling.com/ws",
-      agent: { userId: "user-1" }
+      accessToken: "token-1",
+      refreshToken: "refresh-1",
+      agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" },
+      deviceId: prepared.deviceId,
+      workspace: await realpath(workspace),
+      output: { toolCallsDefault: "off", chatOverrides: {} }
     });
-    await expect(readFile(path, "utf8")).resolves.toContain("\"accessToken\"");
-    expect((await stat(path)).mode & 0o777).toBe(0o600);
-  });
-
-  it("returns null when the state file does not exist", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "clawchat-pi-state-"));
-
-    await expect(loadClawchatState({ path: join(dir, "missing.json") })).resolves.toBeNull();
+    expect((await stat(getClawchatStatePath(options))).mode & 0o777).toBe(0o600);
   });
 });

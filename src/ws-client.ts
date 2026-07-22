@@ -1,119 +1,85 @@
-import WebSocket from "ws";
+import { ClawChatGateway } from "./gateway.js";
+import { GatewayStore } from "./gateway-store.js";
+import { ClawchatInboundRouter } from "./inbound-router.js";
+import { ClawchatOutputProjector } from "./output-projector.js";
 import type { ClawchatInboundMessage, ClawchatOutboundMessage, ClawchatTransport } from "./types.js";
 
 export interface ClawchatWebSocketClientOptions {
   websocketUrl: string;
   accessToken: string;
-  deviceId?: string;
+  deviceId: string;
+  userId: string;
+  gatewayStorePath: string;
+  queueTurns?: boolean;
+  routeInbound?: boolean;
+  toolCallsDefault?: "on" | "off";
+  onToolOutputChanged?: (chatId: string) => Promise<void> | void;
   onInboundMessage: (message: ClawchatInboundMessage) => Promise<void>;
   onStatus?: (message: string) => void;
 }
 
-interface ProtocolEnvelope {
-  version: string;
-  event: string;
-  trace_id?: string;
-  emitted_at?: number;
-  payload?: Record<string, unknown>;
-}
-
 export class ClawchatWebSocketClient implements ClawchatTransport {
-  private readonly options: ClawchatWebSocketClientOptions;
-  private socket: WebSocket | undefined;
+  private readonly store: GatewayStore;
+  private readonly gateway: ClawChatGateway;
+  private closed = false;
 
   constructor(options: ClawchatWebSocketClientOptions) {
-    this.options = options;
+    this.store = GatewayStore.open(options.gatewayStorePath);
+    let gateway: ClawChatGateway;
+    const routeInbound = options.routeInbound
+      ? new ClawchatInboundRouter({
+          store: this.store,
+          agentUserId: options.userId,
+          toolCallsDefault: options.toolCallsDefault ?? "off",
+          reply: async (message, text) => {
+            const projector = new ClawchatOutputProjector({
+              transport: { send: async (outbound) => gateway.send(outbound) }
+            });
+            await projector.replyTo(message, text);
+          },
+          ...(options.onToolOutputChanged
+            ? { onToolOutputChanged: options.onToolOutputChanged }
+            : {})
+        })
+      : undefined;
+    gateway = new ClawChatGateway({
+      websocketUrl: options.websocketUrl,
+      accessToken: options.accessToken,
+      deviceId: options.deviceId,
+      userId: options.userId,
+      store: this.store,
+      onInboundMessage: options.onInboundMessage,
+      queueTurns: options.queueTurns ?? false,
+      ...(routeInbound
+        ? {
+            classifyInbound: (message) => routeInbound.classify(message),
+            onAcceptedControl: (message, decision) =>
+              routeInbound.applyAcceptedControl(message, decision)
+          }
+        : {}),
+      reconnect: true,
+      ...(options.onStatus ? { onStatus: options.onStatus } : {})
+    });
+    this.gateway = gateway;
   }
 
-  connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const socket = new WebSocket(this.options.websocketUrl);
-      this.socket = socket;
-
-      socket.once("error", reject);
-      socket.on("message", (data) => {
-        void this.handleRawMessage(data, resolve);
-      });
-      socket.on("close", (code) => {
-        this.options.onStatus?.(`ClawChat WebSocket closed with code ${code}`);
-      });
-    });
+  async connect(): Promise<void> {
+    if (this.closed) throw new Error("ClawChat WebSocket client is closed");
+    await this.gateway.start();
   }
 
   async send(message: ClawchatOutboundMessage): Promise<void> {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      throw new Error("ClawChat WebSocket is not open");
-    }
-    this.socket.send(JSON.stringify(message));
+    if (this.closed) throw new Error("ClawChat WebSocket client is closed");
+    await this.gateway.send(message);
   }
 
-  close(): void {
-    this.socket?.close();
-    this.socket = undefined;
-  }
-
-  private async handleRawMessage(data: WebSocket.RawData, ready: () => void): Promise<void> {
-    const envelope = parseEnvelope(data);
-    if (!envelope) return;
-
-    if (envelope.event === "connect.challenge") {
-      this.sendConnect(envelope);
-      return;
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    try {
+      await this.gateway.stop();
+    } finally {
+      this.store.close();
     }
-
-    if (envelope.event === "hello-ok") {
-      this.options.onStatus?.("ClawChat WebSocket ready");
-      ready();
-      return;
-    }
-
-    if (envelope.event === "ping") {
-      await this.sendRaw({
-        version: "2",
-        event: "pong",
-        trace_id: envelope.trace_id ?? `pong-${Date.now()}`,
-        emitted_at: envelope.emitted_at ?? Date.now(),
-        payload: {}
-      });
-      return;
-    }
-
-    if (envelope.event === "message.send" || envelope.event === "message.reply") {
-      await this.options.onInboundMessage(envelope as unknown as ClawchatInboundMessage);
-    }
-  }
-
-  private sendConnect(challenge: ProtocolEnvelope): void {
-    const nonce = typeof challenge.payload?.nonce === "string" ? challenge.payload.nonce : "";
-    void this.sendRaw({
-      version: "2",
-      event: "connect",
-      trace_id: `connect-${Date.now()}`,
-      emitted_at: Date.now(),
-      payload: {
-        token: this.options.accessToken,
-        nonce,
-        device_id: this.options.deviceId ?? "clawchat-pi",
-        capabilities: {
-          multi_device: true,
-          device_replay: true,
-          chat_meta_events: true
-        }
-      }
-    });
-  }
-
-  private async sendRaw(message: ProtocolEnvelope): Promise<void> {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
-    this.socket.send(JSON.stringify(message));
-  }
-}
-
-function parseEnvelope(data: WebSocket.RawData): ProtocolEnvelope | undefined {
-  try {
-    const parsed = JSON.parse(data.toString()) as ProtocolEnvelope;
-    return parsed.version === "2" && typeof parsed.event === "string" ? parsed : undefined;
-  } catch {
-    return undefined;
   }
 }

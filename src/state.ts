@@ -1,8 +1,9 @@
-import { mkdir, readFile, rename, writeFile, chmod } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
 import type { ActivationResult } from "./activation.js";
 import { DEFAULT_WEBSOCKET_URL } from "./config.js";
+import { GatewayStore } from "./gateway-store.js";
+import { HostProfileRepository } from "./host-profile.js";
+import type { ClawchatOutputSettings } from "./output-settings.js";
 
 export interface ClawchatState {
   baseUrl: string;
@@ -14,68 +15,131 @@ export interface ClawchatState {
     userId: string;
     ownerId: string;
   };
+  deviceId: string;
+  workspace: string;
+  output: ClawchatOutputSettings;
 }
 
 export interface StatePathOptions {
-  path?: string;
+  agentDir?: string;
+  profile?: string;
+  workspace?: string;
+}
+
+export interface PreparedClawchatState {
+  deviceId: string;
+  workspace: string;
 }
 
 export function getClawchatStatePath(options: StatePathOptions = {}): string {
-  return options.path ?? process.env.CLAWCHAT_PI_STATE_PATH ?? join(getAgentDir(), "clawchat.json");
+  return repository(options).profilePath(profileName(options));
+}
+
+export function getClawchatGatewayStorePath(options: StatePathOptions = {}): string {
+  const name = profileName(options);
+  return gatewayPath(options, name);
+}
+
+export async function prepareClawchatState(options: StatePathOptions = {}): Promise<PreparedClawchatState> {
+  const workspace = options.workspace;
+  if (!workspace) throw new Error("A Workspace is required to prepare ClawChat activation");
+  const prepared = await repository(options).prepareActivation(profileName(options), workspace);
+  return { deviceId: prepared.deviceId, workspace: prepared.workspace };
 }
 
 export async function loadClawchatState(options: StatePathOptions = {}): Promise<ClawchatState | null> {
-  const path = getClawchatStatePath(options);
-  let text: string;
+  const name = profileName(options);
+  const profile = await repository(options).load(name);
+  if (!profile) return null;
+  const gateway = GatewayStore.open(gatewayPath(options, name));
   try {
-    text = await readFile(path, "utf8");
-  } catch (error: unknown) {
-    if (isMissingFileError(error)) return null;
-    throw error;
+    return {
+      baseUrl: profile.baseUrl,
+      websocketUrl: profile.websocketUrl,
+      accessToken: profile.accessToken,
+      ...(profile.refreshToken ? { refreshToken: profile.refreshToken } : {}),
+      agent: profile.agent,
+      deviceId: profile.deviceId,
+      workspace: profile.workspace,
+      output: {
+        toolCallsDefault: profile.output.toolCallsDefault,
+        chatOverrides: gateway.getToolOutputOverrides()
+      }
+    };
+  } finally {
+    gateway.close();
   }
-
-  const parsed = JSON.parse(text) as Partial<ClawchatState>;
-  if (!parsed.accessToken || !parsed.agent?.userId || !parsed.agent.ownerId) {
-    throw new Error(`Invalid ClawChat Pi state at ${path}`);
-  }
-
-  return {
-    baseUrl: parsed.baseUrl || "https://app.clawling.com",
-    websocketUrl: parsed.websocketUrl || DEFAULT_WEBSOCKET_URL,
-    accessToken: parsed.accessToken,
-    ...(parsed.refreshToken ? { refreshToken: parsed.refreshToken } : {}),
-    agent: {
-      ...(parsed.agent.id ? { id: parsed.agent.id } : {}),
-      userId: parsed.agent.userId,
-      ownerId: parsed.agent.ownerId
-    }
-  };
 }
 
 export async function saveClawchatState(
   state: ClawchatState | ActivationResult,
   options: StatePathOptions & { websocketUrl?: string } = {}
 ): Promise<string> {
-  const path = getClawchatStatePath(options);
-  const dir = dirname(path);
-  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const name = profileName(options);
+  const profiles = repository(options);
+  let extensionState: ClawchatState;
 
-  const normalized: ClawchatState = {
-    baseUrl: state.baseUrl,
-    websocketUrl: "websocketUrl" in state ? state.websocketUrl : options.websocketUrl ?? DEFAULT_WEBSOCKET_URL,
-    accessToken: state.accessToken,
-    ...(state.refreshToken ? { refreshToken: state.refreshToken } : {}),
-    agent: state.agent
-  };
+  if (isClawchatState(state)) {
+    await profiles.prepareActivation(name, state.workspace);
+    const profile = await profiles.completeActivation(
+      name,
+      {
+        baseUrl: state.baseUrl,
+        accessToken: state.accessToken,
+        ...(state.refreshToken ? { refreshToken: state.refreshToken } : {}),
+        agent: state.agent
+      },
+      { websocketUrl: state.websocketUrl }
+    );
+    extensionState = { ...state, deviceId: profile.deviceId, workspace: profile.workspace };
+  } else {
+    const workspace = options.workspace;
+    if (!workspace) throw new Error("A Workspace is required to save ClawChat activation");
+    await profiles.prepareActivation(name, workspace);
+    const profile = await profiles.completeActivation(name, state, {
+      websocketUrl: options.websocketUrl ?? DEFAULT_WEBSOCKET_URL
+    });
+    extensionState = {
+      baseUrl: profile.baseUrl,
+      websocketUrl: profile.websocketUrl,
+      accessToken: profile.accessToken,
+      ...(profile.refreshToken ? { refreshToken: profile.refreshToken } : {}),
+      agent: profile.agent,
+      deviceId: profile.deviceId,
+      workspace: profile.workspace,
+      output: { toolCallsDefault: profile.output.toolCallsDefault, chatOverrides: {} }
+    };
+  }
 
-  const tempPath = `${path}.${process.pid}.tmp`;
-  await writeFile(tempPath, `${JSON.stringify(normalized, null, 2)}\n`, { mode: 0o600 });
-  await chmod(tempPath, 0o600);
-  await rename(tempPath, path);
-  await chmod(path, 0o600);
-  return path;
+  const gateway = GatewayStore.open(gatewayPath(options, name));
+  try {
+    const previous = gateway.getToolOutputOverrides();
+    for (const chatId of Object.keys(previous)) {
+      if (!(chatId in extensionState.output.chatOverrides)) {
+        gateway.setToolOutputOverride(chatId, "inherit");
+      }
+    }
+    for (const [chatId, value] of Object.entries(extensionState.output.chatOverrides)) {
+      gateway.setToolOutputOverride(chatId, value);
+    }
+  } finally {
+    gateway.close();
+  }
+  return profiles.profilePath(name);
 }
 
-function isMissingFileError(error: unknown): boolean {
-  return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
+function repository(options: StatePathOptions): HostProfileRepository {
+  return new HostProfileRepository(options.agentDir ? { agentDir: options.agentDir } : {});
+}
+
+function profileName(options: StatePathOptions): string {
+  return options.profile ?? process.env.CLAWCHAT_PI_PROFILE ?? "default";
+}
+
+function gatewayPath(options: StatePathOptions, name: string): string {
+  return join(repository(options).profileDirectory(name), "gateway.sqlite");
+}
+
+function isClawchatState(state: ClawchatState | ActivationResult): state is ClawchatState {
+  return "deviceId" in state && "workspace" in state && "output" in state;
 }

@@ -1,0 +1,5 @@
+# Send complete materialized output instead of streaming lifecycle frames
+
+The MVP will represent active Pi work with `typing.update` and project visible Pi output into complete materialized ClawChat messages. Final assistant text is forwarded without adapter-authored rewriting. When Pi's native thinking level for a Chat Session is enabled and the model produces thinking content, that completed content is also forwarded. Completed tool-call output is forwarded only when enabled by persisted ClawChat output configuration, which an Extension slash command can change. A turn can therefore produce multiple complete messages.
+
+The integration will not emit `message.created`, `message.add`, `message.done`, or `message.failed` streaming lifecycle frames, and it will not synthesize an assistant failure reply when Pi produced no output. This retains Pi's output semantics while avoiding a partial-message state machine across replay, deduplication, reconnect, and multi-session routing. Token streaming can be reconsidered later without changing Chat Session identity or the output-visibility policy.

@@ -1,22 +1,15 @@
-export type ClawchatEventName =
-  | "message.send"
-  | "message.reply"
-  | "message.created"
-  | "message.add"
-  | "message.done"
-  | "message.failed";
+export type ClawchatChatType = "direct" | "group";
+export type ClawchatMessageMode = "normal" | "thinking" | "tool";
 
 export interface ClawchatPeer {
   id: string;
-  type: "direct" | "group";
+  type: ClawchatChatType;
   nick_name?: string;
 }
 
 export interface TextFragment {
-  kind?: "text";
-  type?: "text";
+  kind: "text";
   text: string;
-  delta?: string;
 }
 
 export type ClawchatFragment = TextFragment;
@@ -27,44 +20,66 @@ export interface ClawchatInboundMessage {
   trace_id: string;
   emitted_at: number;
   chat_id: string;
-  chat_type: "direct" | "group";
+  chat_type: ClawchatChatType;
   sender: ClawchatPeer;
   payload: {
     message_id: string;
-    fragments?: ClawchatFragment[];
-    message?: {
-      body?: {
-        fragments?: ClawchatFragment[];
+    message: {
+      body: {
+        fragments: ClawchatFragment[];
       };
       context?: Record<string, unknown>;
     };
   };
 }
 
-export interface ClawchatOutboundMessage {
+interface ClawchatOutboundBase {
   version: "2";
-  event: "message.created" | "message.add" | "message.done" | "message.failed";
   trace_id: string;
   emitted_at: number;
   chat_id: string;
-  payload: Record<string, unknown>;
+  to: {
+    id: string;
+    type: ClawchatChatType;
+  };
 }
+
+export interface ClawchatReplyMessage extends ClawchatOutboundBase {
+  event: "message.reply";
+  payload: {
+    message_mode: ClawchatMessageMode;
+    message: {
+      body: {
+        fragments: ClawchatFragment[];
+      };
+      context: {
+        mentions: [];
+        reply: {
+          reply_to_msg_id: string;
+          reply_preview: {
+            id: string;
+            nick_name?: string;
+            fragments: ClawchatFragment[];
+          };
+        };
+      };
+    };
+  };
+}
+
+export interface ClawchatTypingUpdate extends ClawchatOutboundBase {
+  event: "typing.update";
+  payload: {
+    is_typing: boolean;
+  };
+}
+
+export type ClawchatOutboundMessage = ClawchatReplyMessage | ClawchatTypingUpdate;
+type WithoutEnvelope<T> = T extends ClawchatOutboundMessage
+  ? Omit<T, "version" | "trace_id" | "emitted_at">
+  : never;
+export type ClawchatOutboundContent = WithoutEnvelope<ClawchatOutboundMessage>;
 
 export interface ClawchatTransport {
   send(message: ClawchatOutboundMessage): Promise<void>;
-}
-
-export interface PiAgentSessionEvent {
-  type: string;
-  assistantMessageEvent?: {
-    type: string;
-    delta?: string;
-  };
-  [key: string]: unknown;
-}
-
-export interface PiAgentSession {
-  prompt(message: string, options?: { source?: "interactive" | "rpc" | "extension" }): Promise<void>;
-  subscribe(listener: (event: PiAgentSessionEvent) => void): () => void;
-  dispose?: () => void;
 }

@@ -1,0 +1,3 @@
+# Use host profiles instead of chat-controlled workspace binding
+
+Each running Headless Pi Host profile will bind one ClawChat agent identity and stable device to one locally configured Pi Workspace. Inbound `chat_id` values automatically select isolated persistent Chat Sessions within that Workspace; chats cannot choose, bind, or switch local paths. Supporting another project means running another Host Profile with its own ClawChat agent credentials, Workspace, device identity, and session namespace, matching the host-owned routing boundary used by OpenClaw and Hermes rather than turning the connector into a remote project-management platform.
