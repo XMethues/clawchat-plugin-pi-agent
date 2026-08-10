@@ -1,0 +1,10 @@
+.git
+.agents
+.codex
+node_modules
+dist
+coverage
+pi-workspace
+*.log
+.env
+.env.*

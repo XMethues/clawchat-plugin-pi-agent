@@ -10,6 +10,10 @@ tracked in <https://github.com/XMethues/clawchat-plugin-pi-agent/issues/1>.
 
 - `activation.ts` exchanges invite codes with `/v1/agents/connect` using
   `platform: "pi"`.
+- `cli.ts` owns command parsing and the `activate`, `run`, and `status`
+  workflows without executing as an import side effect.
+- `bin.ts` is the thin installed executable entry point that invokes the CLI;
+  it contains no reusable command logic or main-module path detection.
 - `host-profile.ts` owns canonical Workspace binding, stable device identity,
   credentials, atomic profile writes, and the per-profile process lock.
 - `gateway-store.ts` owns SQLite-backed durable admission, per-chat queues,

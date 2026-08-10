@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { runCli } from "../src/bin.js";
+import { runCli } from "../src/cli.js";
 import { GatewayStore } from "../src/gateway-store.js";
 import { HostProfileRepository } from "../src/host-profile.js";
 
