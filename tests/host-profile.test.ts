@@ -20,6 +20,7 @@ describe("HostProfileRepository", () => {
     await profiles.completeActivation("default", {
       baseUrl: "https://app.clawling.com",
       accessToken: "access-1",
+      ownerChatId: "owner-chat-1",
       refreshToken: "refresh-1",
       agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" }
     });
@@ -32,6 +33,7 @@ describe("HostProfileRepository", () => {
       baseUrl: "https://app.clawling.com",
       websocketUrl: "wss://app.clawling.com/ws",
       accessToken: "access-1",
+      ownerChatId: "owner-chat-1",
       refreshToken: "refresh-1",
       agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" },
       output: { toolCallsDefault: "off" }

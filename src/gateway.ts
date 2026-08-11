@@ -10,9 +10,16 @@ export interface ClawchatGatewayEvent {
   trace_id?: string;
   emitted_at?: number;
   chat_id?: string;
+  target_device_id?: string;
+  origin_device_id?: string;
   chat_type?: unknown;
   sender?: unknown;
   payload?: Record<string, unknown>;
+}
+export function isClawchatGatewayEvent(value: unknown): value is ClawchatGatewayEvent {
+  if (!isUnknownRecord(value)) return false;
+  if (value.version !== "2" || typeof value.event !== "string") return false;
+  return value.payload === undefined || isUnknownRecord(value.payload);
 }
 
 export interface ClawChatGatewayOptions {
@@ -144,9 +151,15 @@ export class ClawChatGateway {
       this.sendRaw(envelope);
       return;
     }
-    if (envelope.event === "message.reaction") {
+    if (envelope.event === "message.reaction" || envelope.event === "history.transit") {
+      if (envelope.event === "history.transit") {
+        requireString(envelope.target_device_id, "target_device_id");
+        requireString(envelope.origin_device_id, "origin_device_id");
+        if (!isUnknownRecord(envelope.sender)) throw new Error("Outbound frame missing sender");
+        requireString(envelope.sender.id, "sender.id");
+      }
       if (this.socket?.readyState !== WebSocket.OPEN) {
-        throw new Error("Cannot send a reaction while the ClawChat Gateway is disconnected");
+        throw new Error(`Cannot send ${envelope.event} while the ClawChat Gateway is disconnected`);
       }
       this.sendRaw(envelope);
       return;

@@ -95,10 +95,29 @@ describe("HeadlessPiHost", () => {
       {
         baseUrl: "https://app.clawling.com",
         accessToken: "access-1",
-        agent: { userId: "agent-user-1", ownerId: "owner-1" }
+        ownerChatId: "owner-chat-1",
+        agent: { id: "agent-1", userId: "agent-user-1", ownerId: "owner-1" }
       },
       { websocketUrl: websocketUrl(server) }
     );
+    const persistedStore = GatewayStore.open(
+      join(profiles.profileDirectory("default"), "gateway.sqlite")
+    );
+    persistedStore.persistReliableFrame("history:recovery", "history.transit", {
+      version: "2",
+      event: "history.transit",
+      trace_id: "trace-history-recovery",
+      emitted_at: 3,
+      target_device_id: "clawchat-pi-device-1",
+      origin_device_id: "device-old",
+      sender: { id: "agent-user-1" },
+      payload: {
+        kind: "history_sync_message",
+        chat_id: "chat-recovered",
+        messages: [{ id: "history-message-1", content: "restored", created_at: 2 }]
+      }
+    });
+    persistedStore.close();
     const host = new HeadlessPiHost({
       agentDir,
       profiles,
@@ -110,7 +129,10 @@ describe("HeadlessPiHost", () => {
     await expect(connected.promise).resolves.toEqual({
       multi_device: true,
       device_replay: true,
+      chat_meta_events: true,
+      notify_signals: true,
       delivery_receipt: true,
+      history_sync: true,
       reliable_delivery: true,
       reliable_delivery_v2: true
     });
@@ -120,8 +142,100 @@ describe("HeadlessPiHost", () => {
 
     const store = GatewayStore.open(join(profiles.profileDirectory("default"), "gateway.sqlite"));
     expect(store.getGroupDispatchMode("group-1")).toBe("all");
+    expect(store.listHistoryMessages("chat-recovered")).toEqual([
+      { id: "history-message-1", content: "restored", created_at: 2 }
+    ]);
     store.close();
     await expect(profiles.getLockStatus("default")).resolves.toEqual({ running: false });
+  });
+
+  it.each([
+    { caseName: "no owner chat", ownerChatId: undefined },
+    { caseName: "no agent id", ownerChatId: "owner-chat-legacy" }
+  ])("omits awareness capabilities with $caseName", async ({ ownerChatId }) => {
+    const server = await listen();
+    const connected = Promise.withResolvers<Record<string, unknown>>();
+    const acked = Promise.withResolvers<Record<string, any>>();
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({
+        version: "2",
+        event: "connect.challenge",
+        trace_id: "challenge-legacy",
+        emitted_at: 1,
+        payload: { nonce: "challenge-nonce" }
+      }));
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, any>;
+        if (frame.event === "connect") {
+          connected.resolve(frame.payload.capabilities);
+          socket.send(JSON.stringify({
+            version: "2",
+            event: "hello-ok",
+            trace_id: frame.trace_id,
+            emitted_at: 2,
+            payload: {
+              ack_mode: "dseq",
+              ack_epoch: "01JXYZ8K3MNPQRSTVWXYZ0AB",
+              device_id: "clawchat-pi-device-legacy",
+              delivery_mode: "device_replay"
+            }
+          }));
+          socket.send(JSON.stringify({
+            version: "2",
+            event: "history.transit",
+            trace_id: "history-request-legacy",
+            emitted_at: 3,
+            dseq: 1,
+            target_device_id: "clawchat-pi-device-legacy",
+            origin_device_id: "clawchat-pi-device-old",
+            sender: { id: "agent-user-legacy" },
+            payload: { kind: "history_sync_request" }
+          }));
+          socket.send(JSON.stringify({
+            version: "2",
+            event: "replay.done",
+            trace_id: "replay-legacy",
+            emitted_at: 4,
+            dseq: 2,
+            payload: {}
+          }));
+        } else if (frame.event === "message.sync_ack") {
+          acked.resolve(frame);
+        }
+      });
+    });
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-host-legacy-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const profiles = new HostProfileRepository({
+      agentDir,
+      createDeviceId: () => "clawchat-pi-device-legacy"
+    });
+    await profiles.prepareActivation("default", workspace);
+    await profiles.completeActivation(
+      "default",
+      {
+        baseUrl: websocketUrl(server).replace(/^ws/, "http"),
+        accessToken: "legacy-access",
+        ...(ownerChatId ? { ownerChatId } : {}),
+        agent: { userId: "agent-user-legacy", ownerId: "owner-legacy" }
+      },
+      { websocketUrl: websocketUrl(server) }
+    );
+    const host = new HeadlessPiHost({
+      agentDir,
+      profiles,
+      onAwarenessSignal: async () => undefined
+    });
+
+    await host.start();
+    const capabilities = await connected.promise;
+    expect(capabilities).not.toHaveProperty("chat_meta_events");
+    expect(capabilities).not.toHaveProperty("notify_signals");
+    await expect(acked.promise).resolves.toMatchObject({
+      payload: { dseq: 2, epoch: "01JXYZ8K3MNPQRSTVWXYZ0AB" }
+    });
+    await host.stop();
   });
 });
 

@@ -1,6 +1,12 @@
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { ClawChatGateway, type ClawchatGatewayEvent } from "./gateway.js";
+import { ClawchatAwarenessCoordinator } from "./clawchat-awareness.js";
+import { ClawchatPlaintextHistorySync } from "./clawchat-history-sync.js";
+import {
+  ClawChatGateway,
+  isClawchatGatewayEvent,
+  type ClawchatGatewayEvent
+} from "./gateway.js";
 import { GatewayStore } from "./gateway-store.js";
 import { HostProfileRepository, type HostProfileLock } from "./host-profile.js";
 import { ClawchatInboundRouter } from "./inbound-router.js";
@@ -32,6 +38,9 @@ export class HeadlessPiHost {
   private store: GatewayStore | undefined;
   private gateway: ClawChatGateway | undefined;
   private registry: ChatSessionRegistry | undefined;
+  private readonly awarenessRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+  private readonly historyRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+  private stopping = false;
   private started = false;
 
   constructor(options: HeadlessPiHostOptions = {}) {
@@ -45,6 +54,7 @@ export class HeadlessPiHost {
   }
 
   async start(): Promise<void> {
+    this.stopping = false;
     if (this.started) throw new Error("Headless Pi Host is already started");
     const profile = await this.profiles.load(this.profileName);
     if (!profile) throw new Error(`Host Profile '${this.profileName}' is not activated`);
@@ -103,6 +113,33 @@ export class HeadlessPiHost {
         }
       });
       this.registry = registry;
+      const awarenessOwnerChatId = profile.ownerChatId;
+      const awarenessAgentId = profile.agent.id;
+      const awareness = awarenessOwnerChatId && awarenessAgentId
+        ? new ClawchatAwarenessCoordinator({
+            api: toolRuntime.environment.api,
+            store,
+            ownerChatId: awarenessOwnerChatId,
+            agentId: awarenessAgentId,
+            wake: (chatId) => {
+              void registry.wake(chatId).catch((error: unknown) => {
+                this.onStatus?.(
+                  `awareness turn for ${chatId} failed: ${error instanceof Error ? error.message : String(error)}`
+                );
+              });
+            }
+          })
+        : undefined;
+      const historySync = new ClawchatPlaintextHistorySync({
+        api: toolRuntime.environment.api,
+        store,
+        deviceId: profile.deviceId,
+        userId: profile.agent.userId,
+        send: async (frame) => {
+          if (!gateway) throw new Error("ClawChat Gateway is not started");
+          await gateway.send(frame);
+        }
+      });
 
       gateway = new ClawChatGateway({
         websocketUrl: profile.websocketUrl,
@@ -122,8 +159,34 @@ export class HeadlessPiHost {
             );
           });
         },
-        ...(this.onAwarenessSignal ? { onAwarenessSignal: this.onAwarenessSignal } : {}),
-        ...(this.onHistoryTransit ? { onHistoryTransit: this.onHistoryTransit } : {}),
+        ...(awareness
+          ? {
+              onAwarenessSignal: async (event: ClawchatGatewayEvent) => {
+                void (async () => {
+                  await this.processAwareness(awareness, event);
+                  await this.onAwarenessSignal?.(event);
+                })().catch((error: unknown) => {
+                  this.onStatus?.(
+                    `awareness observer failed: ${
+                      error instanceof Error ? error.message : String(error)
+                    }`
+                  );
+                });
+              }
+            }
+          : {}),
+        onHistoryTransit: async (event: ClawchatGatewayEvent) => {
+          void (async () => {
+            await this.processHistory(historySync, event);
+            await this.onHistoryTransit?.(event);
+          })().catch((error: unknown) => {
+            this.onStatus?.(
+              `history observer failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            );
+          });
+        },
         onDeliveryReceipt: async (event) => {
           this.onStatus?.(`message ${String(event.payload?.message_id ?? "unknown")} delivered`);
           await this.onDeliveryReceipt?.(event);
@@ -133,6 +196,14 @@ export class HeadlessPiHost {
       this.gateway = gateway;
       await registry.start();
       await gateway.start();
+      if (awareness) {
+        for (const frame of store.listReliableFrames("notify.signal")) {
+          if (isClawchatGatewayEvent(frame)) await this.processAwareness(awareness, frame);
+        }
+      }
+      for (const frame of store.listReliableFrames("history.transit")) {
+        if (isClawchatGatewayEvent(frame)) await this.processHistory(historySync, frame);
+      }
       this.started = true;
     } catch (error: unknown) {
       await this.stopComponents();
@@ -144,8 +215,60 @@ export class HeadlessPiHost {
     await this.stopComponents();
   }
 
+  private async processAwareness(
+    awareness: ClawchatAwarenessCoordinator,
+    event: ClawchatGatewayEvent,
+    attempt = 0
+  ): Promise<void> {
+    try {
+      await awareness.handle(event);
+    } catch (error: unknown) {
+      if (this.stopping) return;
+      const delay = Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
+      this.onStatus?.(
+        `awareness refresh failed; retrying in ${delay}ms: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      const timer = setTimeout(() => {
+        this.awarenessRetryTimers.delete(timer);
+        void this.processAwareness(awareness, event, attempt + 1);
+      }, delay);
+      this.awarenessRetryTimers.add(timer);
+    }
+  }
+
+  private async processHistory(
+    historySync: ClawchatPlaintextHistorySync,
+    event: ClawchatGatewayEvent,
+    attempt = 0
+  ): Promise<void> {
+    try {
+      await historySync.handle(event);
+    } catch (error: unknown) {
+      if (this.stopping) return;
+      const delay = Math.min(30_000, 1_000 * 2 ** Math.min(attempt, 5));
+      this.onStatus?.(
+        `history sync failed; retrying in ${delay}ms: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+      const timer = setTimeout(() => {
+        this.historyRetryTimers.delete(timer);
+        void this.processHistory(historySync, event, attempt + 1);
+      }, delay);
+      this.historyRetryTimers.add(timer);
+    }
+  }
+
   private async stopComponents(): Promise<void> {
     this.started = false;
+    this.stopping = true;
+    for (const timer of this.awarenessRetryTimers) clearTimeout(timer);
+    this.awarenessRetryTimers.clear();
+    for (const timer of this.historyRetryTimers) clearTimeout(timer);
+    this.historyRetryTimers.clear();
+
     const registry = this.registry;
     this.registry = undefined;
     await registry?.shutdown();

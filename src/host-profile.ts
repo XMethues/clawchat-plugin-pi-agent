@@ -18,6 +18,7 @@ export interface HostProfile {
   websocketUrl: string;
   accessToken: string;
   refreshToken?: string;
+  ownerChatId?: string;
   agent: {
     id?: string;
     userId: string;
@@ -174,6 +175,7 @@ export class HostProfileRepository {
         (!rebinding && previous ? previous.websocketUrl : DEFAULT_WEBSOCKET_URL),
       accessToken: activation.accessToken,
       ...(activation.refreshToken ? { refreshToken: activation.refreshToken } : {}),
+      ...(activation.ownerChatId ? { ownerChatId: activation.ownerChatId } : {}),
       agent: activation.agent,
       output: !rebinding && previous ? previous.output : { toolCallsDefault: "off" }
     };

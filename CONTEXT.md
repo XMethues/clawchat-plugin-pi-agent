@@ -61,7 +61,7 @@ The non-encrypted ClawChat Protocol v2 behavior applicable to a ClawChat agent i
 _Avoid_: full generic client, owner client, partial reliable delivery
 
 **Gateway Store**:
-The per-Host-Profile SQLite record that durably owns accepted inbound frames, deduplication keys, reliable-delivery admission state, Chat Turn Queues, Chat Session mappings, and materialized outbound delivery attempts. It does not store Pi conversation context, which remains in Pi's native session JSONL files.
+The per-Host-Profile SQLite record that durably owns accepted inbound frames, deduplication keys, reliable-delivery admission state, Chat Turn Queues, Chat Session mappings, imported sibling-device history, and materialized outbound delivery attempts. It does not store Pi conversation context, which remains in Pi's native session JSONL files.
 _Avoid_: Pi session database, in-memory queue, global state database
 
 **Online Host Profile**:
@@ -83,6 +83,10 @@ _Avoid_: global queue, interrupt-on-message, steer, concurrent turns
 **ClawChat Awareness Turn**:
 A Pi turn created from an actionable, content-free ClawChat signal after authoritative state is refreshed, rather than from a user's chat message. It is routed only to the owner's direct Chat Session; moment-comment signals remain distinct, while lower-priority contact and conversation changes may be consolidated.
 _Avoid_: synthetic user message, notification reply, signal-per-turn
+
+**Sibling Plaintext History Sync**:
+The non-encrypted transfer of retained ClawChat message pages between two devices of the same user through `history.transit`. The receiving Host Profile durably imports each message by message identity, without turning transferred history into Pi conversation context.
+_Avoid_: server replay, Pi session import, encrypted history sync
 
 **Group Dispatch Mode**:
 The per-group policy `mention`, `all`, or `muted` that controls whether an accepted ClawChat message enters its Chat Session. `muted` still consumes, deduplicates, and acknowledges frames but never dispatches them to Pi; direct chats always dispatch, while groups default to `mention`.

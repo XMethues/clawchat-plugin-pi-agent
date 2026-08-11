@@ -32,6 +32,29 @@ export interface ChatTurn {
   status: "queued" | "running" | "complete" | "interrupted";
 }
 
+export interface ClawchatAwarenessSource {
+  sourceId: string;
+  signalType: string;
+  entityId: string;
+  authoritativeState: unknown;
+}
+
+export interface AwarenessAdmission {
+  status: "queued" | "coalesced";
+  chatId: string;
+  turnId: string;
+}
+
+export interface HistoryTransferState {
+  deviceId: string;
+  direction: "import" | "export";
+  status: "active" | "complete" | "cancelled";
+  chatId?: string;
+  messagesTransferred: number;
+  conversationsTransferred: number;
+  reason?: string;
+}
+
 export interface OutboundRecord {
   traceId: string;
   chatId: string;
@@ -139,6 +162,46 @@ export class GatewayStore {
         event TEXT NOT NULL,
         frame_json TEXT NOT NULL,
         received_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS history_messages (
+        message_id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        message_json TEXT NOT NULL,
+        source_device_id TEXT NOT NULL,
+        imported_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS history_messages_by_chat
+        ON history_messages (chat_id, imported_at);
+
+      CREATE TABLE IF NOT EXISTS history_sources (
+        source_id TEXT PRIMARY KEY,
+        processed_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS history_transfers (
+        device_id TEXT NOT NULL,
+        direction TEXT NOT NULL CHECK (direction IN ('import', 'export')),
+        status TEXT NOT NULL CHECK (status IN ('active', 'complete', 'cancelled')),
+        chat_id TEXT,
+        messages_transferred INTEGER NOT NULL,
+        conversations_transferred INTEGER NOT NULL,
+        reason TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (device_id, direction)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS awareness_turns (
+        coalesce_key TEXT PRIMARY KEY,
+        turn_id TEXT NOT NULL UNIQUE REFERENCES chat_turns(id),
+        updated_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS awareness_sources (
+        source_id TEXT PRIMARY KEY,
+        turn_id TEXT NOT NULL REFERENCES chat_turns(id),
+        processed_at INTEGER NOT NULL
       ) STRICT;
 
       CREATE TABLE IF NOT EXISTS tool_calls (
@@ -355,6 +418,95 @@ export class GatewayStore {
     return rows.map((row) => row.chat_id);
   }
 
+  getAwarenessSourceTurn(sourceId: string): string | null {
+    const row = this.database
+      .prepare("SELECT turn_id FROM awareness_sources WHERE source_id = ?")
+      .get(sourceId) as { turn_id: string } | undefined;
+    return row?.turn_id ?? null;
+  }
+
+  enqueueAwareness(input: {
+    chatId: string;
+    coalesceKey: string;
+    source: ClawchatAwarenessSource;
+  }): AwarenessAdmission {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = this.database
+        .prepare(
+          `SELECT awareness_turns.turn_id, chat_turns.status, chat_turns.frame_json
+           FROM awareness_turns
+           JOIN chat_turns ON chat_turns.id = awareness_turns.turn_id
+           WHERE awareness_turns.coalesce_key = ?`
+        )
+        .get(input.coalesceKey) as
+        | { turn_id: string; status: ChatTurn["status"]; frame_json: string }
+        | undefined;
+      const now = Date.now();
+      if (existing?.status === "queued") {
+        const frame = JSON.parse(existing.frame_json) as {
+          kind: "clawchat.awareness";
+          coalesceKey: string;
+          sources: ClawchatAwarenessSource[];
+        };
+        if (!frame.sources.some((source) => source.sourceId === input.source.sourceId)) {
+          frame.sources.push(input.source);
+          this.database
+            .prepare(
+              `UPDATE chat_turns
+               SET message_id = ?, frame_json = ?
+               WHERE id = ? AND status = 'queued'`
+            )
+            .run(input.source.sourceId, JSON.stringify(frame), existing.turn_id);
+        }
+        this.database
+          .prepare("UPDATE awareness_turns SET updated_at = ? WHERE coalesce_key = ?")
+          .run(now, input.coalesceKey);
+        this.database
+          .prepare(
+            `INSERT OR IGNORE INTO awareness_sources (source_id, turn_id, processed_at)
+             VALUES (?, ?, ?)`
+          )
+          .run(input.source.sourceId, existing.turn_id, now);
+        this.database.exec("COMMIT");
+        return { status: "coalesced", chatId: input.chatId, turnId: existing.turn_id };
+      }
+
+      const turnId = crypto.randomUUID();
+      const frame = {
+        kind: "clawchat.awareness" as const,
+        coalesceKey: input.coalesceKey,
+        sources: [input.source]
+      };
+      this.database
+        .prepare(
+          `INSERT INTO chat_turns
+            (id, chat_id, message_id, frame_json, status, admitted_at)
+           VALUES (?, ?, ?, ?, 'queued', ?)`
+        )
+        .run(turnId, input.chatId, input.source.sourceId, JSON.stringify(frame), now);
+      this.database
+        .prepare(
+          `INSERT INTO awareness_turns (coalesce_key, turn_id, updated_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT (coalesce_key)
+           DO UPDATE SET turn_id = excluded.turn_id, updated_at = excluded.updated_at`
+        )
+        .run(input.coalesceKey, turnId, now);
+      this.database
+        .prepare(
+          `INSERT INTO awareness_sources (source_id, turn_id, processed_at)
+           VALUES (?, ?, ?)`
+        )
+        .run(input.source.sourceId, turnId, now);
+      this.database.exec("COMMIT");
+      return { status: "queued", chatId: input.chatId, turnId };
+    } catch (error: unknown) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   enqueueOutbound(input: { traceId: string; chatId: string; frame: unknown }): void {
     this.database
       .prepare(
@@ -540,6 +692,131 @@ export class GatewayStore {
     return rows.map((row) => JSON.parse(row.frame_json) as unknown);
   }
 
+  admitHistoryPage(input: {
+    sourceId: string;
+    chatId: string;
+    sourceDeviceId: string;
+    messages: Array<{ id: string } & Record<string, unknown>>;
+  }): boolean {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      if (this.isHistorySourceProcessed(input.sourceId)) {
+        this.database.exec("COMMIT");
+        return false;
+      }
+      const insert = this.database.prepare(
+        `INSERT OR IGNORE INTO history_messages
+          (message_id, chat_id, message_json, source_device_id, imported_at)
+         VALUES (?, ?, ?, ?, ?)`
+      );
+      const now = Date.now();
+      let imported = 0;
+      for (const message of input.messages) {
+        const result = insert.run(
+          message.id,
+          input.chatId,
+          JSON.stringify(message),
+          input.sourceDeviceId,
+          now
+        );
+        imported += Number(result.changes);
+      }
+      const previous = this.getHistoryTransfer(input.sourceDeviceId, "import");
+      this.updateHistoryTransfer({
+        deviceId: input.sourceDeviceId,
+        direction: "import",
+        status: "active",
+        chatId: input.chatId,
+        messagesTransferred: (previous?.messagesTransferred ?? 0) + imported,
+        conversationsTransferred: previous?.conversationsTransferred ?? 0
+      });
+      this.markHistorySourceProcessed(input.sourceId);
+      this.database.exec("COMMIT");
+      return true;
+    } catch (error: unknown) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  listHistoryMessages(chatId: string): unknown[] {
+    const rows = this.database
+      .prepare(
+        `SELECT message_json
+         FROM history_messages
+         WHERE chat_id = ?
+         ORDER BY imported_at, rowid`
+      )
+      .all(chatId) as unknown as Array<{ message_json: string }>;
+    return rows.map((row) => JSON.parse(row.message_json) as unknown);
+  }
+
+  isHistorySourceProcessed(sourceId: string): boolean {
+    return Boolean(
+      this.database.prepare("SELECT 1 FROM history_sources WHERE source_id = ?").get(sourceId)
+    );
+  }
+
+  markHistorySourceProcessed(sourceId: string): void {
+    this.database
+      .prepare(
+        `INSERT OR IGNORE INTO history_sources (source_id, processed_at)
+         VALUES (?, ?)`
+      )
+      .run(sourceId, Date.now());
+  }
+
+  updateHistoryTransfer(state: HistoryTransferState): void {
+    this.database
+      .prepare(
+        `INSERT INTO history_transfers
+          (device_id, direction, status, chat_id, messages_transferred,
+           conversations_transferred, reason, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (device_id, direction) DO UPDATE SET
+           status = excluded.status,
+           chat_id = excluded.chat_id,
+           messages_transferred = excluded.messages_transferred,
+           conversations_transferred = excluded.conversations_transferred,
+           reason = excluded.reason,
+           updated_at = excluded.updated_at`
+      )
+      .run(
+        state.deviceId,
+        state.direction,
+        state.status,
+        state.chatId ?? null,
+        state.messagesTransferred,
+        state.conversationsTransferred,
+        state.reason ?? null,
+        Date.now()
+      );
+  }
+
+  getHistoryTransfer(
+    deviceId: string,
+    direction: HistoryTransferState["direction"]
+  ): HistoryTransferState | null {
+    const row = this.database
+      .prepare(
+        `SELECT device_id, direction, status, chat_id, messages_transferred,
+                conversations_transferred, reason
+         FROM history_transfers
+         WHERE device_id = ? AND direction = ?`
+      )
+      .get(deviceId, direction) as HistoryTransferRow | undefined;
+    if (!row) return null;
+    return {
+      deviceId: row.device_id,
+      direction: row.direction,
+      status: row.status,
+      ...(row.chat_id ? { chatId: row.chat_id } : {}),
+      messagesTransferred: row.messages_transferred,
+      conversationsTransferred: row.conversations_transferred,
+      ...(row.reason ? { reason: row.reason } : {})
+    };
+  }
+
   recordToolCall(input: {
     chatId?: string;
     messageId?: string;
@@ -593,6 +870,16 @@ interface OutboundRow {
   chat_id: string;
   frame_json: string;
   attempts: number;
+}
+
+interface HistoryTransferRow {
+  device_id: string;
+  direction: HistoryTransferState["direction"];
+  status: HistoryTransferState["status"];
+  chat_id: string | null;
+  messages_transferred: number;
+  conversations_transferred: number;
+  reason: string | null;
 }
 
 interface StatusSessionRow extends ChatSessionRow {

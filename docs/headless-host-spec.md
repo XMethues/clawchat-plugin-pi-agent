@@ -99,8 +99,8 @@ The Gateway follows `docs/client-integration.md` and uses exactly one connection
 ### Handshake and capabilities
 
 - Complete `connect.challenge` -> `connect` -> `hello-ok` before sending application frames.
-- Advertise only implemented capabilities. The initial Headless Host advertises `multi_device`, `device_replay`, `reliable_delivery`, and `reliable_delivery_v2`.
-- Do not advertise chat metadata, delivery receipts, notifications, permissions, history sync, streaming, or encryption until their full contracts exist.
+- Advertise only implemented capabilities. The Headless Host advertises `multi_device`, `device_replay`, `chat_meta_events`, `notify_signals`, `delivery_receipt`, `history_sync`, `reliable_delivery`, and `reliable_delivery_v2`.
+- Do not advertise permission events, streaming, or encryption until their full contracts exist.
 - If `hello-ok.ack_mode` is `dseq`, use reliable-delivery v2. Otherwise fall back to v1 when storage `seq` is present, or legacy behavior when neither reliable mode is granted.
 - Treat authentication `hello-fail` as requiring fresh credentials before retry. Treat a remote authentication-service failure or a close without `hello-fail` as reconnectable with backoff.
 

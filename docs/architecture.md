@@ -61,6 +61,7 @@ ClawChat output, and the package does not emit `message.created`, `message.add`,
 - Live concurrent TUI attachment to a Host-owned Pi session is unsupported;
   session handoff is sequential.
 - The ClawChat backend must accept `platform: "pi"` for activation.
-- The default Headless Pi Host does not advertise awareness or sibling-history
-  capabilities. Embedders must provide `onAwarenessSignal` and
-  `onHistoryTransit` consumers before those capabilities are declared.
+- Awareness requires Activation to return the owner's direct conversation id;
+  profiles created from older responses omit awareness capabilities until rebound.
+- Sibling history transfer is plaintext only. The package does not advertise E2EE
+  or interpret `ciphertext_fragments`.

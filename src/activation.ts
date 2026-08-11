@@ -8,6 +8,7 @@ export interface ActivateClawchatOptions {
 export interface ActivationResult {
   accessToken: string;
   refreshToken?: string;
+  ownerChatId?: string;
   agent: {
     id?: string;
     userId: string;
@@ -27,6 +28,9 @@ interface RawActivationResponse {
     user_id?: unknown;
     owner_id?: unknown;
   };
+  conversation?: {
+    id?: unknown;
+  };
 }
 
 function requireTrimmedString(value: unknown, field: string): string {
@@ -38,6 +42,18 @@ function requireTrimmedString(value: unknown, field: string): string {
 
 function optionalTrimmedString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
+
+function jwtStringClaim(token: string, claim: string): string | undefined {
+  const payload = token.split(".")[1];
+  if (!payload) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    return optionalTrimmedString((parsed as Record<string, unknown>)[claim]);
+  } catch {
+    return undefined;
+  }
 }
 
 function unwrapActivationResponse(raw: RawActivationResponse): RawActivationResponse {
@@ -95,7 +111,13 @@ export async function activateClawchat(options: ActivateClawchatOptions): Promis
     result.refreshToken = refreshToken;
   }
 
-  const agentId = optionalTrimmedString(agent.id);
+  const ownerChatId = optionalTrimmedString(raw.conversation?.id);
+  if (ownerChatId) {
+    result.ownerChatId = ownerChatId;
+  }
+
+  const agentId =
+    optionalTrimmedString(agent.id) ?? jwtStringClaim(result.accessToken, "aid");
   if (agentId) {
     result.agent.id = agentId;
   }

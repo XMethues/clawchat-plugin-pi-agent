@@ -5,6 +5,7 @@ import {
   SessionManager,
   SettingsManager
 } from "@earendil-works/pi-coding-agent";
+import { isClawchatAwarenessFrame, renderAwarenessPrompt } from "./clawchat-awareness.js";
 import type { ChatSessionRecord, ChatTurn, GatewayStore } from "./gateway-store.js";
 import { createHeadlessClawchatPiExtension } from "./headless-extension.js";
 import { renderInboundPrompt } from "./inbound.js";
@@ -103,6 +104,18 @@ export class PiChatSessionFactory implements ChatSessionFactory {
 
     return {
       runTurn: async (turn: ChatTurn) => {
+        if (isClawchatAwarenessFrame(turn.frame)) {
+          await session.sendCustomMessage(
+            {
+              customType: "clawchat.awareness",
+              content: renderAwarenessPrompt(turn.frame),
+              display: false,
+              details: turn.frame
+            },
+            { triggerTurn: true }
+          );
+          return;
+        }
         const message = requireInboundMessage(turn.frame);
         const prompt = renderInboundPrompt(message);
         if (!prompt) throw new Error(`Turn '${turn.id}' has no supported text content`);

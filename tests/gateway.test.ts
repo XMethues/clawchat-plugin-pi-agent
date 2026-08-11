@@ -221,6 +221,76 @@ describe("ClawChatGateway", () => {
     store.close();
   });
 
+  it("sends plaintext history transit frames without rewriting their routing envelope", async () => {
+    const server = await listen();
+    const receivedHistory = Promise.withResolvers<unknown>();
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({
+        version: "2",
+        event: "connect.challenge",
+        trace_id: "challenge",
+        emitted_at: 1,
+        payload: { nonce: "challenge-nonce" }
+      }));
+      socket.on("message", (raw) => {
+        const frame: unknown = JSON.parse(raw.toString());
+        if (!frame || typeof frame !== "object" || Array.isArray(frame) || !("event" in frame)) {
+          return;
+        }
+        if (frame.event === "connect") {
+          socket.send(JSON.stringify({
+            version: "2",
+            event: "hello-ok",
+            trace_id: "connect",
+            emitted_at: 2,
+            payload: { device_id: "device-old", delivery_mode: "device_replay" }
+          }));
+          socket.send(JSON.stringify({
+            version: "2",
+            event: "replay.done",
+            trace_id: "replay",
+            emitted_at: 3,
+            payload: {}
+          }));
+        } else if (frame.event === "history.transit") {
+          receivedHistory.resolve(frame);
+        }
+      });
+    });
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const gateway = new ClawChatGateway({
+      websocketUrl: websocketUrl(server),
+      accessToken: "access-1",
+      deviceId: "device-old",
+      userId: "user-1",
+      store,
+      onInboundMessage: async () => undefined,
+      reconnect: false
+    });
+
+    await gateway.start();
+    await gateway.send({
+      version: "2",
+      event: "history.transit",
+      trace_id: "history-out",
+      emitted_at: 4,
+      target_device_id: "device-new",
+      origin_device_id: "device-old",
+      sender: { id: "user-1" },
+      payload: { kind: "history_sync_done", messages_sent: 2 }
+    });
+
+    await expect(receivedHistory.promise).resolves.toMatchObject({
+      target_device_id: "device-new",
+      origin_device_id: "device-old",
+      sender: { id: "user-1" },
+      payload: { kind: "history_sync_done", messages_sent: 2 }
+    });
+    await gateway.stop();
+    store.close();
+  });
+
   it("reconnects and resends an unacknowledged reply with the same trace_id", async () => {
     const server = await listen();
     const replies: Array<Record<string, any>> = [];

@@ -42,15 +42,21 @@ describe("activateClawchat", () => {
   });
 
   it("accepts the production response envelope", async () => {
+    const accessToken = `header.${Buffer.from(
+      JSON.stringify({ aid: "agent-2" })
+    ).toString("base64url")}.signature`;
     const fetchFn = vi.fn(async () => {
       return new Response(
         JSON.stringify({
           code: 0,
           data: {
-            access_token: "token-2",
+            access_token: accessToken,
             agent: {
               user_id: "user-2",
               owner_id: "owner-2"
+            },
+            conversation: {
+              id: "owner-chat-2"
             }
           },
           msg: "ok"
@@ -65,7 +71,9 @@ describe("activateClawchat", () => {
       fetchFn
     });
 
-    expect(result.accessToken).toBe("token-2");
+    expect(result.accessToken).toBe(accessToken);
     expect(result.agent.userId).toBe("user-2");
+    expect(result.agent.id).toBe("agent-2");
+    expect(result.ownerChatId).toBe("owner-chat-2");
   });
 });
