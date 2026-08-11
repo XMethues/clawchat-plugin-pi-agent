@@ -61,6 +61,9 @@ describe("ClawChatGateway", () => {
       userId: "agent-user-1",
       store,
       onInboundMessage: async () => undefined,
+      onAwarenessSignal: async () => undefined,
+      onHistoryTransit: async () => undefined,
+      onDeliveryReceipt: async () => undefined,
       reconnect: false
     });
 
@@ -73,6 +76,10 @@ describe("ClawChatGateway", () => {
       capabilities: {
         multi_device: true,
         device_replay: true,
+        chat_meta_events: true,
+        delivery_receipt: true,
+        notify_signals: true,
+        history_sync: true,
         reliable_delivery: true,
         reliable_delivery_v2: true
       }
@@ -185,7 +192,7 @@ describe("ClawChatGateway", () => {
               trace_id: frame.trace_id,
               emitted_at: 4,
               chat_id: frame.chat_id,
-              payload: { message_id: frame.payload.message_id, accepted_at: 4 }
+              payload: { message_id: "msg-01MINTEDBYSERVER000000000", accepted_at: 4 }
             })
           );
         }
@@ -207,16 +214,16 @@ describe("ClawChatGateway", () => {
     await gateway.start();
     await gateway.send(outboundReply());
     const frame = await replied;
-    expect(frame.payload.message_id).toMatch(/^msg-[0-9A-HJ-NP-Z]{26}$/);
+    expect(frame.payload).not.toHaveProperty("message_id");
     expect(store.listPendingOutbound()).toHaveLength(1);
     await waitFor(() => store.listPendingOutbound().length === 0);
     await gateway.stop();
     store.close();
   });
 
-  it("reconnects and resends an unacknowledged reply with the same message_id", async () => {
+  it("reconnects and resends an unacknowledged reply with the same trace_id", async () => {
     const server = await listen();
-    const messageIds: string[] = [];
+    const replies: Array<Record<string, any>> = [];
     let connectionNumber = 0;
     let resolveAccepted!: () => void;
     const accepted = new Promise<void>((resolve) => {
@@ -250,7 +257,7 @@ describe("ClawChatGateway", () => {
             JSON.stringify({ version: "2", event: "replay.done", trace_id: "replay", emitted_at: 3, payload: {} })
           );
         } else if (frame.event === "message.reply") {
-          messageIds.push(frame.payload.message_id);
+          replies.push(frame);
           if (thisConnection === 1) {
             socket.close();
           } else {
@@ -261,7 +268,7 @@ describe("ClawChatGateway", () => {
                 trace_id: frame.trace_id,
                 emitted_at: 4,
                 chat_id: frame.chat_id,
-                payload: { message_id: frame.payload.message_id, accepted_at: 4 }
+                payload: { message_id: "msg-01MINTEDBYSERVER000000000", accepted_at: 4 }
               })
             );
             resolveAccepted();
@@ -286,8 +293,9 @@ describe("ClawChatGateway", () => {
     await gateway.send(outboundReply());
     await accepted;
     await waitFor(() => store.listPendingOutbound().length === 0);
-    expect(messageIds).toHaveLength(2);
-    expect(messageIds[1]).toBe(messageIds[0]);
+    expect(replies).toHaveLength(2);
+    expect(replies[1]!.trace_id).toBe(replies[0]!.trace_id);
+    expect(replies.every((frame) => !("message_id" in frame.payload))).toBe(true);
     await gateway.stop();
     store.close();
   });
@@ -618,7 +626,6 @@ describe("ClawChatGateway", () => {
               emitted_at: 4,
               chat_id: frame.chat_id,
               payload: {
-                message_id: frame.payload.message_id,
                 code: "chat_not_found",
                 reason: "chat not found",
                 rejected_at: 4
@@ -834,6 +841,479 @@ describe("ClawChatGateway", () => {
     await gateway.stop();
     store.close();
   });
+  it("persists history transit before acknowledging its dense delivery sequence", async () => {
+    const server = await listen();
+    const { promise: acked, resolve: resolveAck } =
+      Promise.withResolvers<Record<string, unknown>>();
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({
+        version: "2",
+        event: "connect.challenge",
+        trace_id: "challenge",
+        emitted_at: 1,
+        payload: { nonce: "challenge-nonce" }
+      }));
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, unknown>;
+        if (frame.event === "connect") {
+          socket.send(JSON.stringify({
+            version: "2",
+            event: "hello-ok",
+            trace_id: frame.trace_id,
+            emitted_at: 2,
+            payload: {
+              ack_mode: "dseq",
+              ack_epoch: "01JXYZ8K3MNPQRSTVWXYZ0AB",
+              device_id: "clawchat-pi-device-1",
+              delivery_mode: "device_replay"
+            }
+          }));
+          socket.send(JSON.stringify({
+            version: "2",
+            event: "history.transit",
+            trace_id: "history-1",
+            emitted_at: 3,
+            dseq: 1,
+            target_device_id: "clawchat-pi-device-1",
+            origin_device_id: "clawchat-pi-device-2",
+            sender: { id: "agent-user-1", type: "direct" },
+            payload: { kind: "history_sync_message", messages: [{ body: "prior" }] }
+          }));
+        } else if (frame.event === "message.sync_ack") {
+          resolveAck(frame);
+        }
+      });
+    });
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-history-"));
+    const databasePath = join(directory, "gateway.sqlite");
+    const store = GatewayStore.open(databasePath);
+    const gateway = new ClawChatGateway({
+      websocketUrl: websocketUrl(server),
+      accessToken: "access-1",
+      deviceId: "clawchat-pi-device-1",
+      userId: "agent-user-1",
+      store,
+      onInboundMessage: async () => undefined,
+      ackDebounceMs: 0,
+      reconnect: false
+    });
+
+    await gateway.start();
+    await expect(acked).resolves.toMatchObject({
+      payload: { dseq: 1, epoch: "01JXYZ8K3MNPQRSTVWXYZ0AB" }
+    });
+    await gateway.stop();
+    store.close();
+
+    const reopened = GatewayStore.open(databasePath);
+    expect(reopened.listReliableFrames("history.transit")).toEqual([
+      expect.objectContaining({ event: "history.transit", trace_id: "history-1" })
+    ]);
+    reopened.close();
+  });
+
+  it("materializes a completed inbound stream once and drops failed streams", async () => {
+    const server = await listen();
+    const partials = Promise.withResolvers<void>();
+    const finalize = Promise.withResolvers<void>();
+    const disconnected = Promise.withResolvers<void>();
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({
+        version: "2",
+        event: "connect.challenge",
+        trace_id: "challenge",
+        emitted_at: 1,
+        payload: { nonce: "challenge-nonce" }
+      }));
+      socket.on("message", async (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, unknown>;
+        if (frame.event !== "connect") return;
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "hello-ok",
+          trace_id: frame.trace_id,
+          emitted_at: 2,
+          payload: {
+            ack_mode: "legacy",
+            device_id: "clawchat-pi-device-1",
+            delivery_mode: "device_replay"
+          }
+        }));
+        const streamBase = {
+          version: "2",
+          emitted_at: 3,
+          chat_id: "chat-1",
+          chat_type: "direct",
+          sender: { id: "human-1", type: "direct", nick_name: "Alice" }
+        };
+        socket.send(JSON.stringify({
+          ...streamBase,
+          event: "message.created",
+          trace_id: "stream-created",
+          payload: { message_id: "agent-stream-1", message_mode: "normal" }
+        }));
+        socket.send(JSON.stringify({
+          ...streamBase,
+          event: "message.add",
+          trace_id: "stream-add-0",
+          payload: {
+            message_id: "agent-stream-1",
+            sequence: 0,
+            mutation: { type: "append", target_fragment_index: 0 },
+            fragments: [{ kind: "text", text: "Hel", delta: "Hel" }],
+            streaming: { status: "streaming", sequence: 0, mutation_policy: "append_text_only" }
+          }
+        }));
+        socket.send(JSON.stringify({
+          ...streamBase,
+          event: "message.add",
+          trace_id: "stream-add-1",
+          payload: {
+            message_id: "agent-stream-1",
+            sequence: 1,
+            mutation: { type: "append", target_fragment_index: 0 },
+            fragments: [{ kind: "text", text: "Hello", delta: "lo" }],
+            streaming: { status: "streaming", sequence: 1, mutation_policy: "append_text_only" }
+          }
+        }));
+        partials.resolve();
+        await finalize.promise;
+        socket.send(JSON.stringify({
+          ...streamBase,
+          event: "message.done",
+          trace_id: "stream-done",
+          payload: {
+            message_id: "agent-stream-1",
+            fragments: [{ kind: "text", text: "Hello" }],
+            streaming: { status: "done", sequence: 1, mutation_policy: "append_text_only" }
+          }
+        }));
+        socket.send(JSON.stringify({
+          ...streamBase,
+          event: "message.reply",
+          trace_id: "polished-reply",
+          payload: {
+            message_id: "agent-stream-1",
+            message: {
+              body: { fragments: [{ kind: "text", text: "Polished Hello" }] },
+              context: { mentions: [], reply: null }
+            }
+          }
+        }));
+        socket.send(JSON.stringify({
+          ...streamBase,
+          event: "message.created",
+          trace_id: "failed-created",
+          payload: { message_id: "agent-stream-2", message_mode: "normal" }
+        }));
+        socket.send(JSON.stringify({
+          ...streamBase,
+          event: "message.failed",
+          trace_id: "failed-final",
+          payload: {
+            message_id: "agent-stream-2",
+            fragments: [{ kind: "text", text: "partial" }],
+            streaming: { status: "failed", sequence: 0, mutation_policy: "append_text_only" }
+          }
+        }), () => socket.close());
+      });
+    });
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-stream-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const received: Array<Record<string, unknown>> = [];
+    const gateway = new ClawChatGateway({
+      websocketUrl: websocketUrl(server),
+      accessToken: "access-1",
+      deviceId: "clawchat-pi-device-1",
+      userId: "agent-user-1",
+      store,
+      onInboundMessage: async (message) => {
+        received.push(message as unknown as Record<string, unknown>);
+      },
+      reconnect: false,
+      onStatus: (status) => {
+        if (status === "disconnected") disconnected.resolve();
+      }
+    });
+
+    await gateway.start();
+    await partials.promise;
+    expect(received).toEqual([]);
+    finalize.resolve();
+    await waitFor(() => received.length === 1);
+    expect(received[0]).toMatchObject({
+      event: "message.send",
+      payload: {
+        message_id: "agent-stream-1",
+        message: { body: { fragments: [{ kind: "text", text: "Hello" }] } }
+      }
+    });
+    await disconnected.promise;
+    await gateway.stop();
+    expect(received).toHaveLength(1);
+    store.close();
+  });
+
+  it("flushes the durable outbox after replay becomes idle without replay.done", async () => {
+    const server = await listen();
+    const received: Array<Record<string, unknown>> = [];
+    const lateBoundary = Promise.withResolvers<void>();
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({
+        version: "2",
+        event: "connect.challenge",
+        trace_id: "challenge",
+        emitted_at: 1,
+        payload: { nonce: "challenge-nonce" }
+      }));
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, unknown>;
+        received.push(frame);
+        if (frame.event === "connect") {
+          socket.send(JSON.stringify({
+            version: "2",
+            event: "hello-ok",
+            trace_id: frame.trace_id,
+            emitted_at: 2,
+            payload: {
+              ack_mode: "legacy",
+              device_id: "clawchat-pi-device-1",
+              delivery_mode: "device_replay"
+            }
+          }));
+        } else if (frame.event === "message.reply") {
+          socket.send(JSON.stringify({
+            version: "2",
+            event: "replay.done",
+            trace_id: "late-replay",
+            emitted_at: 3,
+            payload: {}
+          }));
+          setTimeout(() => lateBoundary.resolve(), 10);
+        }
+      });
+    });
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-replay-idle-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const gateway = new ClawChatGateway({
+      websocketUrl: websocketUrl(server),
+      accessToken: "access-1",
+      deviceId: "clawchat-pi-device-1",
+      userId: "agent-user-1",
+      store,
+      onInboundMessage: async () => undefined,
+      replayIdleTimeoutMs: 0,
+      reconnect: false
+    });
+    await gateway.send(outboundReply());
+
+    await gateway.start();
+    await waitFor(() => received.some((frame) => frame.event === "message.reply"));
+    await lateBoundary.promise;
+
+    expect(received.filter((frame) => frame.event === "message.reply")).toHaveLength(1);
+    await gateway.stop();
+    store.close();
+  });
+
+  it("waits for queued replay processing before the idle fallback flushes outbound", async () => {
+    const server = await listen();
+    const received: Array<Record<string, unknown>> = [];
+    const awarenessStarted = Promise.withResolvers<void>();
+    const releaseAwareness = Promise.withResolvers<void>();
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({
+        version: "2",
+        event: "connect.challenge",
+        trace_id: "challenge",
+        emitted_at: 1,
+        payload: { nonce: "challenge-nonce" }
+      }));
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, unknown>;
+        received.push(frame);
+        if (frame.event !== "connect") return;
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "hello-ok",
+          trace_id: frame.trace_id,
+          emitted_at: 2,
+          payload: {
+            ack_mode: "legacy",
+            device_id: "clawchat-pi-device-1",
+            delivery_mode: "device_replay"
+          }
+        }));
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "notify.signal",
+          trace_id: "notify-replay",
+          emitted_at: 3,
+          payload: {
+            type: "friend.added",
+            entity_id: "user-2",
+            version: 3,
+            event_id: "notify-event-1",
+            message_id: "notify:friend.added:user-2"
+          }
+        }));
+      });
+    });
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-replay-queue-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const gateway = new ClawChatGateway({
+      websocketUrl: websocketUrl(server),
+      accessToken: "access-1",
+      deviceId: "clawchat-pi-device-1",
+      userId: "agent-user-1",
+      store,
+      onInboundMessage: async () => undefined,
+      onAwarenessSignal: async () => {
+        awarenessStarted.resolve();
+        await releaseAwareness.promise;
+      },
+      replayIdleTimeoutMs: 5,
+      reconnect: false
+    });
+    await gateway.send(outboundReply());
+
+    await gateway.start();
+    await awarenessStarted.promise;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(received.some((frame) => frame.event === "message.reply")).toBe(false);
+    releaseAwareness.resolve();
+    await waitFor(() => received.some((frame) => frame.event === "message.reply"));
+
+    await gateway.stop();
+    store.close();
+  });
+
+  it("handles awareness, history, and delivery event families", async () => {
+    const server = await listen();
+    const clientFrames: Array<Record<string, any>> = [];
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({
+        version: "2",
+        event: "connect.challenge",
+        trace_id: "challenge",
+        emitted_at: 1,
+        payload: { nonce: "challenge-nonce" }
+      }));
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, any>;
+        clientFrames.push(frame);
+        if (frame.event !== "connect") return;
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "hello-ok",
+          trace_id: frame.trace_id,
+          emitted_at: 2,
+          payload: {
+            ack_mode: "dseq",
+            ack_epoch: "01JXYZ8K3MNPQRSTVWXYZ0AB",
+            device_id: "clawchat-pi-device-1",
+            delivery_mode: "device_replay"
+          }
+        }));
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "notify.signal",
+          trace_id: "notify-trace",
+          emitted_at: 3,
+          dseq: 1,
+          payload: { event_id: "notify-1", category: "social" }
+        }));
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "history.transit",
+          trace_id: "history-trace",
+          emitted_at: 4,
+          dseq: 2,
+          payload: { kind: "history_sync_message", messages: [] }
+        }));
+        socket.send(JSON.stringify({
+          ...inboundFrame({ dseq: 3 }),
+          trace_id: "inbound-receipt",
+          payload: {
+            ...(inboundFrame().payload as Record<string, unknown>),
+            message_id: "msg-receipt-1"
+          }
+        }));
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "replay.done",
+          trace_id: "replay-done",
+          emitted_at: 6,
+          dseq: 4,
+          payload: {}
+        }));
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "chat.metadata.invalidated",
+          trace_id: "metadata-1",
+          emitted_at: 7,
+          chat_id: "chat-1",
+          payload: { reason: "updated" }
+        }));
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "message.delivered",
+          trace_id: "delivered-downlink",
+          emitted_at: 8,
+          chat_id: "chat-1",
+          payload: { message_id: "outbound-1", delivered_at: 8 }
+        }));
+      });
+    });
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-events-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const awareness: string[] = [];
+    const history: string[] = [];
+    const deliveries: string[] = [];
+    const gateway = new ClawChatGateway({
+      websocketUrl: websocketUrl(server),
+      accessToken: "access-1",
+      deviceId: "clawchat-pi-device-1",
+      userId: "agent-user-1",
+      store,
+      onInboundMessage: async () => undefined,
+      onAwarenessSignal: async (event) => {
+        awareness.push(event.event);
+        if (event.event === "notify.signal") {
+          expect(store.listReliableFrames("notify.signal")).toHaveLength(1);
+        }
+      },
+      onHistoryTransit: async (event) => {
+        history.push(event.event);
+        expect(store.listReliableFrames("history.transit")).toHaveLength(1);
+      },
+      onDeliveryReceipt: async (event) => {
+        deliveries.push(event.event);
+      },
+      ackDebounceMs: 0,
+      reconnect: false
+    });
+
+    await gateway.start();
+    await waitFor(
+      () =>
+        clientFrames.some((frame) => frame.event === "message.sync_ack" && frame.payload.dseq === 4) &&
+        clientFrames.some(
+          (frame) =>
+            frame.event === "message.delivered" && frame.payload.message_id === "msg-receipt-1"
+        ) &&
+        awareness.length === 2 &&
+        history.length === 1 &&
+        deliveries.length === 1
+    );
+
+    expect(awareness).toEqual(["notify.signal", "chat.metadata.invalidated"]);
+    expect(history).toEqual(["history.transit"]);
+    expect(deliveries).toEqual(["message.delivered"]);
+    await gateway.stop();
+    store.close();
+  });
+
 });
 
 async function listen(): Promise<WebSocketServer> {

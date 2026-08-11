@@ -1,9 +1,10 @@
-import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ActivationResult } from "./activation.js";
 import { DEFAULT_WEBSOCKET_URL } from "./config.js";
 import { GatewayStore } from "./gateway-store.js";
+import { isFileSystemError, optionalLstat } from "./filesystem.js";
 
 const PROFILE_SCHEMA_VERSION = 1 as const;
 const PROFILE_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
@@ -84,13 +85,13 @@ export class HostProfileRepository {
       try {
         handle = await open(path, "wx", 0o600);
       } catch (error: unknown) {
-        if (!isFileExistsError(error)) throw error;
+        if (!isFileSystemError(error, "EEXIST")) throw error;
         const owner = await readLockOwner(path);
         if (attempt === 0 && owner && !this.isProcessAlive(owner.pid)) {
           try {
             await unlink(path);
           } catch (unlinkError: unknown) {
-            if (!isMissingFileError(unlinkError)) throw unlinkError;
+            if (!isFileSystemError(unlinkError, "ENOENT")) throw unlinkError;
           }
           continue;
         }
@@ -110,7 +111,7 @@ export class HostProfileRepository {
           const current = JSON.parse(await readFile(path, "utf8")) as { token?: unknown };
           if (current.token === token) await unlink(path);
         } catch (error: unknown) {
-          if (!isMissingFileError(error)) throw error;
+          if (!isFileSystemError(error, "ENOENT")) throw error;
         }
       }
     };
@@ -208,7 +209,7 @@ export class HostProfileRepository {
     try {
       text = await readFile(path, "utf8");
     } catch (error: unknown) {
-      if (isMissingFileError(error)) return null;
+      if (isFileSystemError(error, "ENOENT")) return null;
       throw error;
     }
 
@@ -312,22 +313,6 @@ function assertProfileName(name: string): void {
   }
 }
 
-async function optionalLstat(path: string) {
-  try {
-    return await lstat(path);
-  } catch (error: unknown) {
-    if (isMissingFileError(error)) return undefined;
-    throw error;
-  }
-}
-
-function isMissingFileError(error: unknown): boolean {
-  return Boolean(error && typeof error === "object" && "code" in error && error.code === "ENOENT");
-}
-
-function isFileExistsError(error: unknown): boolean {
-  return Boolean(error && typeof error === "object" && "code" in error && error.code === "EEXIST");
-}
 
 async function readLockOwner(path: string): Promise<{ pid: number } | null> {
   try {
@@ -336,7 +321,7 @@ async function readLockOwner(path: string): Promise<{ pid: number } | null> {
       ? { pid: parsed.pid }
       : null;
   } catch (error: unknown) {
-    if (isMissingFileError(error)) return null;
+    if (isFileSystemError(error, "ENOENT")) return null;
     if (error instanceof SyntaxError) return null;
     throw error;
   }

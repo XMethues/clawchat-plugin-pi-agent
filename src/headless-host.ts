@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { ClawChatGateway } from "./gateway.js";
+import { ClawChatGateway, type ClawchatGatewayEvent } from "./gateway.js";
 import { GatewayStore } from "./gateway-store.js";
 import { HostProfileRepository, type HostProfileLock } from "./host-profile.js";
 import { ClawchatInboundRouter } from "./inbound-router.js";
@@ -15,6 +15,9 @@ export interface HeadlessPiHostOptions {
   agentDir?: string;
   profiles?: HostProfileRepository;
   onStatus?: (status: string) => void;
+  onAwarenessSignal?: (event: ClawchatGatewayEvent) => Promise<void>;
+  onHistoryTransit?: (event: ClawchatGatewayEvent) => Promise<void>;
+  onDeliveryReceipt?: (event: ClawchatGatewayEvent) => Promise<void> | void;
 }
 
 export class HeadlessPiHost {
@@ -22,6 +25,9 @@ export class HeadlessPiHost {
   private readonly agentDir: string;
   private readonly profiles: HostProfileRepository;
   private readonly onStatus: ((status: string) => void) | undefined;
+  private readonly onAwarenessSignal: ((event: ClawchatGatewayEvent) => Promise<void>) | undefined;
+  private readonly onHistoryTransit: ((event: ClawchatGatewayEvent) => Promise<void>) | undefined;
+  private readonly onDeliveryReceipt: ((event: ClawchatGatewayEvent) => Promise<void> | void) | undefined;
   private lock: HostProfileLock | undefined;
   private store: GatewayStore | undefined;
   private gateway: ClawChatGateway | undefined;
@@ -33,6 +39,9 @@ export class HeadlessPiHost {
     this.agentDir = options.agentDir ?? getAgentDir();
     this.profiles = options.profiles ?? new HostProfileRepository({ agentDir: this.agentDir });
     this.onStatus = options.onStatus;
+    this.onAwarenessSignal = options.onAwarenessSignal;
+    this.onHistoryTransit = options.onHistoryTransit;
+    this.onDeliveryReceipt = options.onDeliveryReceipt;
   }
 
   async start(): Promise<void> {
@@ -112,6 +121,12 @@ export class HeadlessPiHost {
               `chat ${message.chat_id} worker failed: ${error instanceof Error ? error.message : String(error)}`
             );
           });
+        },
+        ...(this.onAwarenessSignal ? { onAwarenessSignal: this.onAwarenessSignal } : {}),
+        ...(this.onHistoryTransit ? { onHistoryTransit: this.onHistoryTransit } : {}),
+        onDeliveryReceipt: async (event) => {
+          this.onStatus?.(`message ${String(event.payload?.message_id ?? "unknown")} delivered`);
+          await this.onDeliveryReceipt?.(event);
         },
         ...(this.onStatus ? { onStatus: this.onStatus } : {})
       });

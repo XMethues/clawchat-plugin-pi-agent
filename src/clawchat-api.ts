@@ -21,6 +21,7 @@ export class ClawchatApiError extends Error {
 
 export interface ClawchatApiClientOptions {
   baseUrl: string;
+  mediaBaseUrl?: string;
   accessToken: () => string;
   refreshAccessToken?: () => Promise<void>;
   fetchFn?: typeof fetch;
@@ -39,6 +40,7 @@ interface ApiEnvelope {
 
 export class ClawchatApiClient {
   private readonly baseUrl: string;
+  private readonly mediaBaseUrl: string;
   private readonly accessToken: () => string;
   private readonly fetchFn: typeof fetch;
   private readonly refreshAccessToken: (() => Promise<void>) | undefined;
@@ -46,6 +48,7 @@ export class ClawchatApiClient {
 
   constructor(options: ClawchatApiClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, "");
+    this.mediaBaseUrl = (options.mediaBaseUrl ?? options.baseUrl).replace(/\/+$/, "");
     this.accessToken = options.accessToken;
     this.fetchFn = options.fetchFn ?? fetch;
     this.refreshAccessToken = options.refreshAccessToken;
@@ -72,7 +75,7 @@ export class ClawchatApiClient {
   }
 
   async upload(path: string, file: { bytes: Uint8Array; filename: string; mime: string }): Promise<Record<string, unknown>> {
-    return this.uploadRequest(path, file, true);
+    return this.uploadRequest(path, file);
   }
 
   async refresh(refreshToken: string, deviceId: string): Promise<RotatedTokens> {
@@ -118,17 +121,72 @@ export class ClawchatApiClient {
     return { accessToken, refreshToken: nextRefreshToken };
   }
 
-  private async request(method: string, path: string, body?: unknown, allowRefresh = true): Promise<unknown> {
+  private async request(method: string, path: string, body?: unknown): Promise<unknown> {
+    const { response, envelope, code } = await this.authenticatedEnvelope(
+      path,
+      (accessToken) =>
+        this.fetchFn(`${this.baseUrl}${path}`, {
+          method,
+          headers: {
+            authorization: `Bearer ${accessToken}`,
+            ...(body === undefined ? {} : { "content-type": "application/json" })
+          },
+          ...(body === undefined ? {} : { body: JSON.stringify(body) })
+        })
+    );
+    if (!isSuccessfulResponse(response, code)) {
+      const kind = classifyApiFailure(response, code);
+      throw new ClawchatApiError(
+        kind,
+        stringValue(envelope.msg) || `ClawChat API request failed (${response.status})`,
+        {
+          status: response.status,
+          path,
+          ...(code !== undefined ? { code } : {}),
+          ...(isUnknownRecord(envelope.data) ? { data: envelope.data } : {}),
+          retryable: response.status >= 500 || code === 1
+        }
+      );
+    }
+    return envelope.data === undefined ? envelope : envelope.data;
+  }
+
+  private async uploadRequest(
+    path: string,
+    file: { bytes: Uint8Array; filename: string; mime: string }
+  ): Promise<Record<string, unknown>> {
+    const blobBytes =
+      file.bytes.buffer instanceof ArrayBuffer &&
+      file.bytes.byteOffset === 0 &&
+      file.bytes.byteLength === file.bytes.buffer.byteLength
+        ? file.bytes.buffer
+        : Uint8Array.from(file.bytes).buffer;
+    const { response, envelope, code } = await this.authenticatedEnvelope(
+      path,
+      (accessToken) => {
+        const form = new FormData();
+        form.append("file", new Blob([blobBytes], { type: file.mime }), file.filename);
+        return this.fetchFn(
+          `${path === "/media/upload" ? this.mediaBaseUrl : this.baseUrl}${path}`,
+          {
+            method: "POST",
+            headers: { authorization: `Bearer ${accessToken}` },
+            body: form
+          }
+        );
+      }
+    );
+    return this.unwrapRecord(response, path, envelope, code);
+  }
+
+  private async authenticatedEnvelope(
+    path: string,
+    execute: (accessToken: string) => Promise<Response>,
+    allowRefresh = true
+  ): Promise<{ response: Response; envelope: ApiEnvelope; code: number | string | undefined }> {
     let response: Response;
     try {
-      response = await this.fetchFn(`${this.baseUrl}${path}`, {
-        method,
-        headers: {
-          authorization: `Bearer ${this.requireToken()}`,
-          ...(body === undefined ? {} : { "content-type": "application/json" })
-        },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) })
-      });
+      response = await execute(this.requireToken());
     } catch (error: unknown) {
       throw new ClawchatApiError("transport", error instanceof Error ? error.message : String(error), {
         path,
@@ -137,54 +195,11 @@ export class ClawchatApiClient {
     }
     const envelope = await this.parseEnvelope(response, path);
     const code = normalizeCode(envelope.code);
-    if (!response.ok || (code !== undefined && code !== 0)) {
-      if (response.status === 401 && allowRefresh && this.refreshAccessToken) {
-        await this.refreshToken();
-        return this.request(method, path, body, false);
-      }
-      const kind: ClawchatApiErrorKind = response.status === 401 || response.status === 403 ? "auth" : "api";
-      throw new ClawchatApiError(kind, stringValue(envelope.msg) || `ClawChat API request failed (${response.status})`, {
-        status: response.status,
-        path,
-        ...(code !== undefined ? { code } : {}),
-        ...(isUnknownRecord(envelope.data) ? { data: envelope.data } : {}),
-        retryable: response.status >= 500 || code === 1
-      });
-    }
-    return envelope.data === undefined ? envelope : envelope.data;
-  }
-
-  private async uploadRequest(
-    path: string,
-    file: { bytes: Uint8Array; filename: string; mime: string },
-    allowRefresh: boolean
-  ): Promise<Record<string, unknown>> {
-    const blobBytes =
-      file.bytes.buffer instanceof ArrayBuffer &&
-      file.bytes.byteOffset === 0 &&
-      file.bytes.byteLength === file.bytes.buffer.byteLength
-        ? file.bytes.buffer
-        : Uint8Array.from(file.bytes).buffer;
-    const form = new FormData();
-    form.append("file", new Blob([blobBytes], { type: file.mime }), file.filename);
-    let response: Response;
-    try {
-      response = await this.fetchFn(`${this.baseUrl}${path}`, {
-        method: "POST",
-        headers: { authorization: `Bearer ${this.requireToken()}` },
-        body: form
-      });
-    } catch (error: unknown) {
-      throw new ClawchatApiError("transport", error instanceof Error ? error.message : String(error), {
-        path,
-        retryable: true
-      });
-    }
-    if (response.status === 401 && allowRefresh && this.refreshAccessToken) {
+    if (isAuthFailure(response, code) && allowRefresh && this.refreshAccessToken) {
       await this.refreshToken();
-      return this.uploadRequest(path, file, false);
+      return this.authenticatedEnvelope(path, execute, false);
     }
-    return this.unwrapRecord(response, path);
+    return { response, envelope, code };
   }
 
   private async refreshToken(): Promise<void> {
@@ -197,19 +212,28 @@ export class ClawchatApiClient {
     await this.refreshInFlight;
   }
 
-  private async unwrapRecord(response: Response, path: string): Promise<Record<string, unknown>> {
-    const envelope = await this.parseEnvelope(response, path);
-    const code = normalizeCode(envelope.code);
-    if (!response.ok || (code !== undefined && code !== 0)) {
-      throw new ClawchatApiError(response.status === 401 ? "auth" : "api", stringValue(envelope.msg) || "upload failed", {
-        status: response.status,
-        path,
-        ...(code !== undefined ? { code } : {}),
-        ...(isUnknownRecord(envelope.data) ? { data: envelope.data } : {})
-      });
+  private unwrapRecord(
+    response: Response,
+    path: string,
+    envelope: ApiEnvelope,
+    code: number | string | undefined
+  ): Record<string, unknown> {
+    if (!isSuccessfulResponse(response, code)) {
+      throw new ClawchatApiError(
+        classifyApiFailure(response, code),
+        stringValue(envelope.msg) || "upload failed",
+        {
+          status: response.status,
+          path,
+          ...(code !== undefined ? { code } : {}),
+          ...(isUnknownRecord(envelope.data) ? { data: envelope.data } : {})
+        }
+      );
     }
     const value = envelope.data === undefined ? envelope : envelope.data;
-    if (!isUnknownRecord(value)) throw new ClawchatApiError("transport", "upload response missing data", { path });
+    if (!isUnknownRecord(value)) {
+      throw new ClawchatApiError("transport", "upload response missing data", { path });
+    }
     return value;
   }
 
@@ -246,6 +270,30 @@ function normalizeCode(value: unknown): number | string | undefined {
     return Number.isFinite(number) ? number : value;
   }
   return undefined;
+}
+
+function isSuccessfulResponse(
+  response: Response,
+  code: number | string | undefined
+): boolean {
+  return code === undefined ? response.ok : code === 0;
+}
+
+function isAuthFailure(response: Response, code: number | string | undefined): boolean {
+  return (
+    code === 10003 ||
+    code === 40101 ||
+    (code === undefined && (response.status === 401 || response.status === 403))
+  );
+}
+
+function classifyApiFailure(
+  response: Response,
+  code: number | string | undefined
+): ClawchatApiErrorKind {
+  if (isAuthFailure(response, code)) return "auth";
+  if (code === 400) return "validation";
+  return "api";
 }
 
 function stringValue(value: unknown): string {

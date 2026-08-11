@@ -40,6 +40,7 @@ export async function createClawchatToolRuntime(options: {
 
   api = new ClawchatApiClient({
     baseUrl: profile.baseUrl,
+    mediaBaseUrl: websocketHttpOrigin(profile.websocketUrl),
     accessToken: () => profile.accessToken,
     refreshAccessToken: async () => {
       await refreshAccessToken();
@@ -58,4 +59,14 @@ export async function createClawchatToolRuntime(options: {
       memory
     }
   };
+}
+
+function websocketHttpOrigin(websocketUrl: string): string {
+  const url = new URL(websocketUrl);
+  if (url.protocol === "ws:") url.protocol = "http:";
+  if (url.protocol === "wss:") url.protocol = "https:";
+  url.pathname = "/";
+  url.search = "";
+  url.hash = "";
+  return url.origin;
 }

@@ -33,7 +33,7 @@ export interface ChatTurn {
 }
 
 export interface OutboundRecord {
-  messageId: string;
+  traceId: string;
   chatId: string;
   frame: unknown;
   attempts: number;
@@ -96,7 +96,7 @@ export class GatewayStore {
       ) STRICT;
 
       CREATE TABLE IF NOT EXISTS outbound_messages (
-        message_id TEXT PRIMARY KEY,
+        trace_id TEXT PRIMARY KEY,
         chat_id TEXT NOT NULL,
         frame_json TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('pending', 'acknowledged', 'failed')),
@@ -134,6 +134,13 @@ export class GatewayStore {
         UNIQUE (ack_epoch, dseq)
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS reliable_frames (
+        dedupe_key TEXT PRIMARY KEY,
+        event TEXT NOT NULL,
+        frame_json TEXT NOT NULL,
+        received_at INTEGER NOT NULL
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS tool_calls (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         id TEXT NOT NULL UNIQUE,
@@ -150,6 +157,7 @@ export class GatewayStore {
       CREATE INDEX IF NOT EXISTS tool_calls_by_chat
         ON tool_calls (chat_id, sequence);
     `);
+    migrateGatewaySchema(database);
     return new GatewayStore(database);
   }
 
@@ -347,20 +355,20 @@ export class GatewayStore {
     return rows.map((row) => row.chat_id);
   }
 
-  enqueueOutbound(input: { messageId: string; chatId: string; frame: unknown }): void {
+  enqueueOutbound(input: { traceId: string; chatId: string; frame: unknown }): void {
     this.database
       .prepare(
         `INSERT INTO outbound_messages
-          (message_id, chat_id, frame_json, status, attempts, created_at)
+          (trace_id, chat_id, frame_json, status, attempts, created_at)
          VALUES (?, ?, ?, 'pending', 0, ?)`
       )
-      .run(input.messageId, input.chatId, JSON.stringify(input.frame), Date.now());
+      .run(input.traceId, input.chatId, JSON.stringify(input.frame), Date.now());
   }
 
   listPendingOutbound(): OutboundRecord[] {
     const rows = this.database
       .prepare(
-        `SELECT message_id, chat_id, frame_json, attempts
+        `SELECT trace_id, chat_id, frame_json, attempts
          FROM outbound_messages
          WHERE status = 'pending'
          ORDER BY created_at, rowid`
@@ -369,27 +377,28 @@ export class GatewayStore {
     return rows.map(mapOutbound);
   }
 
-  recordOutboundAttempt(messageId: string): void {
+  recordOutboundAttempt(traceId: string): void {
     const result = this.database
       .prepare(
         `UPDATE outbound_messages
          SET attempts = attempts + 1
-         WHERE message_id = ? AND status = 'pending'`
+         WHERE trace_id = ? AND status = 'pending'`
       )
-      .run(messageId);
+      .run(traceId);
     if (result.changes !== 1) {
-      throw new Error(`Outbound message '${messageId}' is not pending`);
+      throw new Error(`Outbound trace '${traceId}' is not pending`);
     }
   }
 
-  acknowledgeOutbound(messageId: string): void {
+  acknowledgeOutbound(traceId: string): void {
     this.database
       .prepare(
         `UPDATE outbound_messages
          SET status = 'acknowledged', acknowledged_at = ?
-         WHERE message_id = ? AND status = 'pending'`
+         WHERE status = 'pending'
+           AND (trace_id = ? OR json_extract(frame_json, '$.trace_id') = ?)`
       )
-      .run(Date.now(), messageId);
+      .run(Date.now(), traceId, traceId);
   }
 
   setToolOutputOverride(chatId: string, value: "on" | "off" | "inherit"): void {
@@ -497,14 +506,38 @@ export class GatewayStore {
       );
   }
 
-  failOutbound(messageId: string, code: string, reason?: string): void {
+  failOutbound(traceId: string, code: string, reason?: string): void {
     this.database
       .prepare(
         `UPDATE outbound_messages
          SET status = 'failed', failed_at = ?, error_code = ?, error_reason = ?
-         WHERE message_id = ? AND status = 'pending'`
+         WHERE status = 'pending'
+           AND (trace_id = ? OR json_extract(frame_json, '$.trace_id') = ?)`
       )
-      .run(Date.now(), code, reason ?? null, messageId);
+      .run(Date.now(), code, reason ?? null, traceId, traceId);
+  }
+
+  persistReliableFrame(dedupeKey: string, event: string, frame: unknown): boolean {
+    const result = this.database
+      .prepare(
+        `INSERT OR IGNORE INTO reliable_frames
+          (dedupe_key, event, frame_json, received_at)
+         VALUES (?, ?, ?, ?)`
+      )
+      .run(dedupeKey, event, JSON.stringify(frame), Date.now());
+    return result.changes === 1;
+  }
+
+  listReliableFrames(event: string): unknown[] {
+    const rows = this.database
+      .prepare(
+        `SELECT frame_json
+         FROM reliable_frames
+         WHERE event = ?
+         ORDER BY received_at, dedupe_key`
+      )
+      .all(event) as unknown as Array<{ frame_json: string }>;
+    return rows.map((row) => JSON.parse(row.frame_json) as unknown);
   }
 
   recordToolCall(input: {
@@ -556,7 +589,7 @@ interface ChatTurnRow {
 }
 
 interface OutboundRow {
-  message_id: string;
+  trace_id: string;
   chat_id: string;
   frame_json: string;
   attempts: number;
@@ -587,9 +620,18 @@ function mapChatTurn(row: ChatTurnRow): ChatTurn {
 
 function mapOutbound(row: OutboundRow): OutboundRecord {
   return {
-    messageId: row.message_id,
+    traceId: row.trace_id,
     chatId: row.chat_id,
     frame: JSON.parse(row.frame_json) as unknown,
     attempts: row.attempts
   };
+}
+
+function migrateGatewaySchema(database: DatabaseSyncType): void {
+  const columns = database.prepare("PRAGMA table_info(outbound_messages)").all() as Array<{
+    name: string;
+  }>;
+  if (columns.some((column) => column.name === "message_id")) {
+    database.exec("ALTER TABLE outbound_messages RENAME COLUMN message_id TO trace_id");
+  }
 }

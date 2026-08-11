@@ -128,11 +128,11 @@ Duplicate replay or live delivery never creates a second Pi turn. Dedupe uses th
 ### Outbound delivery
 
 - `message.reply` is inserted into an outbox before the Gateway writes it to the socket.
-- Every materialized reply gets one conforming client-generated `message_id`; retries reuse that ID.
-- `message.ack` marks the outbox item accepted by the server. Reconnect resends unacknowledged items after replay completes.
-- `message.error` applies the terminal or retry behavior defined by the protocol error code.
+- Ordinary materialized uplinks omit `payload.message_id`; the server mints the stable message identity.
+- The outbox uses the client-generated `trace_id` as its local correlation key. `message.ack` or `message.error` echoes that trace and settles the matching row.
+- Reconnect resends an unacknowledged frame with the same `trace_id` after replay completes or the replay stream becomes idle.
 - `typing.update` is ephemeral, best effort, and never enters the outbox.
-- A retry may be delivered more than once by a legacy server, so stable message IDs remain mandatory even without reliable downlink negotiation.
+- A retry can be delivered more than once because `trace_id` is correlation, not a server idempotency key; the protocol's ordinary-uplink identifier rule takes precedence over client-side deduplication.
 
 ## Routing and chat policy
 
@@ -228,7 +228,7 @@ Structured logs include profile name, connection generation, `chat_id`, turn ID,
 - Mention mode uses structured mention metadata, not display-name or text matching.
 - WebSocket replay duplicates do not create duplicate Pi turns.
 - Reliable v2 acknowledgement never advances past an uncommitted or missing dense `dseq`; v1 never assumes dense `seq` values.
-- An unacknowledged outbound reply is retried with the same `message_id` after reconnect.
+- An unacknowledged outbound reply is retried with the same `trace_id` and without a client-supplied `payload.message_id`.
 - Thinking output follows the Pi thinking level; tool output follows profile default plus the per-chat override.
 - No streaming lifecycle frame or synthetic busy/failure reply is emitted.
 - A stopped Host session opens through `pi --session <path>` and is subsequently reusable by the Host.

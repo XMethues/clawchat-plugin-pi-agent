@@ -67,7 +67,7 @@ describe("HostProfileRepository", () => {
     const gatewayPath = join(profileDirectory, "gateway.sqlite");
     const gateway = GatewayStore.open(gatewayPath);
     gateway.getOrCreateChatSession("chat-1", () => ({ sessionId: "session-1", sessionPath }));
-    gateway.enqueueOutbound({ messageId: "out-1", chatId: "chat-1", frame: { event: "message.send" } });
+    gateway.enqueueOutbound({ traceId: "out-1", chatId: "chat-1", frame: { event: "message.send" } });
     gateway.close();
 
     const rebound = await profiles.prepareActivation("default", workspace);

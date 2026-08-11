@@ -3,7 +3,7 @@ export type { ActivateClawchatOptions, ActivationResult } from "./activation.js"
 export { DEFAULT_BASE_URL, DEFAULT_WEBSOCKET_URL } from "./config.js";
 export { createClawchatPiExtension } from "./extension.js";
 export type { ClawchatPiExtensionOptions } from "./extension.js";
-export { ClawChatGateway, createMessageId } from "./gateway.js";
+export { ClawChatGateway } from "./gateway.js";
 export type { ClawChatGatewayOptions } from "./gateway.js";
 export { GatewayStore } from "./gateway-store.js";
 export type {

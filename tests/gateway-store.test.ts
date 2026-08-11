@@ -1,8 +1,14 @@
 import { mkdtemp, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createRequire } from "node:module";
+import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { GatewayStore } from "../src/gateway-store.js";
+
+const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as {
+  DatabaseSync: typeof DatabaseSyncType;
+};
 
 describe("GatewayStore", () => {
   it("keeps one Pi session mapping for a chat across restarts", async () => {
@@ -95,23 +101,23 @@ describe("GatewayStore", () => {
     const path = join(directory, "gateway.sqlite");
     const store = GatewayStore.open(path);
     store.enqueueOutbound({
-      messageId: "msg-out-1",
+      traceId: "trace-out-1",
       chatId: "chat-1",
-      frame: { event: "message.reply", payload: { message_id: "msg-out-1" } }
+      frame: { event: "message.reply", trace_id: "trace-out-1", payload: {} }
     });
     store.close();
 
     const reopened = GatewayStore.open(path);
-    reopened.recordOutboundAttempt("msg-out-1");
+    reopened.recordOutboundAttempt("trace-out-1");
     expect(reopened.listPendingOutbound()).toEqual([
       {
-        messageId: "msg-out-1",
+        traceId: "trace-out-1",
         chatId: "chat-1",
-        frame: { event: "message.reply", payload: { message_id: "msg-out-1" } },
+        frame: { event: "message.reply", trace_id: "trace-out-1", payload: {} },
         attempts: 1
       }
     ]);
-    reopened.acknowledgeOutbound("msg-out-1");
+    reopened.acknowledgeOutbound("trace-out-1");
     expect(reopened.listPendingOutbound()).toEqual([]);
     reopened.close();
   });
@@ -127,5 +133,26 @@ describe("GatewayStore", () => {
     store.setToolOutputOverride("chat-1", "inherit");
     expect(store.getToolOutputOverrides()).toEqual({ "chat-2": "off" });
     store.close();
+  });
+
+  it("migrates legacy outbound message ids to trace correlation ids", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const path = join(directory, "gateway.sqlite");
+    const original = GatewayStore.open(path);
+    original.enqueueOutbound({
+      traceId: "trace-out-1",
+      chatId: "chat-1",
+      frame: { event: "message.reply", trace_id: "trace-out-1", payload: {} }
+    });
+    original.close();
+    const legacy = new DatabaseSync(path);
+    legacy.exec("ALTER TABLE outbound_messages RENAME COLUMN trace_id TO message_id");
+    legacy.close();
+
+    const migrated = GatewayStore.open(path);
+    expect(migrated.listPendingOutbound()).toEqual([
+      expect.objectContaining({ traceId: "trace-out-1" })
+    ]);
+    migrated.close();
   });
 });

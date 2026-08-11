@@ -41,11 +41,17 @@ export interface ClawchatInboundMessage {
   sender: ClawchatPeer;
   payload: {
     message_id: string;
+    message_mode?: string;
     message: {
       body: {
         fragments: ClawchatFragment[];
       };
       context?: Record<string, unknown>;
+      streaming?: {
+        status: "static";
+        sequence: number;
+        mutation_policy: "sealed";
+      };
     };
   };
 }

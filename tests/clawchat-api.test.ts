@@ -64,6 +64,80 @@ describe("ClawchatApiClient", () => {
       body: JSON.stringify({ refresh_token: "refresh-1" })
     }));
   });
+  it("routes media uploads to the gateway origin without moving REST uploads", async () => {
+    const urls: string[] = [];
+    const fetchFn = vi.fn(async (input: string | URL | Request) => {
+      urls.push(String(input));
+      return jsonResponse({ code: 0, data: { url: "https://cdn.example/file", mime: "text/plain", size: 1 } });
+    });
+    const api = new ClawchatApiClient({
+      baseUrl: "https://api.example.test",
+      mediaBaseUrl: "https://gateway.example.test",
+      accessToken: () => "access-1",
+      fetchFn: fetchFn as typeof fetch
+    });
+    const file = { bytes: new Uint8Array([65]), filename: "a.txt", mime: "text/plain" };
+
+    await api.upload("/media/upload", file);
+    await api.upload("/v1/files/upload-url", file);
+
+    expect(urls).toEqual([
+      "https://gateway.example.test/media/upload",
+      "https://api.example.test/v1/files/upload-url"
+    ]);
+  });
+
+  it("refreshes and retries media uploads rejected with code 40101", async () => {
+    let accessToken = "access-1";
+    const seenTokens: string[] = [];
+    const fetchFn = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      seenTokens.push(new Headers(init?.headers).get("authorization") ?? "");
+      if (seenTokens.length === 1) {
+        return jsonResponse({ code: 40101, msg: "invalid token", data: null }, 401);
+      }
+      return jsonResponse({ code: 0, data: { url: "https://cdn.example/file" } });
+    });
+    const refreshAccessToken = vi.fn(async () => {
+      accessToken = "access-2";
+    });
+    const api = new ClawchatApiClient({
+      baseUrl: "https://api.example.test",
+      mediaBaseUrl: "https://gateway.example.test",
+      accessToken: () => accessToken,
+      refreshAccessToken,
+      fetchFn: fetchFn as typeof fetch
+    });
+
+    await expect(api.upload("/media/upload", {
+      bytes: new Uint8Array([65]),
+      filename: "a.txt",
+      mime: "text/plain"
+    })).resolves.toEqual({ url: "https://cdn.example/file" });
+    expect(refreshAccessToken).toHaveBeenCalledOnce();
+    expect(seenTokens).toEqual(["Bearer access-1", "Bearer access-2"]);
+  });
+
+  it("uses envelope codes as the response and authentication authority", async () => {
+    let accessToken = "access-1";
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse({ code: 10003, msg: "expired", data: null }, 200))
+      .mockResolvedValueOnce(jsonResponse({ code: 0, data: { id: "user-1" } }, 503))
+      .mockResolvedValueOnce(jsonResponse({ code: 0, data: { id: "user-2" } }, 500));
+    const refreshAccessToken = vi.fn(async () => {
+      accessToken = "access-2";
+    });
+    const api = new ClawchatApiClient({
+      baseUrl: "https://app.clawling.com",
+      accessToken: () => accessToken,
+      refreshAccessToken,
+      fetchFn: fetchFn as typeof fetch
+    });
+
+    await expect(api.get("/v1/users/me")).resolves.toEqual({ id: "user-1" });
+    await expect(api.get("/v1/users/user-2")).resolves.toEqual({ id: "user-2" });
+    expect(refreshAccessToken).toHaveBeenCalledOnce();
+  });
 });
 
 function jsonResponse(body: unknown, status = 200): Response {

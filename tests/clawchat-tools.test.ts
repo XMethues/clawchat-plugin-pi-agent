@@ -71,6 +71,10 @@ describe("registerClawchatTools", () => {
         })
       })
     }));
+    expect(sendFrame).toHaveBeenCalledWith(expect.objectContaining({
+      payload: expect.not.objectContaining({ message_id: expect.anything() })
+    }));
+    expect(result.details).toMatchObject({ traceId: "pi-tool-trace-1" });
     expect(result.details).toMatchObject({ sent: true, terminal: true, noFollowupReply: true });
     expect(onTerminalSend).toHaveBeenCalledOnce();
 

@@ -28,6 +28,8 @@ describe("HeadlessPiHost", () => {
     const replied = new Promise<string>((resolve) => {
       resolveReply = resolve;
     });
+    const delivered = Promise.withResolvers<string>();
+    const connected = Promise.withResolvers<Record<string, unknown>>();
     server.on("connection", (socket) => {
       socket.send(
         JSON.stringify({
@@ -41,6 +43,7 @@ describe("HeadlessPiHost", () => {
       socket.on("message", (raw) => {
         const frame = JSON.parse(raw.toString()) as Record<string, any>;
         if (frame.event === "connect") {
+          connected.resolve(frame.payload.capabilities);
           socket.send(
             JSON.stringify({
               version: "2",
@@ -66,6 +69,16 @@ describe("HeadlessPiHost", () => {
               payload: { message_id: frame.payload.message_id, accepted_at: 5 }
             })
           );
+          socket.send(
+            JSON.stringify({
+              version: "2",
+              event: "message.delivered",
+              trace_id: "delivery-1",
+              emitted_at: 6,
+              chat_id: frame.chat_id,
+              payload: { message_id: "server-message-1", delivered_at: 6 }
+            })
+          );
         }
       });
     });
@@ -86,10 +99,23 @@ describe("HeadlessPiHost", () => {
       },
       { websocketUrl: websocketUrl(server) }
     );
-    const host = new HeadlessPiHost({ agentDir, profiles, profileName: "default" });
+    const host = new HeadlessPiHost({
+      agentDir,
+      profiles,
+      profileName: "default",
+      onDeliveryReceipt: (event) => delivered.resolve(String(event.payload?.message_id))
+    });
 
     await host.start();
+    await expect(connected.promise).resolves.toEqual({
+      multi_device: true,
+      device_replay: true,
+      delivery_receipt: true,
+      reliable_delivery: true,
+      reliable_delivery_v2: true
+    });
     await expect(replied).resolves.toBe("ClawChat group dispatch: all.");
+    await expect(delivered.promise).resolves.toBe("server-message-1");
     await host.stop();
 
     const store = GatewayStore.open(join(profiles.profileDirectory("default"), "gateway.sqlite"));

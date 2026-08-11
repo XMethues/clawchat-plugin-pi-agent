@@ -1,8 +1,19 @@
-import { randomBytes } from "node:crypto";
 import WebSocket from "ws";
 import type { GatewayStore } from "./gateway-store.js";
 import type { InboundDecision } from "./inbound-router.js";
-import type { ClawchatInboundMessage } from "./types.js";
+import type { ClawchatFragment, ClawchatInboundMessage, ClawchatPeer } from "./types.js";
+import { isUnknownRecord } from "./type-guards.js";
+
+export interface ClawchatGatewayEvent {
+  version: "2";
+  event: string;
+  trace_id?: string;
+  emitted_at?: number;
+  chat_id?: string;
+  chat_type?: unknown;
+  sender?: unknown;
+  payload?: Record<string, unknown>;
+}
 
 export interface ClawChatGatewayOptions {
   websocketUrl: string;
@@ -15,12 +26,16 @@ export interface ClawChatGatewayOptions {
   shouldDispatch?: (message: ClawchatInboundMessage) => boolean;
   classifyInbound?: (message: ClawchatInboundMessage) => InboundDecision;
   onAcceptedControl?: (message: ClawchatInboundMessage, decision: InboundDecision) => Promise<void>;
+  onAwarenessSignal?: (event: ClawchatGatewayEvent) => Promise<void>;
+  onHistoryTransit?: (event: ClawchatGatewayEvent) => Promise<void>;
+  onDeliveryReceipt?: (event: ClawchatGatewayEvent) => Promise<void>;
   queueTurns?: boolean;
   onStatus?: (status: string) => void;
   reconnect?: boolean;
   reconnectDelay?: (attempt: number) => number;
   ackDebounceMs?: number;
   ackHeartbeatMs?: number;
+  replayIdleTimeoutMs?: number;
   handshakeTimeoutMs?: number;
   now?: () => number;
   idFactory?: () => string;
@@ -33,6 +48,14 @@ interface ProtocolEnvelope {
   emitted_at?: number;
   payload?: Record<string, unknown>;
   [key: string]: unknown;
+}
+
+interface InboundStreamState {
+  chatId: string;
+  chatType: "direct" | "group";
+  sender: ClawchatPeer;
+  messageMode: unknown;
+  nextSequence: number;
 }
 
 export class ClawChatGateway {
@@ -50,9 +73,12 @@ export class ClawChatGateway {
   private ackTimer: ReturnType<typeof setTimeout> | undefined;
   private ackHeartbeat: ReturnType<typeof setInterval> | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+  private replayIdleTimer: ReturnType<typeof setTimeout> | undefined;
+  private replayIdleGeneration = 0;
   private reconnectAttempt = 0;
   private replayComplete = false;
   private handshakeRefreshAttempted = false;
+  private readonly inboundStreams = new Map<string, InboundStreamState>();
 
   constructor(options: ClawChatGatewayOptions) {
     this.options = options;
@@ -82,36 +108,36 @@ export class ClawChatGateway {
 
   async stop(): Promise<void> {
     this.stopping = true;
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
-    if (this.ackTimer) clearTimeout(this.ackTimer);
+    this.clearReplayIdleFallback();
+    clearTimeout(this.ackTimer);
     this.ackTimer = undefined;
-    if (this.ackHeartbeat) clearInterval(this.ackHeartbeat);
+    clearInterval(this.ackHeartbeat);
     this.ackHeartbeat = undefined;
     this.flushAcknowledgement();
     const socket = this.socket;
     this.socket = undefined;
-    if (!socket || socket.readyState === WebSocket.CLOSED) return;
-    const { promise, resolve } = Promise.withResolvers<void>();
-    socket.once("close", () => resolve());
-    socket.close();
-    await promise;
+    if (socket && socket.readyState !== WebSocket.CLOSED) {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      socket.once("close", () => resolve());
+      socket.close();
+      await promise;
+    }
+    await this.frameQueue;
   }
 
   async send(message: unknown): Promise<void> {
     const envelope = cloneOutboundEnvelope(message);
     if (envelope.event === "message.reply" || envelope.event === "message.send") {
-      const messageId =
-        typeof envelope.payload?.message_id === "string"
-          ? envelope.payload.message_id
-          : createMessageId(this.now());
-      envelope.payload = { ...envelope.payload, message_id: messageId };
+      const traceId = requireString(envelope.trace_id, "trace_id");
+      if (envelope.payload) delete envelope.payload.message_id;
       this.options.store.enqueueOutbound({
-        messageId,
+        traceId,
         chatId: requireString(envelope.chat_id, "chat_id"),
         frame: envelope
       });
-      this.sendApplicationFrame(envelope);
+      this.sendApplicationFrame(envelope, traceId);
       return;
     }
     if (envelope.event === "typing.update") {
@@ -130,51 +156,54 @@ export class ClawChatGateway {
 
   private openConnection(): Promise<void> {
     const { promise, resolve, reject } = Promise.withResolvers<void>();
-      const socket = new WebSocket(this.options.websocketUrl);
-      this.socket = socket;
-      this.frameQueue = Promise.resolve();
-      this.replayComplete = false;
-      let ready = false;
-      const handshakeTimer = setTimeout(() => {
-        if (ready) return;
-        reject(new ReconnectableHandshakeError("ClawChat handshake timed out"));
-        socket.close();
-      }, this.options.handshakeTimeoutMs ?? 10_000);
+    const socket = new WebSocket(this.options.websocketUrl);
+    this.socket = socket;
+    this.frameQueue = Promise.resolve();
+    this.clearReplayIdleFallback();
+    this.replayComplete = false;
+    let ready = false;
+    const handshakeTimer = setTimeout(() => {
+      if (ready) return;
+      reject(new ReconnectableHandshakeError("ClawChat handshake timed out"));
+      socket.close();
+    }, this.options.handshakeTimeoutMs ?? 10_000);
 
-      const failBeforeReady = (error: Error) => {
-        if (!ready) reject(new ReconnectableHandshakeError(error.message));
-      };
-      socket.once("error", failBeforeReady);
-      socket.on("message", (raw) => {
-        this.frameQueue = this.frameQueue
-          .then(() =>
-            this.handleFrame(parseEnvelope(raw), {
-              ready: () => {
-                if (ready) return;
-                ready = true;
-                clearTimeout(handshakeTimer);
-                socket.off("error", failBeforeReady);
-                this.options.onStatus?.("connected");
-                resolve();
-              },
-              reject
-            })
-          )
-          .catch((error: unknown) => {
-            const message = error instanceof Error ? error.message : String(error);
-            this.options.onStatus?.(`protocol error: ${message}`);
-            if (!ready) reject(error instanceof Error ? error : new Error(message));
-            socket.close();
-          });
-      });
-      socket.on("close", () => {
-        clearTimeout(handshakeTimer);
-        if (!ready) reject(new ReconnectableHandshakeError("ClawChat WebSocket closed before hello-ok"));
-        if (!this.stopping) {
-          this.options.onStatus?.("disconnected");
-          if (ready) this.scheduleReconnect();
-        }
-      });
+    const failBeforeReady = (error: Error) => {
+      if (!ready) reject(new ReconnectableHandshakeError(error.message));
+    };
+    socket.once("error", failBeforeReady);
+    socket.on("message", (raw) => {
+      if (ready && !this.replayComplete) this.armReplayIdleFallback();
+      this.frameQueue = this.frameQueue
+        .then(() =>
+          this.handleFrame(parseEnvelope(raw), {
+            ready: () => {
+              if (ready) return;
+              ready = true;
+              clearTimeout(handshakeTimer);
+              socket.off("error", failBeforeReady);
+              this.options.onStatus?.("connected");
+              resolve();
+            },
+            reject
+          })
+        )
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          this.options.onStatus?.(`protocol error: ${message}`);
+          if (!ready) reject(error instanceof Error ? error : new Error(message));
+          socket.close();
+        });
+    });
+    socket.on("close", () => {
+      clearTimeout(handshakeTimer);
+      this.clearReplayIdleFallback();
+      if (!ready) reject(new ReconnectableHandshakeError("ClawChat WebSocket closed before hello-ok"));
+      if (!this.stopping) {
+        this.options.onStatus?.("disconnected");
+        if (ready) this.scheduleReconnect();
+      }
+    });
     return promise;
   }
 
@@ -196,6 +225,11 @@ export class ClawChatGateway {
           capabilities: {
             multi_device: true,
             device_replay: true,
+            ...(this.options.onAwarenessSignal
+              ? { chat_meta_events: true, notify_signals: true }
+              : {}),
+            ...(this.options.onDeliveryReceipt ? { delivery_receipt: true } : {}),
+            ...(this.options.onHistoryTransit ? { history_sync: true } : {}),
             reliable_delivery: true,
             reliable_delivery_v2: true
           }
@@ -213,16 +247,18 @@ export class ClawChatGateway {
         this.ackMode = "cursor";
         this.ackEpoch = undefined;
       }
-      if (this.ackHeartbeat) clearInterval(this.ackHeartbeat);
+      clearInterval(this.ackHeartbeat);
       this.ackHeartbeat = setInterval(
         () => this.flushAcknowledgement(),
         this.options.ackHeartbeatMs ?? 30_000
       );
       handshake.ready();
+      this.armReplayIdleFallback();
       return;
     }
     if (envelope.event === "hello-fail") {
-      const reason = typeof envelope.payload?.reason === "string" ? envelope.payload.reason : "unknown reason";
+      const reason =
+        typeof envelope.payload?.reason === "string" ? envelope.payload.reason : "unknown reason";
       if (reason === "remote auth service unavailable") {
         handshake.reject(new TransientHandshakeError(`ClawChat hello failed: ${reason}`));
       } else if (
@@ -254,6 +290,7 @@ export class ClawChatGateway {
       this.socket?.terminate();
       return;
     }
+
     if (envelope.event === "ping") {
       this.sendRaw({
         version: "2",
@@ -264,47 +301,58 @@ export class ClawChatGateway {
       });
       return;
     }
-
     if (envelope.event === "message.ack") {
-      const messageId = envelope.payload?.message_id;
-      if (typeof messageId === "string") this.options.store.acknowledgeOutbound(messageId);
-      return;
-    }
-
-    if (envelope.event === "message.error") {
-      const messageId = envelope.payload?.message_id;
-      const code = envelope.payload?.code;
-      if (typeof messageId === "string" && typeof code === "string") {
-        const reason = typeof envelope.payload?.reason === "string" ? envelope.payload.reason : undefined;
-        this.options.store.failOutbound(messageId, code, reason);
-        this.options.onStatus?.(`outbound ${messageId} failed: ${code}`);
+      if (typeof envelope.trace_id === "string") {
+        this.options.store.acknowledgeOutbound(envelope.trace_id);
       }
       return;
     }
-
+    if (envelope.event === "message.error") {
+      const code = envelope.payload?.code;
+      if (typeof envelope.trace_id === "string" && typeof code === "string") {
+        const reason =
+          typeof envelope.payload?.reason === "string" ? envelope.payload.reason : undefined;
+        this.options.store.failOutbound(envelope.trace_id, code, reason);
+        this.options.onStatus?.(`outbound ${envelope.trace_id} failed: ${code}`);
+      }
+      return;
+    }
+    if (envelope.event === "chat.metadata.invalidated") {
+      await this.options.onAwarenessSignal?.(envelope);
+      return;
+    }
+    if (envelope.event === "message.delivered") {
+      await this.options.onDeliveryReceipt?.(envelope);
+      return;
+    }
+    if (
+      envelope.event === "message.created" ||
+      envelope.event === "message.add" ||
+      envelope.event === "message.done" ||
+      envelope.event === "message.failed"
+    ) {
+      await this.handleInboundStream(envelope);
+      return;
+    }
     if (this.ackMode === "dseq" && typeof envelope.dseq === "number") {
       await this.handleDseqFrame(envelope);
       return;
     }
-
-    if (envelope.event === "replay.done") {
-      this.reconnectAttempt = 0;
-      this.replayComplete = true;
-      this.flushOutbox();
-      return;
-    }
-
-    if (
-      this.ackMode === "cursor" &&
-      typeof envelope.seq === "number" &&
-      (envelope.event === "message.send" || envelope.event === "message.reply")
-    ) {
-      await this.persistInboundMessage(envelope);
+    if (this.ackMode === "cursor" && typeof envelope.seq === "number") {
+      await this.persistReliableInbound(envelope);
       this.ackHighWater = Math.max(this.ackHighWater, envelope.seq);
-      this.scheduleAcknowledgement(false);
+      this.scheduleAcknowledgement(envelope.event === "replay.done");
+      if (envelope.event === "replay.done") this.completeReplay();
       return;
     }
-
+    if (envelope.event === "replay.done") {
+      this.completeReplay();
+      return;
+    }
+    if (envelope.event === "notify.signal" || envelope.event === "history.transit") {
+      await this.persistReliableInbound(envelope);
+      return;
+    }
     if (envelope.event === "message.send" || envelope.event === "message.reply") {
       await this.persistInboundMessage(envelope);
     }
@@ -316,31 +364,57 @@ export class ClawChatGateway {
       throw new Error(`expected dseq ${this.lastReadDseq + 1}, received ${dseq}`);
     }
     this.lastReadDseq = dseq;
-
-    if (envelope.event === "message.send" || envelope.event === "message.reply") {
-      try {
-        await this.persistInboundMessage(envelope);
-      } catch (error: unknown) {
-        this.options.store.quarantineInboundFrame({
-          ...(this.ackEpoch ? { ackEpoch: this.ackEpoch } : {}),
-          dseq,
-          event: envelope.event,
-          reason: error instanceof Error ? error.message : String(error),
-          frame: envelope
-        });
-        this.options.onStatus?.(`quarantined dseq ${dseq}`);
-      }
+    try {
+      await this.persistReliableInbound(envelope);
+    } catch (error: unknown) {
+      this.options.store.quarantineInboundFrame({
+        ...(this.ackEpoch ? { ackEpoch: this.ackEpoch } : {}),
+        dseq,
+        event: envelope.event,
+        reason: error instanceof Error ? error.message : String(error),
+        frame: envelope
+      });
+      this.options.onStatus?.(`quarantined dseq ${dseq}`);
     }
     this.ackHighWater = dseq;
     this.scheduleAcknowledgement(envelope.event === "replay.done");
-    if (envelope.event === "replay.done") {
-      this.reconnectAttempt = 0;
-      this.replayComplete = true;
-      this.flushOutbox();
-    }
+    if (envelope.event === "replay.done") this.completeReplay();
   }
 
-  private async persistInboundMessage(envelope: ProtocolEnvelope): Promise<void> {
+  private async persistReliableInbound(envelope: ProtocolEnvelope): Promise<void> {
+    if (envelope.event === "message.send" || envelope.event === "message.reply") {
+      await this.persistInboundMessage(envelope);
+      return;
+    }
+    if (envelope.event === "history.transit") {
+      const traceId = requireString(envelope.trace_id, "trace_id");
+      const inserted = this.options.store.persistReliableFrame(
+        `history:${traceId}`,
+        envelope.event,
+        envelope
+      );
+      if (inserted) await this.options.onHistoryTransit?.(envelope);
+      return;
+    }
+    if (envelope.event === "notify.signal") {
+      const eventId = requireString(envelope.payload?.event_id, "payload.event_id");
+      const inserted = this.options.store.persistReliableFrame(
+        `notify:${eventId}`,
+        envelope.event,
+        envelope
+      );
+      if (inserted) await this.options.onAwarenessSignal?.(envelope);
+      return;
+    }
+    if (envelope.event === "sync.mark" || envelope.event === "replay.done") return;
+    const traceId = requireString(envelope.trace_id, "trace_id");
+    this.options.store.persistReliableFrame(`event:${traceId}`, envelope.event, envelope);
+  }
+
+  private async persistInboundMessage(
+    envelope: ProtocolEnvelope | ClawchatInboundMessage,
+    emitReceipt = true
+  ): Promise<void> {
     if (!isInboundMessage(envelope)) {
       throw new Error(`invalid ${envelope.event} frame`);
     }
@@ -358,12 +432,133 @@ export class ClawChatGateway {
       dispatch: decision.dispatch,
       queueTurn: this.options.queueTurns !== false
     });
+    if (!ownMessage && emitReceipt) this.sendDeliveryReceipt(envelope);
     if (admission.status !== "accepted") return;
     if (decision.control) {
       await this.options.onAcceptedControl?.(envelope, decision);
     } else if (decision.dispatch) {
       await this.options.onInboundMessage(envelope);
     }
+  }
+
+  private async handleInboundStream(envelope: ProtocolEnvelope): Promise<void> {
+    const messageId = requireString(envelope.payload?.message_id, "payload.message_id");
+    if (envelope.event === "message.created") {
+      this.inboundStreams.set(messageId, {
+        chatId: requireString(envelope.chat_id, "chat_id"),
+        chatType: requireChatType(envelope.chat_type),
+        sender: requirePeer(envelope.sender),
+        messageMode: envelope.payload?.message_mode,
+        nextSequence: 0
+      });
+      return;
+    }
+    const stream = this.inboundStreams.get(messageId);
+    if (!stream) {
+      this.options.onStatus?.(`ignored ${envelope.event} for unknown stream ${messageId}`);
+      return;
+    }
+    if (envelope.event === "message.failed") {
+      this.inboundStreams.delete(messageId);
+      return;
+    }
+    if (envelope.event === "message.add") {
+      const sequence = envelope.payload?.sequence;
+      if (sequence !== stream.nextSequence) {
+        this.inboundStreams.delete(messageId);
+        this.options.onStatus?.(
+          `dropped stream ${messageId}: expected sequence ${stream.nextSequence}, received ${String(sequence)}`
+        );
+        return;
+      }
+      if (!Array.isArray(envelope.payload?.fragments)) {
+        this.inboundStreams.delete(messageId);
+        this.options.onStatus?.(`dropped stream ${messageId}: invalid fragments`);
+        return;
+      }
+      stream.nextSequence += 1;
+      return;
+    }
+
+    this.inboundStreams.delete(messageId);
+    const fragments = parseStreamFragments(envelope.payload?.fragments);
+    if (!fragments) {
+      this.options.onStatus?.(`dropped stream ${messageId}: invalid final fragments`);
+      return;
+    }
+    const materialized: ClawchatInboundMessage = {
+      version: "2",
+      event: "message.send",
+      trace_id: requireString(envelope.trace_id, "trace_id"),
+      emitted_at: typeof envelope.emitted_at === "number" ? envelope.emitted_at : this.now(),
+      chat_id: stream.chatId,
+      chat_type: stream.chatType,
+      sender: stream.sender,
+      payload: {
+        message_id: messageId,
+        ...(typeof stream.messageMode === "string" ? { message_mode: stream.messageMode } : {}),
+        message: {
+          body: { fragments },
+          context: { mentions: [], reply: null },
+          streaming: {
+            status: "static",
+            sequence: Math.max(0, stream.nextSequence - 1),
+            mutation_policy: "sealed"
+          }
+        }
+      }
+    };
+    await this.persistInboundMessage(materialized, false);
+  }
+
+  private sendDeliveryReceipt(message: ClawchatInboundMessage): void {
+    this.sendRaw({
+      version: "2",
+      event: "message.delivered",
+      trace_id: `delivered-${this.idFactory()}`,
+      emitted_at: this.now(),
+      chat_id: message.chat_id,
+      to: { id: message.sender.id, type: "direct" },
+      payload: {
+        message_id: message.payload.message_id,
+        delivered_at: this.now()
+      }
+    });
+  }
+
+  private armReplayIdleFallback(): void {
+    if (this.replayComplete || this.stopping) return;
+    clearTimeout(this.replayIdleTimer);
+    const generation = ++this.replayIdleGeneration;
+    const enqueueCompletion = () => {
+      if (generation !== this.replayIdleGeneration || this.replayComplete || this.stopping) return;
+      this.replayIdleTimer = undefined;
+      this.frameQueue = this.frameQueue.then(() => {
+        if (generation === this.replayIdleGeneration && !this.replayComplete && !this.stopping) {
+          this.completeReplay();
+        }
+      });
+    };
+    const timeout = this.options.replayIdleTimeoutMs ?? 5_000;
+    if (timeout === 0) {
+      queueMicrotask(enqueueCompletion);
+    } else {
+      this.replayIdleTimer = setTimeout(enqueueCompletion, timeout);
+    }
+  }
+
+  private clearReplayIdleFallback(): void {
+    this.replayIdleGeneration += 1;
+    clearTimeout(this.replayIdleTimer);
+    this.replayIdleTimer = undefined;
+  }
+
+  private completeReplay(): void {
+    if (this.replayComplete) return;
+    this.clearReplayIdleFallback();
+    this.reconnectAttempt = 0;
+    this.replayComplete = true;
+    this.flushOutbox();
   }
 
   private scheduleAcknowledgement(immediate = false): void {
@@ -401,14 +596,14 @@ export class ClawChatGateway {
 
   private flushOutbox(): void {
     for (const pending of this.options.store.listPendingOutbound()) {
-      this.sendApplicationFrame(cloneOutboundEnvelope(pending.frame));
+      this.sendApplicationFrame(cloneOutboundEnvelope(pending.frame), pending.traceId);
     }
   }
 
-  private sendApplicationFrame(frame: ProtocolEnvelope): void {
+  private sendApplicationFrame(frame: ProtocolEnvelope, traceId: string): void {
     if (!this.replayComplete || this.socket?.readyState !== WebSocket.OPEN) return;
-    const messageId = requireString(frame.payload?.message_id, "payload.message_id");
-    this.options.store.recordOutboundAttempt(messageId);
+    if (frame.payload) delete frame.payload.message_id;
+    this.options.store.recordOutboundAttempt(traceId);
     this.socket.send(JSON.stringify(frame));
   }
 
@@ -446,7 +641,9 @@ function parseEnvelope(raw: WebSocket.RawData): ProtocolEnvelope | null {
   }
 }
 
-function isInboundMessage(envelope: ProtocolEnvelope): envelope is ProtocolEnvelope & ClawchatInboundMessage {
+function isInboundMessage(
+  envelope: ProtocolEnvelope | ClawchatInboundMessage
+): envelope is ClawchatInboundMessage {
   const candidate = envelope as Partial<ClawchatInboundMessage>;
   return (
     (candidate.event === "message.send" || candidate.event === "message.reply") &&
@@ -458,29 +655,61 @@ function isInboundMessage(envelope: ProtocolEnvelope): envelope is ProtocolEnvel
   );
 }
 
-const CROCKFORD_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-
-export function createMessageId(timestamp: number, entropy: Uint8Array = randomBytes(10)): string {
-  if (!Number.isSafeInteger(timestamp) || timestamp < 0 || timestamp > 0xffffffffffff) {
-    throw new Error("ULID timestamp is outside the 48-bit range");
-  }
-  if (entropy.length !== 10) throw new Error("ULID entropy must contain 10 bytes");
-
-  let time = BigInt(timestamp);
-  const timeChars = new Array<string>(10);
-  for (let index = 9; index >= 0; index -= 1) {
-    timeChars[index] = CROCKFORD_BASE32[Number(time & 31n)]!;
-    time >>= 5n;
-  }
-  let randomness = 0n;
-  for (const byte of entropy) randomness = (randomness << 8n) | BigInt(byte);
-  const randomChars = new Array<string>(16);
-  for (let index = 15; index >= 0; index -= 1) {
-    randomChars[index] = CROCKFORD_BASE32[Number(randomness & 31n)]!;
-    randomness >>= 5n;
-  }
-  return `msg-${timeChars.join("")}${randomChars.join("")}`;
+function requireChatType(value: unknown): "direct" | "group" {
+  if (value !== "direct" && value !== "group") throw new Error("invalid chat_type");
+  return value;
 }
+
+function requirePeer(value: unknown): ClawchatPeer {
+  if (!isUnknownRecord(value)) throw new Error("invalid sender");
+  return {
+    id: requireString(value.id, "sender.id"),
+    type: requireChatType(value.type),
+    ...(typeof value.nick_name === "string" ? { nick_name: value.nick_name } : {})
+  };
+}
+
+function parseStreamFragments(value: unknown): ClawchatFragment[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const fragments: ClawchatFragment[] = [];
+  for (const candidate of value) {
+    if (!isUnknownRecord(candidate) || typeof candidate.kind !== "string") return undefined;
+    if (candidate.kind === "text") {
+      if (typeof candidate.text !== "string") return undefined;
+      fragments.push({ kind: "text", text: candidate.text });
+      continue;
+    }
+    if (candidate.kind === "mention") {
+      fragments.push({
+        kind: "mention",
+        ...(typeof candidate.user_id === "string" ? { user_id: candidate.user_id } : {}),
+        ...(typeof candidate.display === "string" ? { display: candidate.display } : {})
+      });
+      continue;
+    }
+    if (
+      candidate.kind !== "image" &&
+      candidate.kind !== "file" &&
+      candidate.kind !== "audio" &&
+      candidate.kind !== "video"
+    ) {
+      return undefined;
+    }
+    if (typeof candidate.url !== "string") return undefined;
+    fragments.push({
+      kind: candidate.kind,
+      url: candidate.url,
+      ...(typeof candidate.name === "string" ? { name: candidate.name } : {}),
+      ...(typeof candidate.mime === "string" ? { mime: candidate.mime } : {}),
+      ...(typeof candidate.size === "number" ? { size: candidate.size } : {}),
+      ...(typeof candidate.width === "number" ? { width: candidate.width } : {}),
+      ...(typeof candidate.height === "number" ? { height: candidate.height } : {}),
+      ...(typeof candidate.duration === "number" ? { duration: candidate.duration } : {})
+    });
+  }
+  return fragments;
+}
+
 
 function cloneOutboundEnvelope(message: unknown): ProtocolEnvelope {
   if (!message || typeof message !== "object") throw new Error("Outbound frame must be an object");

@@ -4,9 +4,13 @@ import { spawn } from "node:child_process";
 import { Type, type TSchema } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ClawchatApiClient, ClawchatApiError } from "./clawchat-api.js";
-import { ClawchatMemoryStore, type ClawchatMemoryTargetType } from "./clawchat-memory.js";
+import {
+  ClawchatMemoryStore,
+  clawchatMemoryTarget,
+  type ClawchatMemoryTarget,
+  type ClawchatMemoryTargetType
+} from "./clawchat-memory.js";
 import type { HostProfile } from "./host-profile.js";
-import { createMessageId } from "./gateway.js";
 import { isUnknownRecord } from "./type-guards.js";
 
 export interface ActiveClawchatTurn {
@@ -157,7 +161,7 @@ const TOOL_SPECS: ToolSpec[] = [
       limit: Type.Optional(Type.Integer({ minimum: 0 }))
     }),
     execute: async (args, env) => {
-      const memory = await env.memory.read(targetType(args.targetType), requiredString(args.targetId, "targetId"));
+      const memory = await env.memory.read(memoryTarget(args));
       const offset = optionalInteger(args.offset, 0);
       const limit = optionalInteger(args.limit, 12_000);
       return {
@@ -183,12 +187,11 @@ const TOOL_SPECS: ToolSpec[] = [
       content: Type.String()
     }),
     execute: async (args, env) => {
-      const type = targetType(args.targetType);
-      const id = requiredString(args.targetId, "targetId");
+      const target = memoryTarget(args);
       const mode = requiredString(args.mode, "mode");
       if (mode !== "append" && mode !== "replace") throw new Error("mode must be append or replace");
-      await env.memory.writeBody(type, id, mode, String(args.content ?? ""));
-      return { ok: true, targetType: type, targetId: id, mode };
+      await env.memory.writeBody(target, mode, String(args.content ?? ""));
+      return { ok: true, ...target, mode };
     }
   },
   {
@@ -201,10 +204,13 @@ const TOOL_SPECS: ToolSpec[] = [
       newText: Type.String()
     }),
     execute: async (args, env) => {
-      const type = targetType(args.targetType);
-      const id = requiredString(args.targetId, "targetId");
-      await env.memory.editBody(type, id, requiredString(args.oldText, "oldText"), String(args.newText ?? ""));
-      return { ok: true, targetType: type, targetId: id };
+      const target = memoryTarget(args);
+      await env.memory.editBody(
+        target,
+        requiredString(args.oldText, "oldText"),
+        String(args.newText ?? "")
+      );
+      return { ok: true, ...target };
     }
   },
   {
@@ -219,8 +225,7 @@ const TOOL_SPECS: ToolSpec[] = [
     execute: async (args, env) =>
       syncMetadata(
         env,
-        targetType(args.targetType),
-        requiredString(args.targetId, "targetId"),
+        memoryTarget(args),
         requiredString(args.direction, "direction"),
         optionalStringArray(args.fields)
       )
@@ -246,8 +251,7 @@ const TOOL_SPECS: ToolSpec[] = [
     execute: async (args, env) =>
       updateMetadata(
         env,
-        targetType(args.targetType),
-        requiredString(args.targetId, "targetId"),
+        memoryTarget(args),
         requiredRecord(args.patch, "patch")
       )
   },
@@ -320,7 +324,7 @@ const TOOL_SPECS: ToolSpec[] = [
     execute: async (args, env) => {
       const conversationId = requiredString(args.conversationId, "conversationId");
       const result = await env.api.post(`/v1/conversations/${encodeURIComponent(conversationId)}/leave`);
-      await env.memory.delete("group", conversationId);
+      await env.memory.delete(clawchatMemoryTarget("group", conversationId));
       return result;
     }
   },
@@ -417,7 +421,7 @@ const TOOL_SPECS: ToolSpec[] = [
       const patch = pickStringFields(args, ["nickname", "avatar_url", "bio"]);
       if (Object.keys(patch).length === 0) throw new Error("at least one profile field is required");
       const result = await env.api.patch("/v1/users/me", patch);
-      await pullMetadata(env, "owner", "owner");
+      await pullMetadata(env, clawchatMemoryTarget("owner", "owner"));
       return result;
     }
   },
@@ -488,38 +492,83 @@ function momentIdSpec(name: string, label: string, method: "GET" | "DELETE"): To
   });
 }
 
+interface MetadataTargetHandler {
+  allowedPatchFields: ReadonlySet<string>;
+  pull: (
+    env: ClawchatToolEnvironment,
+    target: ClawchatMemoryTarget
+  ) => Promise<Record<string, unknown>>;
+  update: (
+    env: ClawchatToolEnvironment,
+    target: ClawchatMemoryTarget,
+    patch: Record<string, unknown>
+  ) => Promise<void>;
+}
+
+const METADATA_TARGET_HANDLERS: Record<ClawchatMemoryTargetType, MetadataTargetHandler> = {
+  owner: {
+    allowedPatchFields: new Set(["agent_behavior"]),
+    pull: pullOwnerMetadata,
+    update: async (env, _target, patch) => {
+      const behavior = requiredString(patch.agent_behavior, "patch.agent_behavior");
+      await env.api.patch("/v1/agents/me/behavior", { behavior });
+    }
+  },
+  user: {
+    allowedPatchFields: new Set(["nickname", "avatar_url", "bio"]),
+    pull: pullUserMetadata,
+    update: async (env, target, patch) => {
+      if (target.targetId !== env.profile().agent.userId) {
+        throw new Error("user metadata update is allowed only for the connected user");
+      }
+      await env.api.patch(
+        "/v1/users/me",
+        pickStringFields(patch, ["nickname", "avatar_url", "bio"])
+      );
+    }
+  },
+  group: {
+    allowedPatchFields: new Set(["group_title", "group_description"]),
+    pull: pullGroupMetadata,
+    update: async (env, target, patch) => {
+      await env.api.patch(`/v1/conversations/${encodeURIComponent(target.targetId)}`, {
+        ...(typeof patch.group_title === "string" ? { title: patch.group_title } : {}),
+        ...(typeof patch.group_description === "string"
+          ? { description: patch.group_description }
+          : {})
+      });
+    }
+  }
+};
+
 async function syncMetadata(
   env: ClawchatToolEnvironment,
-  type: ClawchatMemoryTargetType,
-  id: string,
+  target: ClawchatMemoryTarget,
   direction: string,
   fields: string[]
 ): Promise<unknown> {
-  if (direction === "pull") return pullMetadata(env, type, id);
+  if (direction === "pull") return pullMetadata(env, target);
   if (direction !== "push") throw new Error("direction must be pull or push");
   if (fields.length === 0) throw new Error("fields are required for direction=push");
-  const memory = await env.memory.read(type, id);
+  const memory = await env.memory.read(target);
   const patch: Record<string, string> = {};
   for (const field of fields) {
     const value = memory.metadata[field];
     if (value === undefined) throw new Error(`missing_metadata_field:${field}`);
     patch[field] = value;
   }
-  return updateMetadata(env, type, id, patch);
+  return updateMetadata(env, target, patch);
 }
 
 async function updateMetadata(
   env: ClawchatToolEnvironment,
-  type: ClawchatMemoryTargetType,
-  id: string,
+  target: ClawchatMemoryTarget,
   patch: Record<string, unknown>
 ): Promise<unknown> {
-  const allowedFields: Record<ClawchatMemoryTargetType, Set<string>> = {
-    owner: new Set(["agent_behavior"]),
-    user: new Set(["nickname", "avatar_url", "bio"]),
-    group: new Set(["group_title", "group_description"])
-  };
-  const unsupported = Object.keys(patch).filter((field) => !allowedFields[type].has(field));
+  const handler = METADATA_TARGET_HANDLERS[target.targetType];
+  const unsupported = Object.keys(patch).filter(
+    (field) => !handler.allowedPatchFields.has(field)
+  );
   if (unsupported.length > 0) {
     throw new Error(`unsupported metadata patch fields: ${unsupported.sort().join(", ")}`);
   }
@@ -529,69 +578,71 @@ async function updateMetadata(
   if (nonStrings.length > 0) {
     throw new Error(`metadata patch values must be strings: ${nonStrings.sort().join(", ")}`);
   }
-  const profile = env.profile();
-  if (type === "owner") {
-    if (id !== "owner") throw new Error("owner target requires targetId='owner'");
-    const behavior = requiredString(patch.agent_behavior, "patch.agent_behavior");
-    await env.api.patch("/v1/agents/me/behavior", { behavior });
-  } else if (type === "user") {
-    if (id !== profile.agent.userId) throw new Error("user metadata update is allowed only for the connected user");
-    await env.api.patch("/v1/users/me", pickStringFields(patch, ["nickname", "avatar_url", "bio"]));
-  } else {
-    await env.api.patch(`/v1/conversations/${encodeURIComponent(id)}`, {
-      ...(typeof patch.group_title === "string" ? { title: patch.group_title } : {}),
-      ...(typeof patch.group_description === "string" ? { description: patch.group_description } : {})
-    });
-  }
-  return pullMetadata(env, type, id);
+  await handler.update(env, target, patch);
+  return pullMetadata(env, target);
 }
 
-async function pullMetadata(
+function pullMetadata(
   env: ClawchatToolEnvironment,
-  type: ClawchatMemoryTargetType,
-  id: string
+  target: ClawchatMemoryTarget
+): Promise<Record<string, unknown>> {
+  return METADATA_TARGET_HANDLERS[target.targetType].pull(env, target);
+}
+
+async function pullOwnerMetadata(
+  env: ClawchatToolEnvironment,
+  target: ClawchatMemoryTarget
 ): Promise<Record<string, unknown>> {
   const profile = env.profile();
-  if (type === "owner") {
-    const agentId = profile.agent.id;
-    if (!agentId) throw new Error("agent id is required for owner metadata sync");
-    const [agentResult, ownerResult] = await Promise.all([
-      env.api.get(`/v1/agents/${encodeURIComponent(agentId)}`),
-      env.api.get("/v1/agents/me/owner")
-    ]);
-    const agent = unwrapDetail(agentResult, "agent");
-    const owner = unwrapDetail(ownerResult, "user");
-    const metadata: Record<string, unknown> = {
-      agent_user_id: profile.agent.userId,
-      agent_owner_id: profile.agent.ownerId,
-      agent_nickname: firstValue(agent, ["nickname", "name"]),
-      agent_avatar_url: firstValue(agent, ["avatar_url", "avatarUrl"]),
-      agent_bio: agent.bio,
-      agent_behavior: firstValue(agent, ["behavior", "agent_behavior"]),
-      agent_owner_nickname: owner.nickname,
-      agent_owner_avatar_url: firstValue(owner, ["avatar_url", "avatarUrl"]),
-      agent_owner_bio: owner.bio,
-      agent_owner_locale: owner.locale
-    };
-    await env.memory.writeMetadata("owner", "owner", metadata);
-    return { ok: true, targetType: "owner", targetId: "owner", metadata };
-  }
-  if (type === "user") {
-    const result = await env.api.get(`/v1/users/${encodeURIComponent(id)}`);
-    const user = unwrapDetail(result, "user");
-    const metadata: Record<string, unknown> = {
-      id,
-      nickname: user.nickname,
-      avatar_url: firstValue(user, ["avatar_url", "avatarUrl"]),
-      bio: user.bio,
-      profile_type: firstValue(user, ["profile_type", "type"]),
-      updated_at: firstValue(user, ["updated_at", "updatedAt"])
-    };
-    await env.memory.writeMetadata("user", id, metadata);
-    return { ok: true, targetType: "user", targetId: id, metadata };
-  }
+  const agentId = profile.agent.id;
+  if (!agentId) throw new Error("agent id is required for owner metadata sync");
+  const [agentResult, ownerResult] = await Promise.all([
+    env.api.get(`/v1/agents/${encodeURIComponent(agentId)}`),
+    env.api.get("/v1/agents/me/owner")
+  ]);
+  const agent = unwrapDetail(agentResult, "agent");
+  const owner = unwrapDetail(ownerResult, "user");
+  const metadata: Record<string, unknown> = {
+    agent_user_id: profile.agent.userId,
+    agent_owner_id: profile.agent.ownerId,
+    agent_nickname: firstValue(agent, ["nickname", "name"]),
+    agent_avatar_url: firstValue(agent, ["avatar_url", "avatarUrl"]),
+    agent_bio: agent.bio,
+    agent_behavior: firstValue(agent, ["behavior", "agent_behavior"]),
+    agent_owner_nickname: owner.nickname,
+    agent_owner_avatar_url: firstValue(owner, ["avatar_url", "avatarUrl"]),
+    agent_owner_bio: owner.bio,
+    agent_owner_locale: owner.locale
+  };
+  await env.memory.writeMetadata(target, metadata);
+  return { ok: true, ...target, metadata };
+}
 
-  const result = await env.api.get(`/v1/conversations/${encodeURIComponent(id)}`);
+async function pullUserMetadata(
+  env: ClawchatToolEnvironment,
+  target: ClawchatMemoryTarget
+): Promise<Record<string, unknown>> {
+  const result = await env.api.get(`/v1/users/${encodeURIComponent(target.targetId)}`);
+  const user = unwrapDetail(result, "user");
+  const metadata: Record<string, unknown> = {
+    id: target.targetId,
+    nickname: user.nickname,
+    avatar_url: firstValue(user, ["avatar_url", "avatarUrl"]),
+    bio: user.bio,
+    profile_type: firstValue(user, ["profile_type", "type"]),
+    updated_at: firstValue(user, ["updated_at", "updatedAt"])
+  };
+  await env.memory.writeMetadata(target, metadata);
+  return { ok: true, ...target, metadata };
+}
+
+async function pullGroupMetadata(
+  env: ClawchatToolEnvironment,
+  target: ClawchatMemoryTarget
+): Promise<Record<string, unknown>> {
+  const result = await env.api.get(
+    `/v1/conversations/${encodeURIComponent(target.targetId)}`
+  );
   const conversation = unwrapDetail(result, "conversation");
   const group = isUnknownRecord(conversation.group) ? conversation.group : {};
   const participants = Array.isArray(conversation.participants)
@@ -601,7 +652,7 @@ async function pullMetadata(
     .map((participant) => firstValue(participant, ["id", "user_id", "userId"]))
     .filter((value): value is string => typeof value === "string" && value.length > 0);
   const metadata: Record<string, unknown> = {
-    group_id: id,
+    group_id: target.targetId,
     group_type: firstValue(conversation, ["type", "conversation_type", "conversationType"]),
     group_title: firstValue(conversation, ["title"]) ?? group.title,
     group_description: firstValue(conversation, ["description"]) ?? group.description,
@@ -610,18 +661,28 @@ async function pullMetadata(
     updated_at: firstValue(conversation, ["updated_at", "updatedAt"]),
     participant_ids: participantIds.join(",")
   };
-  await env.memory.writeMetadata("group", id, metadata);
+  await env.memory.writeMetadata(target, metadata);
   const failures: Array<Record<string, string>> = [];
   for (const userId of participantIds) {
-    const existing = await env.memory.read("user", userId);
+    const userTarget = clawchatMemoryTarget("user", userId);
+    const existing = await env.memory.read(userTarget);
     if (existing.exists) continue;
     try {
-      await pullMetadata(env, "user", userId);
+      await pullMetadata(env, userTarget);
     } catch (error: unknown) {
-      failures.push({ targetType: "user", targetId: userId, error: error instanceof Error ? error.message : String(error) });
+      failures.push({
+        targetType: "user",
+        targetId: userId,
+        error: error instanceof Error ? error.message : String(error)
+      });
     }
   }
-  return { ok: failures.length === 0, targetType: "group", targetId: id, metadata, partialFailures: failures };
+  return {
+    ok: failures.length === 0,
+    ...target,
+    metadata,
+    partialFailures: failures
+  };
 }
 
 async function sendMention(args: Record<string, unknown>, env: ClawchatToolEnvironment): Promise<unknown> {
@@ -650,16 +711,15 @@ async function sendMention(args: Record<string, unknown>, env: ClawchatToolEnvir
   }));
   if (typeof args.text === "string" && args.text.trim()) fragments.push({ kind: "text", text: ` ${args.text.trim()}` });
   const now = env.now?.() ?? Date.now();
-  const messageId = createMessageId(now);
+  const traceId = `pi-tool-${env.idFactory?.() ?? crypto.randomUUID()}`;
   await env.sendFrame?.({
     version: "2",
     event: "message.send",
-    trace_id: `pi-tool-${env.idFactory?.() ?? crypto.randomUUID()}`,
+    trace_id: traceId,
     emitted_at: now,
     chat_id: chatId,
     to: { id: chatId, type: turn.chatType },
     payload: {
-      message_id: messageId,
       message_mode: "normal",
       message: {
         body: { fragments },
@@ -677,7 +737,7 @@ async function sendMention(args: Record<string, unknown>, env: ClawchatToolEnvir
     terminal: true,
     noFollowupReply: true,
     instruction: "The mention message has already been sent; do not send a duplicate normal follow-up reply.",
-    messageId,
+    traceId,
     mentions: mentions.map((mention) => mention.userId)
   };
 }
@@ -787,6 +847,10 @@ function mapToolError(error: unknown): Record<string, unknown> {
   }
   return { error: "validation", message: error instanceof Error ? error.message : String(error) };
 }
+function memoryTarget(args: Record<string, unknown>): ClawchatMemoryTarget {
+  return clawchatMemoryTarget(args.targetType, args.targetId);
+}
+
 
 function targetType(value: unknown): ClawchatMemoryTargetType {
   if (value !== "owner" && value !== "user" && value !== "group") {
