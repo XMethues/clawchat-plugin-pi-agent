@@ -8,6 +8,7 @@ import { ClawchatOutputProjector } from "./output-projector.js";
 import { PiChatSessionFactory } from "./pi-session-factory.js";
 import { ChatSessionRegistry } from "./session-registry.js";
 import type { ClawchatTransport } from "./types.js";
+import { createClawchatToolRuntime } from "./clawchat-runtime.js";
 
 export interface HeadlessPiHostOptions {
   profileName?: string;
@@ -38,6 +39,10 @@ export class HeadlessPiHost {
     if (this.started) throw new Error("Headless Pi Host is already started");
     const profile = await this.profiles.load(this.profileName);
     if (!profile) throw new Error(`Host Profile '${this.profileName}' is not activated`);
+    const toolRuntime = await createClawchatToolRuntime({
+      profiles: this.profiles,
+      profileName: this.profileName
+    });
     this.lock = await this.profiles.acquireLock(this.profileName);
 
     try {
@@ -64,7 +69,15 @@ export class HeadlessPiHost {
         agentDir: this.agentDir,
         store,
         transport,
-        toolCallsDefault: profile.output.toolCallsDefault
+        toolCallsDefault: profile.output.toolCallsDefault,
+        tools: {
+          ...toolRuntime.environment,
+          sendFrame: async (frame) => {
+            if (!gateway) throw new Error("ClawChat Gateway is not started");
+            await gateway.send(frame);
+          },
+          recordToolCall: (record) => store.recordToolCall(record)
+        }
       });
       const registry = new ChatSessionRegistry({
         store,
@@ -84,7 +97,8 @@ export class HeadlessPiHost {
 
       gateway = new ClawChatGateway({
         websocketUrl: profile.websocketUrl,
-        accessToken: profile.accessToken,
+        accessToken: toolRuntime.profile().accessToken,
+        refreshAccessToken: toolRuntime.refreshAccessToken,
         deviceId: profile.deviceId,
         userId: profile.agent.userId,
         store,

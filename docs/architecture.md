@@ -1,10 +1,12 @@
 # ClawChat Pi Architecture
 
-`clawchat-pi` is a Pi package with two entry points: a standard Pi Extension and
-a long-lived, non-interactive Pi SDK Host. Both use the same ClawChat Protocol
-v2 Gateway, profile state, routing policy, and output projection. The complete
-runtime contract is specified in `docs/headless-host-spec.md`; delivery is
-tracked in <https://github.com/XMethues/clawchat-plugin-pi-agent/issues/1>.
+`clawchat-pi` is a Pi package with two entry points: a management-only standard
+Pi Extension and a long-lived, non-interactive Pi SDK Host. The Host exclusively
+owns the ClawChat Protocol v2 Gateway; both entry points share profile state,
+REST/local tools, memory, packaged skills, and the output projection code used
+by Hosted Session Bindings. The complete runtime contract is specified in
+`docs/headless-host-spec.md`; delivery is tracked in
+<https://github.com/XMethues/clawchat-plugin-pi-agent/issues/1>.
 
 ## Components
 
@@ -33,13 +35,20 @@ tracked in <https://github.com/XMethues/clawchat-plugin-pi-agent/issues/1>.
   before a message reaches Pi.
 - `output-settings.ts` resolves the Host Profile tool-output default and
   per-chat `on`, `off`, or `inherit` override.
-- `output-projector.ts` maps completed Pi assistant, thinking, and tool events
-  to complete `message.reply` messages and brackets work with `typing.update`.
-- `headless-extension.ts` projects one SDK runtime's Pi lifecycle without
-  opening a per-session WebSocket.
-- `extension.ts` registers `/clawchat-activate` and `/clawchat-output` for an
-  interactive Pi session and delegates wire behavior to the shared Gateway.
-- `ws-client.ts` is the thin interactive-Extension adapter over that Gateway.
+- `output-projector.ts` maps completed Pi assistant, thinking, tool, and
+  `MEDIA:` attachment output to complete `message.reply` messages and brackets
+  work with `typing.update`.
+- `clawchat-api.ts` owns authenticated REST and upload envelopes plus the
+  single reactive token-refresh retry.
+- `clawchat-memory.ts` owns profile-local Markdown memory, metadata/body
+  separation, safe atomic writes, search, and bounded turn context.
+- `clawchat-tools.ts` registers the pinned ClawChat default tool set, validates
+  Active ClawChat Turn mutations, maps permission gates, and records audits.
+- `clawchat-runtime.ts` binds a Host Profile to its API and memory runtime.
+- `headless-extension.ts` projects one SDK runtime's Pi lifecycle and tools
+  without opening a per-session WebSocket.
+- `extension.ts` registers Activation, REST/local tools, and packaged prompt
+  guidance without opening a WebSocket or accepting remote turns.
 
 There is no legacy output Adapter. The Output Projector is the single seam for
 ClawChat output, and the package does not emit `message.created`, `message.add`,
@@ -47,8 +56,6 @@ ClawChat output, and the package does not emit `message.created`, `message.add`,
 
 ## Current Limits
 
-- Only materialized text fragments are bridged; media and streaming lifecycle
-  frames are not projected into Pi.
 - The interactive Extension intentionally binds to one active Pi session. Use
   `clawchat-pi run` for durable multi-chat isolation.
 - Live concurrent TUI attachment to a Host-owned Pi session is unsupported;

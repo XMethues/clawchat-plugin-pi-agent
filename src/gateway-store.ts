@@ -133,6 +133,22 @@ export class GatewayStore {
         created_at INTEGER NOT NULL,
         UNIQUE (ack_epoch, dseq)
       ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS tool_calls (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE,
+        chat_id TEXT,
+        message_id TEXT,
+        tool_name TEXT NOT NULL,
+        arguments_json TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        error TEXT,
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS tool_calls_by_chat
+        ON tool_calls (chat_id, sequence);
     `);
     return new GatewayStore(database);
   }
@@ -489,6 +505,35 @@ export class GatewayStore {
          WHERE message_id = ? AND status = 'pending'`
       )
       .run(Date.now(), code, reason ?? null, messageId);
+  }
+
+  recordToolCall(input: {
+    chatId?: string;
+    messageId?: string;
+    toolName: string;
+    args: Record<string, unknown>;
+    result: unknown;
+    error?: string;
+    startedAt: number;
+    endedAt: number;
+  }): void {
+    this.database
+      .prepare(
+        `INSERT INTO tool_calls
+          (id, chat_id, message_id, tool_name, arguments_json, result_json, error, started_at, ended_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        crypto.randomUUID(),
+        input.chatId ?? null,
+        input.messageId ?? null,
+        input.toolName,
+        JSON.stringify(input.args),
+        JSON.stringify(input.result),
+        input.error ?? null,
+        input.startedAt,
+        input.endedAt
+      );
   }
 
   close(): void {

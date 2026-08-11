@@ -1,8 +1,9 @@
-import { chmod, mkdir, open, readFile, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, lstat, mkdir, open, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ActivationResult } from "./activation.js";
 import { DEFAULT_WEBSOCKET_URL } from "./config.js";
+import { GatewayStore } from "./gateway-store.js";
 
 const PROFILE_SCHEMA_VERSION = 1 as const;
 const PROFILE_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
@@ -54,6 +55,7 @@ export class HostProfileRepository {
   private readonly createDeviceId: () => string;
   private readonly processId: number;
   private readonly isProcessAlive: (pid: number) => boolean;
+  private readonly pendingActivations = new Map<string, HostProfileDraft>();
 
   constructor(options: HostProfileRepositoryOptions = {}) {
     this.agentDir = options.agentDir ?? getAgentDir();
@@ -124,12 +126,18 @@ export class HostProfileRepository {
     const canonicalWorkspace = await canonicalizeWorkspace(workspace);
     const current = await this.loadStored(name);
     if (current) {
+      const lock = await this.getLockStatus(name);
+      if (lock.running) {
+        throw new Error(`Host Profile '${name}' cannot be activated while process ${lock.pid} is running`);
+      }
       if (current.workspace !== canonicalWorkspace) {
         throw new Error(
           `Host Profile '${name}' is bound to ${current.workspace}; use another profile for ${canonicalWorkspace}`
         );
       }
-      return toDraft(current);
+      const draft = toDraft(current);
+      this.pendingActivations.set(name, draft);
+      return draft;
     }
 
     const draft: HostProfileDraft = {
@@ -138,6 +146,7 @@ export class HostProfileRepository {
       workspace: canonicalWorkspace,
       deviceId: this.createDeviceId()
     };
+    this.pendingActivations.set(name, draft);
     await this.write(name, draft);
     return draft;
   }
@@ -145,24 +154,43 @@ export class HostProfileRepository {
   async completeActivation(
     name: string,
     activation: ActivationResult,
-    options: { websocketUrl?: string } = {}
+    options: { websocketUrl?: string; resetIdentityState?: boolean } = {}
   ): Promise<HostProfile> {
-    const prepared = await this.loadStored(name);
+    const stored = await this.loadStored(name);
+    const prepared = this.pendingActivations.get(name) ?? stored;
     if (!prepared) {
       throw new Error(`Host Profile '${name}' must be prepared before activation`);
     }
+    const previous = stored && isActiveProfile(stored) ? stored : undefined;
+    const rebinding = options.resetIdentityState === true && previous !== undefined;
+    if (rebinding) await this.resetIdentityState(name);
 
     const profile: HostProfile = {
       ...toDraft(prepared),
       baseUrl: activation.baseUrl,
-      websocketUrl: options.websocketUrl ?? (isActiveProfile(prepared) ? prepared.websocketUrl : DEFAULT_WEBSOCKET_URL),
+      websocketUrl:
+        options.websocketUrl ??
+        (!rebinding && previous ? previous.websocketUrl : DEFAULT_WEBSOCKET_URL),
       accessToken: activation.accessToken,
       ...(activation.refreshToken ? { refreshToken: activation.refreshToken } : {}),
       agent: activation.agent,
-      output: isActiveProfile(prepared) ? prepared.output : { toolCallsDefault: "off" }
+      output: !rebinding && previous ? previous.output : { toolCallsDefault: "off" }
     };
     await this.write(name, profile);
+    this.pendingActivations.delete(name);
     return profile;
+  }
+
+  async updateTokens(name: string, accessToken: string, refreshToken?: string): Promise<HostProfile> {
+    const profile = await this.load(name);
+    if (!profile) throw new Error(`Host Profile '${name}' is not activated`);
+    const updated: HostProfile = {
+      ...profile,
+      accessToken,
+      ...(refreshToken ? { refreshToken } : {})
+    };
+    await this.write(name, updated);
+    return updated;
   }
 
   async load(name: string): Promise<HostProfile | null> {
@@ -194,6 +222,45 @@ export class HostProfileRepository {
       throw new Error(`Invalid Host Profile at ${path}`);
     }
     return parsed as HostProfile | HostProfileDraft;
+  }
+
+  private async resetIdentityState(name: string): Promise<void> {
+    const directory = this.profileDirectory(name);
+    const gatewayPath = join(directory, "gateway.sqlite");
+    const sessionPaths: string[] = [];
+    const gatewayStat = await optionalLstat(gatewayPath);
+    if (gatewayStat) {
+      if (gatewayStat.isSymbolicLink() || !gatewayStat.isFile()) {
+        throw new Error(`Gateway Store for Host Profile '${name}' must be a regular file`);
+      }
+      const gateway = GatewayStore.open(gatewayPath);
+      try {
+        sessionPaths.push(...gateway.getStatus().sessions.map((session) => session.sessionPath));
+      } finally {
+        gateway.close();
+      }
+    }
+    const sessionsRoot = resolve(this.agentDir, "sessions");
+    for (const sessionPath of new Set(sessionPaths)) {
+      const resolved = resolve(sessionPath);
+      const relation = relative(sessionsRoot, resolved);
+      if (
+        !relation ||
+        relation === ".." ||
+        relation.startsWith(`..${sep}`) ||
+        isAbsolute(relation)
+      ) {
+        continue;
+      }
+      await rm(resolved, { force: true });
+    }
+    await Promise.all([
+      rm(gatewayPath, { force: true }),
+      rm(`${gatewayPath}-shm`, { force: true }),
+      rm(`${gatewayPath}-wal`, { force: true }),
+      rm(join(directory, "memory"), { recursive: true, force: true }),
+      rm(join(directory, "skills"), { recursive: true, force: true })
+    ]);
   }
 
   private async write(name: string, profile: HostProfile | HostProfileDraft): Promise<void> {
@@ -242,6 +309,15 @@ async function canonicalizeWorkspace(workspace: string): Promise<string> {
 function assertProfileName(name: string): void {
   if (!PROFILE_NAME_PATTERN.test(name)) {
     throw new Error(`Invalid Host Profile name '${name}'`);
+  }
+}
+
+async function optionalLstat(path: string) {
+  try {
+    return await lstat(path);
+  } catch (error: unknown) {
+    if (isMissingFileError(error)) return undefined;
+    throw error;
   }
 }
 

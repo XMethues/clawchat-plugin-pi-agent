@@ -80,7 +80,7 @@ describe("ClawchatOutputProjector", () => {
     expect(replies.map((message) => message.payload.message_mode)).toEqual(["thinking", "normal", "tool"]);
     expect(replies[0]?.payload.message.body.fragments).toEqual([{ kind: "text", text: "inspect first" }]);
     expect(replies[1]?.payload.message.body.fragments).toEqual([{ kind: "text", text: "I found it." }]);
-    expect(replies[2]?.payload.message.body.fragments[0]?.text).toContain("README.md");
+    expect(replies[2]?.payload.message.body.fragments[0]).toMatchObject({ text: expect.stringContaining("README.md") });
     expect(replies[1]).toMatchObject({
       chat_id: "chat-1",
       to: { id: "chat-1", type: "direct" },
@@ -140,4 +140,41 @@ describe("ClawchatOutputProjector", () => {
       "typing.update"
     ]);
   });
+  it("uploads MEDIA directives and can force images into document fragments", async () => {
+    const sent: ClawchatOutboundMessage[] = [];
+    const uploadMedia = vi.fn(async (path: string) => ({
+      kind: path.endsWith(".png") ? "image" : "file",
+      url: `https://cdn.example/${path.split("/").at(-1)}`,
+      name: path.split("/").at(-1)
+    }));
+    const projector = new ClawchatOutputProjector({
+      transport: { send: async (message) => { sent.push(message); } },
+      uploadMedia
+    });
+
+    await projector.beginTurn(outputTurnFromInbound(inboundMessage()));
+    await projector.handle(
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{
+            type: "text",
+            text: "Files attached MEDIA:/tmp/report.pdf MEDIA:\"/tmp/chart.png\" [[as_document]]"
+          }]
+        }
+      } as unknown as MessageEndEvent,
+      { thinking: false, tools: false }
+    );
+    await projector.endTurn();
+
+    const reply = sent.find((message) => message.event === "message.reply");
+    expect(uploadMedia.mock.calls).toEqual([["/tmp/report.pdf"], ["/tmp/chart.png"]]);
+    expect(reply?.payload.message.body.fragments).toEqual([
+      { kind: "text", text: "Files attached" },
+      { kind: "file", url: "https://cdn.example/report.pdf", name: "report.pdf" },
+      { kind: "file", url: "https://cdn.example/chart.png", name: "chart.png" }
+    ]);
+  });
+
 });

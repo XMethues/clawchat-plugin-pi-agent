@@ -10,6 +10,7 @@ import { createHeadlessClawchatPiExtension } from "./headless-extension.js";
 import { renderInboundPrompt } from "./inbound.js";
 import type { ChatSessionDriver, ChatSessionFactory } from "./session-registry.js";
 import type { ClawchatInboundMessage, ClawchatTransport } from "./types.js";
+import type { ClawchatToolEnvironment } from "./clawchat-tools.js";
 
 export interface PiChatSessionFactoryOptions {
   workspace: string;
@@ -18,6 +19,7 @@ export interface PiChatSessionFactoryOptions {
   transport: ClawchatTransport;
   sessionDir?: string;
   toolCallsDefault?: "on" | "off";
+  tools?: ClawchatToolEnvironment;
 }
 
 export class PiChatSessionFactory implements ChatSessionFactory {
@@ -28,6 +30,7 @@ export class PiChatSessionFactory implements ChatSessionFactory {
   private readonly newSessions = new Map<string, SessionManager>();
   private readonly sessionDir: string | undefined;
   private readonly toolCallsDefault: "on" | "off";
+  private readonly tools: ClawchatToolEnvironment | undefined;
 
   constructor(options: PiChatSessionFactoryOptions) {
     this.workspace = realpathSync(options.workspace);
@@ -36,6 +39,7 @@ export class PiChatSessionFactory implements ChatSessionFactory {
     this.transport = options.transport;
     this.sessionDir = options.sessionDir;
     this.toolCallsDefault = options.toolCallsDefault ?? "off";
+    this.tools = options.tools;
   }
 
   createSession(_chatId: string): { sessionId: string; sessionPath: string } {
@@ -74,7 +78,8 @@ export class PiChatSessionFactory implements ChatSessionFactory {
       toolsVisible: () => {
         const override = this.store.getToolOutputOverrides()[mapping.chatId];
         return (override ?? this.toolCallsDefault) === "on";
-      }
+      },
+      ...(this.tools ? { tools: this.tools } : {})
     });
     const resourceLoader = new DefaultResourceLoader({
       cwd: this.workspace,

@@ -17,6 +17,7 @@
   ],
   "files": [
     "dist",
+    "skills",
     "README.md",
     "docs"
   ],
@@ -31,6 +32,7 @@
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.81.1",
+    "typebox": "^1.1.38",
     "ws": "^8.18.0"
   },
   "devDependencies": {
@@ -46,6 +48,9 @@
   "pi": {
     "extensions": [
       "./dist/src/extension.js"
+    ],
+    "skills": [
+      "./skills"
     ]
   }
 }

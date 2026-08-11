@@ -24,6 +24,8 @@ export interface StatePathOptions {
   agentDir?: string;
   profile?: string;
   workspace?: string;
+  resetIdentityState?: boolean;
+  profileRepository?: HostProfileRepository;
 }
 
 export interface PreparedClawchatState {
@@ -89,7 +91,12 @@ export async function saveClawchatState(
         ...(state.refreshToken ? { refreshToken: state.refreshToken } : {}),
         agent: state.agent
       },
-      { websocketUrl: state.websocketUrl }
+      {
+        websocketUrl: state.websocketUrl,
+        ...(options.resetIdentityState !== undefined
+          ? { resetIdentityState: options.resetIdentityState }
+          : {})
+      }
     );
     extensionState = { ...state, deviceId: profile.deviceId, workspace: profile.workspace };
   } else {
@@ -97,7 +104,10 @@ export async function saveClawchatState(
     if (!workspace) throw new Error("A Workspace is required to save ClawChat activation");
     await profiles.prepareActivation(name, workspace);
     const profile = await profiles.completeActivation(name, state, {
-      websocketUrl: options.websocketUrl ?? DEFAULT_WEBSOCKET_URL
+      websocketUrl: options.websocketUrl ?? DEFAULT_WEBSOCKET_URL,
+      ...(options.resetIdentityState !== undefined
+        ? { resetIdentityState: options.resetIdentityState }
+        : {})
     });
     extensionState = {
       baseUrl: profile.baseUrl,
@@ -129,7 +139,8 @@ export async function saveClawchatState(
 }
 
 function repository(options: StatePathOptions): HostProfileRepository {
-  return new HostProfileRepository(options.agentDir ? { agentDir: options.agentDir } : {});
+  return options.profileRepository ??
+    new HostProfileRepository(options.agentDir ? { agentDir: options.agentDir } : {});
 }
 
 function profileName(options: StatePathOptions): string {

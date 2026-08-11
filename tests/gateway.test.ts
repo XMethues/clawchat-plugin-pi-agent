@@ -2,7 +2,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocketServer } from "ws";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ClawChatGateway } from "../src/gateway.js";
 import { GatewayStore } from "../src/gateway-store.js";
 
@@ -762,6 +762,55 @@ describe("ClawChatGateway", () => {
 
     await gateway.start();
     expect(connectionNumber).toBe(2);
+    await gateway.stop();
+    store.close();
+  });
+
+  it("refreshes an authentication failure once and treats the repeated failure as terminal", async () => {
+    const server = await listen();
+    const tokens: string[] = [];
+    let connections = 0;
+    server.on("connection", (socket) => {
+      connections += 1;
+      socket.send(JSON.stringify({
+        version: "2",
+        event: "connect.challenge",
+        trace_id: `challenge-${connections}`,
+        emitted_at: 1,
+        payload: { nonce: `nonce-${connections}` }
+      }));
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, any>;
+        if (frame.event !== "connect") return;
+        tokens.push(frame.payload.token);
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "hello-fail",
+          trace_id: frame.trace_id,
+          emitted_at: 2,
+          payload: { reason: "authentication failed" }
+        }));
+      });
+    });
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const refreshAccessToken = vi.fn(async () => "access-2");
+    const gateway = new ClawChatGateway({
+      websocketUrl: websocketUrl(server),
+      accessToken: "access-1",
+      refreshAccessToken,
+      deviceId: "clawchat-pi-device-1",
+      userId: "agent-user-1",
+      store,
+      onInboundMessage: async () => undefined,
+      reconnect: true,
+      reconnectDelay: () => 0
+    });
+
+    await expect(gateway.start()).rejects.toThrow("authentication failed");
+    expect(refreshAccessToken).toHaveBeenCalledOnce();
+    expect(connections).toBe(2);
+    expect(tokens).toEqual(["access-1", "access-2"]);
     await gateway.stop();
     store.close();
   });

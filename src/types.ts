@@ -12,7 +12,24 @@ export interface TextFragment {
   text: string;
 }
 
-export type ClawchatFragment = TextFragment;
+export interface MentionFragment {
+  kind: "mention";
+  user_id?: string;
+  display?: string;
+}
+
+export interface MediaFragment {
+  kind: "image" | "file" | "audio" | "video";
+  url: string;
+  name?: string;
+  mime?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+  duration?: number;
+}
+
+export type ClawchatFragment = TextFragment | MentionFragment | MediaFragment;
 
 export interface ClawchatInboundMessage {
   version: "2";

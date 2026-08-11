@@ -6,6 +6,7 @@ import type {
 import type {
   ClawchatInboundMessage,
   ClawchatMessageMode,
+  ClawchatFragment,
   ClawchatOutboundContent,
   ClawchatOutboundMessage,
   ClawchatTransport,
@@ -31,12 +32,14 @@ export interface OutputProjectorOptions {
   transport: ClawchatTransport;
   now?: () => number;
   idFactory?: () => string;
+  uploadMedia?: (filePath: string) => Promise<Record<string, unknown>>;
 }
 
 export class ClawchatOutputProjector {
   private readonly transport: ClawchatTransport;
   private readonly now: () => number;
   private readonly idFactory: () => string;
+  private readonly uploadMedia: ((filePath: string) => Promise<Record<string, unknown>>) | undefined;
   private readonly toolArguments = new Map<string, unknown>();
   private activeTurn: OutputTurn | undefined;
 
@@ -44,6 +47,7 @@ export class ClawchatOutputProjector {
     this.transport = options.transport;
     this.now = options.now ?? Date.now;
     this.idFactory = options.idFactory ?? (() => crypto.randomUUID());
+    this.uploadMedia = options.uploadMedia;
   }
 
   async beginTurn(turn: OutputTurn): Promise<void> {
@@ -103,6 +107,8 @@ export class ClawchatOutputProjector {
   }
 
   private async sendMaterialized(turn: OutputTurn, text: string, mode: ClawchatMessageMode): Promise<void> {
+    const fragments = mode === "normal" ? await this.materializeFragments(text) : [{ kind: "text" as const, text }];
+    if (fragments.length === 0) return;
     await this.send({
       event: "message.reply",
       chat_id: turn.chatId,
@@ -110,7 +116,7 @@ export class ClawchatOutputProjector {
       payload: {
         message_mode: mode,
         message: {
-          body: { fragments: [{ kind: "text", text }] },
+          body: { fragments },
           context: {
             mentions: [],
             reply: {
@@ -125,6 +131,34 @@ export class ClawchatOutputProjector {
         }
       }
     });
+  }
+
+  private async materializeFragments(text: string): Promise<ClawchatFragment[]> {
+    if (!this.uploadMedia || !text.includes("MEDIA:")) return [{ kind: "text", text }];
+    const forceDocument = text.includes("[[as_document]]");
+    const paths: string[] = [];
+    const body = text
+      .replace(/MEDIA:(?:"([^"]+)"|'([^']+)'|(\S+))/g, (_match, doubleQuoted, singleQuoted, bare) => {
+        paths.push(doubleQuoted ?? singleQuoted ?? bare);
+        return "";
+      })
+      .replaceAll("[[as_document]]", "")
+      .replace(/[ \\t]+\\n/g, "\\n")
+      .trim();
+    const fragments: ClawchatFragment[] = body ? [{ kind: "text", text: body }] : [];
+    for (const path of paths) {
+      try {
+        const uploaded = await this.uploadMedia(path);
+        const fragment = mediaFragment(uploaded);
+        fragments.push(forceDocument && fragment.kind === "image" ? { ...fragment, kind: "file" } : fragment);
+      } catch (error: unknown) {
+        fragments.push({
+          kind: "text",
+          text: `Attachment upload failed for ${path}: ${error instanceof Error ? error.message : String(error)}`
+        });
+      }
+    }
+    return fragments.length > 0 ? fragments : [{ kind: "text", text }];
   }
 
   private async sendTyping(turn: OutputTurn, isTyping: boolean): Promise<void> {
@@ -157,10 +191,33 @@ export function outputTurnFromInbound(message: ClawchatInboundMessage): OutputTu
   };
 }
 
-function trimPreview(fragments: TextFragment[]): TextFragment[] {
-  const text = fragments.map((fragment) => fragment.text).join("").trim();
+function trimPreview(fragments: ClawchatFragment[]): TextFragment[] {
+  const text = fragments
+    .filter((fragment): fragment is TextFragment => fragment.kind === "text")
+    .map((fragment) => fragment.text)
+    .join("")
+    .trim();
   if (!text) return [];
   return [{ kind: "text", text: text.length > 240 ? `${text.slice(0, 237)}...` : text }];
+}
+
+function mediaFragment(value: Record<string, unknown>): Extract<ClawchatFragment, { url: string }> {
+  const kind = value.kind;
+  const url = value.url;
+  if (kind !== "image" && kind !== "file" && kind !== "audio" && kind !== "video") {
+    throw new Error("media upload returned an unsupported fragment kind");
+  }
+  if (typeof url !== "string" || !url) throw new Error("media upload returned no URL");
+  return {
+    kind,
+    url,
+    ...(typeof value.name === "string" ? { name: value.name } : {}),
+    ...(typeof value.mime === "string" ? { mime: value.mime } : {}),
+    ...(typeof value.size === "number" ? { size: value.size } : {}),
+    ...(typeof value.width === "number" ? { width: value.width } : {}),
+    ...(typeof value.height === "number" ? { height: value.height } : {}),
+    ...(typeof value.duration === "number" ? { duration: value.duration } : {})
+  };
 }
 
 function formatToolOutput(event: ToolExecutionEndEvent, args: unknown): string {

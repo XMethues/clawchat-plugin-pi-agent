@@ -60,8 +60,6 @@ export {
   saveClawchatState
 } from "./state.js";
 export type { ClawchatState, PreparedClawchatState, StatePathOptions } from "./state.js";
-export { ClawchatWebSocketClient } from "./ws-client.js";
-export type { ClawchatWebSocketClientOptions } from "./ws-client.js";
 export type {
   ClawchatFragment,
   ClawchatChatType,

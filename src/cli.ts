@@ -33,7 +33,8 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
       deviceId: prepared.deviceId
     });
     const profile = await profiles.completeActivation(parsed.profile, activation, {
-      websocketUrl: environment.CLAWCHAT_WS_URL ?? DEFAULT_WEBSOCKET_URL
+      websocketUrl: environment.CLAWCHAT_WS_URL ?? DEFAULT_WEBSOCKET_URL,
+      resetIdentityState: true
     });
     write(`Activated Host Profile '${profile.name}'.`);
     write(`Workspace: ${profile.workspace}`);

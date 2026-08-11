@@ -1,0 +1,61 @@
+import { join } from "node:path";
+import { ClawchatApiClient } from "./clawchat-api.js";
+import { ClawchatMemoryStore } from "./clawchat-memory.js";
+import type { ClawchatToolEnvironment } from "./clawchat-tools.js";
+import { HostProfileRepository, type HostProfile } from "./host-profile.js";
+
+export interface ClawchatToolRuntime {
+  environment: ClawchatToolEnvironment;
+  profile: () => HostProfile;
+  refreshAccessToken: () => Promise<string>;
+}
+
+export async function createClawchatToolRuntime(options: {
+  profiles: HostProfileRepository;
+  profileName: string;
+}): Promise<ClawchatToolRuntime> {
+  const loadedProfile = await options.profiles.load(options.profileName);
+  if (!loadedProfile) throw new Error(`Host Profile '${options.profileName}' is not activated`);
+  let profile: HostProfile = loadedProfile;
+  let refreshInFlight: Promise<string> | undefined;
+  let api: ClawchatApiClient;
+
+  const refreshAccessToken = async (): Promise<string> => {
+    if (!refreshInFlight) {
+      refreshInFlight = (async () => {
+        if (!profile.refreshToken) throw new Error("Host Profile does not contain a refresh token");
+        const rotated = await api.refresh(profile.refreshToken, profile.deviceId);
+        profile = await options.profiles.updateTokens(
+          options.profileName,
+          rotated.accessToken,
+          rotated.refreshToken
+        );
+        return profile.accessToken;
+      })().finally(() => {
+        refreshInFlight = undefined;
+      });
+    }
+    return refreshInFlight;
+  };
+
+  api = new ClawchatApiClient({
+    baseUrl: profile.baseUrl,
+    accessToken: () => profile.accessToken,
+    refreshAccessToken: async () => {
+      await refreshAccessToken();
+    }
+  });
+  const memory = new ClawchatMemoryStore(
+    join(options.profiles.profileDirectory(options.profileName), "memory")
+  );
+
+  return {
+    profile: () => profile,
+    refreshAccessToken,
+    environment: {
+      profile: () => profile,
+      api,
+      memory
+    }
+  };
+}

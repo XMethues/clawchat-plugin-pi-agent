@@ -8,6 +8,7 @@ export interface ClawChatGatewayOptions {
   websocketUrl: string;
   accessToken: string;
   deviceId: string;
+  refreshAccessToken?: () => Promise<string>;
   userId: string;
   store: GatewayStore;
   onInboundMessage: (message: ClawchatInboundMessage) => Promise<void>;
@@ -40,6 +41,7 @@ export class ClawChatGateway {
   private readonly idFactory: () => string;
   private socket: WebSocket | undefined;
   private stopping = false;
+  private accessToken: string;
   private frameQueue: Promise<void> = Promise.resolve();
   private ackMode: "dseq" | "cursor" | "legacy" = "legacy";
   private ackEpoch: string | undefined;
@@ -50,15 +52,18 @@ export class ClawChatGateway {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnectAttempt = 0;
   private replayComplete = false;
+  private handshakeRefreshAttempted = false;
 
   constructor(options: ClawChatGatewayOptions) {
     this.options = options;
+    this.accessToken = options.accessToken;
     this.now = options.now ?? Date.now;
     this.idFactory = options.idFactory ?? (() => crypto.randomUUID());
   }
 
   async start(): Promise<void> {
     this.stopping = false;
+    this.handshakeRefreshAttempted = false;
     let attempt = 0;
     while (!this.stopping) {
       try {
@@ -87,15 +92,15 @@ export class ClawChatGateway {
     const socket = this.socket;
     this.socket = undefined;
     if (!socket || socket.readyState === WebSocket.CLOSED) return;
-    await new Promise<void>((resolve) => {
-      socket.once("close", () => resolve());
-      socket.close();
-    });
+    const { promise, resolve } = Promise.withResolvers<void>();
+    socket.once("close", () => resolve());
+    socket.close();
+    await promise;
   }
 
   async send(message: unknown): Promise<void> {
     const envelope = cloneOutboundEnvelope(message);
-    if (envelope.event === "message.reply") {
+    if (envelope.event === "message.reply" || envelope.event === "message.send") {
       const messageId =
         typeof envelope.payload?.message_id === "string"
           ? envelope.payload.message_id
@@ -113,11 +118,18 @@ export class ClawChatGateway {
       this.sendRaw(envelope);
       return;
     }
+    if (envelope.event === "message.reaction") {
+      if (this.socket?.readyState !== WebSocket.OPEN) {
+        throw new Error("Cannot send a reaction while the ClawChat Gateway is disconnected");
+      }
+      this.sendRaw(envelope);
+      return;
+    }
     throw new Error(`Unsupported outbound event '${envelope.event}'`);
   }
 
   private openConnection(): Promise<void> {
-    return new Promise((resolve, reject) => {
+    const { promise, resolve, reject } = Promise.withResolvers<void>();
       const socket = new WebSocket(this.options.websocketUrl);
       this.socket = socket;
       this.frameQueue = Promise.resolve();
@@ -163,7 +175,7 @@ export class ClawChatGateway {
           if (ready) this.scheduleReconnect();
         }
       });
-    });
+    return promise;
   }
 
   private async handleFrame(
@@ -178,7 +190,7 @@ export class ClawChatGateway {
         trace_id: `connect-${this.idFactory()}`,
         emitted_at: this.now(),
         payload: {
-          token: this.options.accessToken,
+          token: this.accessToken,
           nonce: typeof envelope.payload?.nonce === "string" ? envelope.payload.nonce : "",
           device_id: this.options.deviceId,
           capabilities: {
@@ -211,12 +223,35 @@ export class ClawChatGateway {
     }
     if (envelope.event === "hello-fail") {
       const reason = typeof envelope.payload?.reason === "string" ? envelope.payload.reason : "unknown reason";
-      handshake.reject(
-        reason === "remote auth service unavailable"
-          ? new TransientHandshakeError(`ClawChat hello failed: ${reason}`)
-          : new Error(`ClawChat hello failed: ${reason}`)
-      );
-      this.socket?.close();
+      if (reason === "remote auth service unavailable") {
+        handshake.reject(new TransientHandshakeError(`ClawChat hello failed: ${reason}`));
+      } else if (
+        reason === "authentication failed" &&
+        this.options.refreshAccessToken &&
+        !this.handshakeRefreshAttempted
+      ) {
+        this.handshakeRefreshAttempted = true;
+        try {
+          this.accessToken = await this.options.refreshAccessToken();
+          handshake.reject(new ReconnectableHandshakeError("ClawChat token refreshed"));
+        } catch (error: unknown) {
+          handshake.reject(
+            new Error(
+              `ClawChat token refresh failed: ${error instanceof Error ? error.message : String(error)}`
+            )
+          );
+        }
+      } else if (
+        reason === "nonce mismatch" ||
+        reason === "authentication failed" ||
+        reason === "invalid connect event" ||
+        reason === "invalid connect payload"
+      ) {
+        handshake.reject(new Error(`ClawChat hello failed: ${reason}`));
+      } else {
+        handshake.reject(new TransientHandshakeError(`ClawChat hello failed: ${reason}`));
+      }
+      this.socket?.terminate();
       return;
     }
     if (envelope.event === "ping") {
@@ -471,5 +506,7 @@ class ReconnectableHandshakeError extends Error {}
 class TransientHandshakeError extends ReconnectableHandshakeError {}
 
 function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, milliseconds);
+  return promise;
 }

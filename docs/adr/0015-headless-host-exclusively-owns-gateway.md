@@ -1,0 +1,5 @@
+# Let the Headless Pi Host exclusively own the Gateway
+
+The `clawchat-pi` Headless Pi Host will be the only module allowed to create or own a ClawChat Gateway. The ordinary Pi package Extension is a Management Extension for Activation, Host Profile configuration, packaged skills, and REST or local tools; it never opens a WebSocket or receives remote turns. The Host gives each loaded Chat Session a narrow, internal Hosted Session Binding for turn context, tools, and Reply Delivery, which keeps Gateway lifecycle and credentials behind one deep module and makes starting or exiting an ordinary Pi TUI unable to disturb the Online Host Profile.
+
+This supersedes only the transport-owning responsibility of the standard Extension described in ADR 0002. We rejected a public general runtime object and a capability-heavy binding interface because both expose Gateway lifecycle knowledge that the two fixed callers do not need. The integration core still uses internal HTTP, WebSocket, SQLite, filesystem, and liveware adapters so production behavior and deterministic contract tests cross the same internal seams.
