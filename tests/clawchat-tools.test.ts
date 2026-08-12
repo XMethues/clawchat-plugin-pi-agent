@@ -131,14 +131,15 @@ function toolEnvironment(
   };
   return {
     profile: () => ({
-      schemaVersion: 1,
+      schemaVersion: 2,
       name: "default",
       workspace: "/tmp",
       deviceId: "device-1",
-      baseUrl: "https://app.clawling.com",
+      restUrl: "https://app.clawling.com",
       websocketUrl: "wss://app.clawling.com/ws",
+      mediaUrl: "https://app.clawling.com",
       accessToken: "token-1",
-      agent: { userId: "agent-1", ownerId: "owner-1" },
+      agent: { id: "agent-id-1", userId: "agent-1", ownerId: "owner-1" },
       output: { toolCallsDefault: "off" }
     }),
     api: api as unknown as ClawchatToolEnvironment["api"],

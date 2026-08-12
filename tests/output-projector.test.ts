@@ -26,7 +26,7 @@ function inboundMessage(): ClawchatInboundMessage {
 }
 
 describe("ClawchatOutputProjector", () => {
-  it("materializes completed thinking, assistant text, and enabled tool output", async () => {
+  it("materializes completed output without quoting a direct message", async () => {
     const sent: ClawchatOutboundMessage[] = [];
     const transport: ClawchatTransport = {
       send: vi.fn(async (message) => {
@@ -71,12 +71,12 @@ describe("ClawchatOutputProjector", () => {
 
     expect(sent.map((message) => message.event)).toEqual([
       "typing.update",
-      "message.reply",
-      "message.reply",
-      "message.reply",
+      "message.send",
+      "message.send",
+      "message.send",
       "typing.update"
     ]);
-    const replies = sent.filter((message) => message.event === "message.reply");
+    const replies = sent.filter((message) => message.event === "message.send");
     expect(replies.map((message) => message.payload.message_mode)).toEqual(["thinking", "normal", "tool"]);
     expect(replies[0]?.payload.message.body.fragments).toEqual([{ kind: "text", text: "inspect first" }]);
     expect(replies[1]?.payload.message.body.fragments).toEqual([{ kind: "text", text: "I found it." }]);
@@ -84,6 +84,38 @@ describe("ClawchatOutputProjector", () => {
     expect(replies[1]).toMatchObject({
       chat_id: "chat-1",
       to: { id: "chat-1", type: "direct" },
+      payload: {
+        message: {
+          context: {
+            mentions: [],
+            reply: null
+          }
+        }
+      }
+    });
+    expect(replies[1]?.payload).not.toHaveProperty("message_id");
+    expect(replies[1]?.payload.message).not.toHaveProperty("streaming");
+    expect(sent.every((message) => !["message.created", "message.add", "message.done"].includes(message.event))).toBe(
+      true
+    );
+  });
+
+  it("quotes the triggering message in a group reply", async () => {
+    const sent: ClawchatOutboundMessage[] = [];
+    const projector = new ClawchatOutputProjector({
+      transport: { send: async (message) => { sent.push(message); } }
+    });
+    const inbound = inboundMessage();
+    inbound.chat_type = "group";
+    inbound.sender.type = "group";
+
+    await projector.replyTo(inbound, "Group answer");
+
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      event: "message.reply",
+      chat_id: "chat-1",
+      to: { id: "chat-1", type: "group" },
       payload: {
         message: {
           context: {
@@ -100,11 +132,6 @@ describe("ClawchatOutputProjector", () => {
         }
       }
     });
-    expect(replies[1]?.payload).not.toHaveProperty("message_id");
-    expect(replies[1]?.payload.message).not.toHaveProperty("streaming");
-    expect(sent.every((message) => !["message.created", "message.add", "message.done"].includes(message.event))).toBe(
-      true
-    );
   });
 
   it("does not materialize thinking or tool events when their visibility is off", async () => {
@@ -168,7 +195,7 @@ describe("ClawchatOutputProjector", () => {
     );
     await projector.endTurn();
 
-    const reply = sent.find((message) => message.event === "message.reply");
+    const reply = sent.find((message) => message.event === "message.send");
     expect(uploadMedia.mock.calls).toEqual([["/tmp/report.pdf"], ["/tmp/chart.png"]]);
     expect(reply?.payload.message.body.fragments).toEqual([
       { kind: "text", text: "Files attached" },

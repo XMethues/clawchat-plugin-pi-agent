@@ -1,17 +1,18 @@
 import { join } from "node:path";
 import type { ActivationResult } from "./activation.js";
-import { DEFAULT_WEBSOCKET_URL } from "./config.js";
+import { DEFAULT_MEDIA_URL, DEFAULT_WEBSOCKET_URL } from "./config.js";
 import { GatewayStore } from "./gateway-store.js";
 import { HostProfileRepository } from "./host-profile.js";
 import type { ClawchatOutputSettings } from "./output-settings.js";
 
 export interface ClawchatState {
-  baseUrl: string;
+  restUrl: string;
   websocketUrl: string;
+  mediaUrl: string;
   accessToken: string;
   refreshToken?: string;
   agent: {
-    id?: string;
+    id: string;
     userId: string;
     ownerId: string;
   };
@@ -56,8 +57,9 @@ export async function loadClawchatState(options: StatePathOptions = {}): Promise
   const gateway = GatewayStore.open(gatewayPath(options, name));
   try {
     return {
-      baseUrl: profile.baseUrl,
+      restUrl: profile.restUrl,
       websocketUrl: profile.websocketUrl,
+      mediaUrl: profile.mediaUrl,
       accessToken: profile.accessToken,
       ...(profile.refreshToken ? { refreshToken: profile.refreshToken } : {}),
       agent: profile.agent,
@@ -75,7 +77,7 @@ export async function loadClawchatState(options: StatePathOptions = {}): Promise
 
 export async function saveClawchatState(
   state: ClawchatState | ActivationResult,
-  options: StatePathOptions & { websocketUrl?: string } = {}
+  options: StatePathOptions & { websocketUrl?: string; mediaUrl?: string } = {}
 ): Promise<string> {
   const name = profileName(options);
   const profiles = repository(options);
@@ -86,13 +88,14 @@ export async function saveClawchatState(
     const profile = await profiles.completeActivation(
       name,
       {
-        baseUrl: state.baseUrl,
+        restUrl: state.restUrl,
         accessToken: state.accessToken,
         ...(state.refreshToken ? { refreshToken: state.refreshToken } : {}),
         agent: state.agent
       },
       {
         websocketUrl: state.websocketUrl,
+        mediaUrl: state.mediaUrl,
         ...(options.resetIdentityState !== undefined
           ? { resetIdentityState: options.resetIdentityState }
           : {})
@@ -105,13 +108,15 @@ export async function saveClawchatState(
     await profiles.prepareActivation(name, workspace);
     const profile = await profiles.completeActivation(name, state, {
       websocketUrl: options.websocketUrl ?? DEFAULT_WEBSOCKET_URL,
+      mediaUrl: options.mediaUrl ?? DEFAULT_MEDIA_URL,
       ...(options.resetIdentityState !== undefined
         ? { resetIdentityState: options.resetIdentityState }
         : {})
     });
     extensionState = {
-      baseUrl: profile.baseUrl,
+      restUrl: profile.restUrl,
       websocketUrl: profile.websocketUrl,
+      mediaUrl: profile.mediaUrl,
       accessToken: profile.accessToken,
       ...(profile.refreshToken ? { refreshToken: profile.refreshToken } : {}),
       agent: profile.agent,
@@ -140,7 +145,12 @@ export async function saveClawchatState(
 
 function repository(options: StatePathOptions): HostProfileRepository {
   return options.profileRepository ??
-    new HostProfileRepository(options.agentDir ? { agentDir: options.agentDir } : {});
+    new HostProfileRepository({
+      ...(options.agentDir ? { agentDir: options.agentDir } : {}),
+      ...(process.env.CLAWCHAT_MEDIA_URL
+        ? { legacyMediaUrl: process.env.CLAWCHAT_MEDIA_URL }
+        : {})
+    });
 }
 
 function profileName(options: StatePathOptions): string {

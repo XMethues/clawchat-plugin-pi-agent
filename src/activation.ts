@@ -1,6 +1,8 @@
+import { normalizeHttpOrigin } from "./config.js";
+
 export interface ActivateClawchatOptions {
   code: string;
-  baseUrl: string;
+  restUrl: string;
   fetchFn?: typeof fetch;
   deviceId?: string;
 }
@@ -10,11 +12,11 @@ export interface ActivationResult {
   refreshToken?: string;
   ownerChatId?: string;
   agent: {
-    id?: string;
+    id: string;
     userId: string;
     ownerId: string;
   };
-  baseUrl: string;
+  restUrl: string;
 }
 
 interface RawActivationResponse {
@@ -40,20 +42,19 @@ function requireTrimmedString(value: unknown, field: string): string {
   return value.trim();
 }
 
-function optionalTrimmedString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+function requireOpaqueToken(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`Activation response missing ${field}`);
+  }
+  return value;
 }
 
-function jwtStringClaim(token: string, claim: string): string | undefined {
-  const payload = token.split(".")[1];
-  if (!payload) return undefined;
-  try {
-    const parsed: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-    return optionalTrimmedString((parsed as Record<string, unknown>)[claim]);
-  } catch {
-    return undefined;
-  }
+function optionalOpaqueToken(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
+}
+
+function optionalTrimmedString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
 }
 
 function unwrapActivationResponse(raw: RawActivationResponse): RawActivationResponse {
@@ -76,9 +77,9 @@ export async function activateClawchat(options: ActivateClawchatOptions): Promis
     throw new Error("Activation code is required");
   }
 
-  const baseUrl = options.baseUrl.replace(/\/+$/, "");
+  const restUrl = normalizeHttpOrigin(options.restUrl, "ClawChat REST origin");
   const fetchImpl = options.fetchFn ?? fetch;
-  const response = await fetchImpl(`${baseUrl}/v1/agents/connect`, {
+  const response = await fetchImpl(`${restUrl}/v1/agents/connect`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -98,15 +99,16 @@ export async function activateClawchat(options: ActivateClawchatOptions): Promis
   const raw = unwrapActivationResponse((await response.json()) as RawActivationResponse);
   const agent = raw.agent ?? {};
   const result: ActivationResult = {
-    accessToken: requireTrimmedString(raw.access_token, "access_token"),
-    baseUrl,
+    accessToken: requireOpaqueToken(raw.access_token, "access_token"),
+    restUrl,
     agent: {
+      id: requireTrimmedString(agent.id, "agent.id"),
       userId: requireTrimmedString(agent.user_id, "agent.user_id"),
       ownerId: requireTrimmedString(agent.owner_id, "agent.owner_id")
     }
   };
 
-  const refreshToken = optionalTrimmedString(raw.refresh_token);
+  const refreshToken = optionalOpaqueToken(raw.refresh_token);
   if (refreshToken) {
     result.refreshToken = refreshToken;
   }
@@ -116,11 +118,6 @@ export async function activateClawchat(options: ActivateClawchatOptions): Promis
     result.ownerChatId = ownerChatId;
   }
 
-  const agentId =
-    optionalTrimmedString(agent.id) ?? jwtStringClaim(result.accessToken, "aid");
-  if (agentId) {
-    result.agent.id = agentId;
-  }
 
   return result;
 }

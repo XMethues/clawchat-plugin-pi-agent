@@ -1,15 +1,24 @@
+import {
+  clawchatMemoryTarget,
+  serializeClawchatSnapshot,
+  type ClawchatMemoryStore
+} from "./clawchat-memory.js";
 import type {
   AwarenessAdmission,
   ClawchatAwarenessSource,
   GatewayStore
 } from "./gateway-store.js";
 import type { ClawchatGatewayEvent } from "./gateway.js";
+import { isUnknownRecord } from "./type-guards.js";
 
 export interface ClawchatAwarenessCoordinatorOptions {
   api: { get(path: string): Promise<unknown> };
   store: GatewayStore;
   ownerChatId: string;
   agentId?: string;
+  agentUserId?: string;
+  agentOwnerId?: string;
+  memory?: ClawchatMemoryStore;
   wake(chatId: string): void;
 }
 
@@ -17,6 +26,11 @@ export interface ClawchatAwarenessFrame {
   kind: "clawchat.awareness";
   coalesceKey: string;
   sources: ClawchatAwarenessSource[];
+}
+
+export interface ClawchatRecoveryResult {
+  changed: boolean;
+  admission: AwarenessAdmission | null;
 }
 
 export function renderAwarenessPrompt(frame: ClawchatAwarenessFrame): string {
@@ -44,6 +58,9 @@ export class ClawchatAwarenessCoordinator {
   private readonly store: GatewayStore;
   private readonly ownerChatId: string;
   private readonly agentId: string | undefined;
+  private readonly agentUserId: string | undefined;
+  private readonly agentOwnerId: string | undefined;
+  private readonly memory: ClawchatMemoryStore | undefined;
   private readonly wake: (chatId: string) => void;
 
   constructor(options: ClawchatAwarenessCoordinatorOptions) {
@@ -52,6 +69,9 @@ export class ClawchatAwarenessCoordinator {
     this.store = options.store;
     this.ownerChatId = options.ownerChatId;
     this.agentId = options.agentId?.trim() || undefined;
+    this.agentUserId = options.agentUserId?.trim() || undefined;
+    this.agentOwnerId = options.agentOwnerId?.trim() || undefined;
+    this.memory = options.memory;
     this.wake = options.wake;
   }
 
@@ -66,6 +86,136 @@ export class ClawchatAwarenessCoordinator {
     });
     this.wake(this.ownerChatId);
     return admission;
+  }
+
+  async recover(): Promise<ClawchatRecoveryResult> {
+    const memory = this.memory;
+    const agentId = requireString(this.agentId, "agentId");
+    if (!memory) throw new Error("memory is required for authoritative recovery");
+
+    const conversationList = await this.api.get("/v1/conversations?limit=100");
+    const listedConversationIds = conversationIds(conversationList);
+    const knownConversationIds = [
+      ...new Set([
+        this.ownerChatId,
+        ...this.store.getStatus().sessions.map((session) => session.chatId)
+      ])
+    ].sort();
+    const [agentState, ownerState, ...conversationStates] = await Promise.all([
+      this.api.get(`/v1/agents/${encodeURIComponent(agentId)}`),
+      this.api.get("/v1/agents/me/owner"),
+      ...knownConversationIds.map((chatId) =>
+        this.api.get(`/v1/conversations/${encodeURIComponent(chatId)}`)
+      )
+    ]);
+    const conversations: Array<{
+      chatId: string;
+      conversation: unknown;
+      announcements?: unknown;
+    }> = knownConversationIds.map((chatId, index) => ({
+      chatId,
+      conversation: conversationStates[index]
+    }));
+    const groupConversations = conversations.filter(({ conversation: state }) => {
+      const conversation = unwrapDetail(state, "conversation");
+      const conversationType = firstValue(conversation, [
+        "type",
+        "conversation_type",
+        "conversationType"
+      ]);
+      return conversationType === "group" || isUnknownRecord(conversation.group);
+    });
+    const announcementStates = await Promise.all(
+      groupConversations.map(({ chatId }) =>
+        this.api.get(`/v1/conversations/${encodeURIComponent(chatId)}/announcements`)
+      )
+    );
+    groupConversations.forEach((conversation, index) => {
+      conversation.announcements = announcementStates[index];
+    });
+
+    const agent = unwrapDetail(agentState, "agent");
+    const owner = unwrapDetail(ownerState, "user");
+    let changed = await memory.writeMetadataIfChanged(clawchatMemoryTarget("owner", "owner"), {
+      agent_user_id: this.agentUserId,
+      agent_owner_id: this.agentOwnerId,
+      agent_nickname: firstValue(agent, ["nickname", "name"]),
+      agent_avatar_url: firstValue(agent, ["avatar_url", "avatarUrl"]),
+      agent_bio: agent.bio,
+      agent_behavior: firstValue(agent, ["behavior", "agent_behavior"]),
+      agent_owner_nickname: owner.nickname,
+      agent_owner_avatar_url: firstValue(owner, ["avatar_url", "avatarUrl"]),
+      agent_owner_bio: owner.bio,
+      agent_owner_locale: owner.locale,
+      conversation_ids: listedConversationIds.join(",")
+    });
+
+    for (const recovered of conversations) {
+      const { chatId, conversation: conversationState, announcements } = recovered;
+      const conversation = unwrapDetail(conversationState, "conversation");
+      const group = isUnknownRecord(conversation.group) ? conversation.group : {};
+      const conversationType = firstValue(conversation, [
+        "type",
+        "conversation_type",
+        "conversationType"
+      ]);
+      if (conversationType !== "group" && !isUnknownRecord(conversation.group)) continue;
+      const participants = Array.isArray(conversation.participants)
+        ? conversation.participants.filter(isUnknownRecord)
+        : [];
+      const participantIds = participants
+        .map((participant) => firstValue(participant, ["id", "user_id", "userId"]))
+        .filter((value): value is string => typeof value === "string" && value.length > 0);
+      const groupOwner = isUnknownRecord(group.owner) ? group.owner : {};
+      const groupChanged = await memory.writeMetadataIfChanged(
+        clawchatMemoryTarget("group", chatId),
+        {
+          group_id: chatId,
+          group_type: conversationType ?? group.type,
+          group_title: conversation.title ?? group.title,
+          group_description: conversation.description ?? group.description,
+          group_avatar_url:
+            firstValue(conversation, ["avatar_url", "avatarUrl"]) ??
+            firstValue(group, ["avatar_url", "avatarUrl"]),
+          group_member_add_policy: firstValue(conversation, [
+            "member_add_policy",
+            "memberAddPolicy"
+          ]),
+          group_announcements: serializeClawchatSnapshot(announcements),
+          group_owner_id: firstValue(conversation, ["creator_id", "creatorId"]) ?? groupOwner.id,
+          group_owner_nickname: firstValue(groupOwner, ["nickname", "name"]),
+          group_owner_profile_type: firstValue(groupOwner, ["profile_type", "type"]),
+          group_created_at: firstValue(conversation, ["created_at", "createdAt"]),
+          updated_at: firstValue(conversation, ["updated_at", "updatedAt"]),
+          participant_ids: participantIds.join(",")
+        }
+      );
+      changed = groupChanged || changed;
+    }
+
+    const authoritativeState = {
+      conversationList,
+      conversations,
+      agent: agentState,
+      owner: ownerState
+    };
+    const snapshotChanged = await memory.writeRecoverySnapshotIfChanged(authoritativeState);
+    changed = snapshotChanged || changed;
+
+    if (!changed) return { changed: false, admission: null };
+    const source: ClawchatAwarenessSource = {
+      sourceId: `recovery:${crypto.randomUUID()}`,
+      signalType: "metadata.recovered",
+      entityId: agentId,
+      authoritativeState
+    };
+    const admission = this.store.enqueueAwareness({
+      chatId: this.ownerChatId,
+      coalesceKey: "general",
+      source
+    });
+    this.wake(this.ownerChatId);
+    return { changed: true, admission };
   }
 
   private async refresh(event: ClawchatGatewayEvent): Promise<ClawchatAwarenessSource> {
@@ -160,6 +310,38 @@ function metadataRefreshPlan(value: unknown): {
     agent: value.includes("behavior")
   };
 }
+
+function conversationIds(value: unknown): string[] {
+  const record = isUnknownRecord(value) ? value : undefined;
+  const candidates = Array.isArray(value)
+    ? value
+    : Array.isArray(record?.conversations)
+      ? record.conversations
+      : Array.isArray(record?.items)
+        ? record.items
+        : [];
+  const ids = candidates.map((candidate) =>
+    requireString(
+      isUnknownRecord(candidate) ? candidate.id : undefined,
+      "conversation.id"
+    )
+  );
+  return [...new Set(ids)].sort();
+}
+
+function unwrapDetail(value: unknown, key: string): Record<string, unknown> {
+  if (!isUnknownRecord(value)) return {};
+  if (isUnknownRecord(value[key])) return value[key];
+  return isUnknownRecord(value.detail) ? value.detail : value;
+}
+
+function firstValue(source: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) {
+    if (source[key] !== undefined && source[key] !== null) return source[key];
+  }
+  return undefined;
+}
+
 
 function awarenessSourceId(event: ClawchatGatewayEvent): string {
   if (event.event === "chat.metadata.invalidated") {

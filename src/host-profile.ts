@@ -2,11 +2,19 @@ import { chmod, mkdir, open, readFile, realpath, rename, rm, stat, unlink, write
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ActivationResult } from "./activation.js";
-import { DEFAULT_WEBSOCKET_URL } from "./config.js";
+import {
+  DEFAULT_MEDIA_URL,
+  DEFAULT_REST_URL,
+  DEFAULT_WEBSOCKET_URL,
+  normalizeHttpOrigin,
+  normalizeWebSocketUrl
+} from "./config.js";
 import { GatewayStore } from "./gateway-store.js";
 import { isFileSystemError, optionalLstat } from "./filesystem.js";
+import { isUnknownRecord } from "./type-guards.js";
 
-const PROFILE_SCHEMA_VERSION = 1 as const;
+const PROFILE_SCHEMA_VERSION = 2 as const;
+const LEGACY_PROFILE_SCHEMA_VERSION = 1 as const;
 const PROFILE_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
 
 export interface HostProfile {
@@ -14,13 +22,14 @@ export interface HostProfile {
   name: string;
   workspace: string;
   deviceId: string;
-  baseUrl: string;
+  restUrl: string;
   websocketUrl: string;
+  mediaUrl: string;
   accessToken: string;
   refreshToken?: string;
   ownerChatId?: string;
   agent: {
-    id?: string;
+    id: string;
     userId: string;
     ownerId: string;
   };
@@ -41,9 +50,10 @@ export interface HostProfileRepositoryOptions {
   createDeviceId?: () => string;
   processId?: number;
   isProcessAlive?: (pid: number) => boolean;
+  legacyMediaUrl?: string;
 }
 
-export interface HostProfileLock {
+export interface HostProfileOperationLease {
   release(): Promise<void>;
 }
 
@@ -58,12 +68,14 @@ export class HostProfileRepository {
   private readonly processId: number;
   private readonly isProcessAlive: (pid: number) => boolean;
   private readonly pendingActivations = new Map<string, HostProfileDraft>();
+  private readonly legacyMediaUrl: string | undefined;
 
   constructor(options: HostProfileRepositoryOptions = {}) {
     this.agentDir = options.agentDir ?? getAgentDir();
     this.createDeviceId = options.createDeviceId ?? (() => `clawchat-pi-${crypto.randomUUID()}`);
     this.processId = options.processId ?? process.pid;
     this.isProcessAlive = options.isProcessAlive ?? isProcessAlive;
+    this.legacyMediaUrl = options.legacyMediaUrl;
   }
 
   profilePath(name: string): string {
@@ -76,7 +88,7 @@ export class HostProfileRepository {
     return join(this.agentDir, "clawchat", "profiles", name);
   }
 
-  async acquireLock(name: string): Promise<HostProfileLock> {
+  async acquireOperationLease(name: string): Promise<HostProfileOperationLease> {
     const directory = this.profileDirectory(name);
     const path = join(directory, "run.lock");
     await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -96,23 +108,28 @@ export class HostProfileRepository {
           }
           continue;
         }
-        throw new Error(`Host Profile '${name}' is already running`);
+        throw new Error(`Host Profile '${name}' already has an active operation`);
       }
     }
     if (!handle) throw new Error(`Unable to lock Host Profile '${name}'`);
     await handle.writeFile(`${JSON.stringify({ pid: this.processId, token, startedAt: Date.now() })}\n`);
 
+    let closed = false;
     let released = false;
     return {
       release: async () => {
         if (released) return;
-        released = true;
-        await handle.close();
+        if (!closed) {
+          await handle.close();
+          closed = true;
+        }
         try {
           const current = JSON.parse(await readFile(path, "utf8")) as { token?: unknown };
           if (current.token === token) await unlink(path);
+          released = true;
         } catch (error: unknown) {
           if (!isFileSystemError(error, "ENOENT")) throw error;
+          released = true;
         }
       }
     };
@@ -126,18 +143,14 @@ export class HostProfileRepository {
 
   async prepareActivation(name: string, workspace: string): Promise<HostProfileDraft> {
     const canonicalWorkspace = await canonicalizeWorkspace(workspace);
-    const current = await this.loadStored(name);
+    const current = await this.readStoredRecord(name);
     if (current) {
-      const lock = await this.getLockStatus(name);
-      if (lock.running) {
-        throw new Error(`Host Profile '${name}' cannot be activated while process ${lock.pid} is running`);
-      }
-      if (current.workspace !== canonicalWorkspace) {
+      const draft = draftFromStored(current, name, this.profilePath(name));
+      if (draft.workspace !== canonicalWorkspace) {
         throw new Error(
-          `Host Profile '${name}' is bound to ${current.workspace}; use another profile for ${canonicalWorkspace}`
+          `Host Profile '${name}' is bound to ${draft.workspace}; use another profile for ${canonicalWorkspace}`
         );
       }
-      const draft = toDraft(current);
       this.pendingActivations.set(name, draft);
       return draft;
     }
@@ -156,28 +169,35 @@ export class HostProfileRepository {
   async completeActivation(
     name: string,
     activation: ActivationResult,
-    options: { websocketUrl?: string; resetIdentityState?: boolean } = {}
+    options: { websocketUrl: string; mediaUrl: string; resetIdentityState?: boolean }
   ): Promise<HostProfile> {
-    const stored = await this.loadStored(name);
-    const prepared = this.pendingActivations.get(name) ?? stored;
+    const stored = await this.readStoredRecord(name);
+    const prepared = this.pendingActivations.get(name) ??
+      (stored ? draftFromStored(stored, name, this.profilePath(name)) : undefined);
     if (!prepared) {
       throw new Error(`Host Profile '${name}' must be prepared before activation`);
     }
-    const previous = stored && isActiveProfile(stored) ? stored : undefined;
-    const rebinding = options.resetIdentityState === true && previous !== undefined;
+    const rebinding = options.resetIdentityState === true && stored !== null && hasAccessToken(stored);
     if (rebinding) await this.resetIdentityState(name);
 
     const profile: HostProfile = {
       ...toDraft(prepared),
-      baseUrl: activation.baseUrl,
-      websocketUrl:
-        options.websocketUrl ??
-        (!rebinding && previous ? previous.websocketUrl : DEFAULT_WEBSOCKET_URL),
-      accessToken: activation.accessToken,
-      ...(activation.refreshToken ? { refreshToken: activation.refreshToken } : {}),
+      restUrl: normalizeHttpOrigin(activation.restUrl, "Host Profile REST origin"),
+      websocketUrl: normalizeWebSocketUrl(options.websocketUrl, "Host Profile WebSocket URL"),
+      mediaUrl: normalizeHttpOrigin(options.mediaUrl, "Host Profile Media origin"),
+      accessToken: requireOpaqueProfileToken(activation.accessToken, "accessToken"),
+      ...(activation.refreshToken
+        ? { refreshToken: requireOpaqueProfileToken(activation.refreshToken, "refreshToken") }
+        : {}),
       ...(activation.ownerChatId ? { ownerChatId: activation.ownerChatId } : {}),
-      agent: activation.agent,
-      output: !rebinding && previous ? previous.output : { toolCallsDefault: "off" }
+      agent: {
+        id: requireProfileString(activation.agent.id, "agent.id"),
+        userId: requireProfileString(activation.agent.userId, "agent.userId"),
+        ownerId: requireProfileString(activation.agent.ownerId, "agent.ownerId")
+      },
+      output: !rebinding && stored && hasOutput(stored)
+        ? storedOutput(stored)
+        : { toolCallsDefault: "off" }
     };
     await this.write(name, profile);
     this.pendingActivations.delete(name);
@@ -189,8 +209,10 @@ export class HostProfileRepository {
     if (!profile) throw new Error(`Host Profile '${name}' is not activated`);
     const updated: HostProfile = {
       ...profile,
-      accessToken,
-      ...(refreshToken ? { refreshToken } : {})
+      accessToken: requireOpaqueProfileToken(accessToken, "accessToken"),
+      ...(refreshToken
+        ? { refreshToken: requireOpaqueProfileToken(refreshToken, "refreshToken") }
+        : {})
     };
     await this.write(name, updated);
     return updated;
@@ -206,6 +228,22 @@ export class HostProfileRepository {
   }
 
   private async loadStored(name: string): Promise<HostProfile | HostProfileDraft | null> {
+    const stored = await this.readStoredRecord(name);
+    if (!stored) return null;
+    if (stored.schemaVersion === PROFILE_SCHEMA_VERSION) {
+      return parseCurrentProfile(stored, name, this.profilePath(name));
+    }
+    if (stored.schemaVersion === LEGACY_PROFILE_SCHEMA_VERSION) {
+      const migrated = this.migrateLegacyProfile(stored, name);
+      await this.write(name, migrated);
+      return migrated;
+    }
+    throw new Error(
+      `Unsupported Host Profile schema at ${this.profilePath(name)}; reactivate Host Profile '${name}'`
+    );
+  }
+
+  private async readStoredRecord(name: string): Promise<Record<string, unknown> | null> {
     const path = this.profilePath(name);
     let text: string;
     try {
@@ -214,17 +252,51 @@ export class HostProfileRepository {
       if (isFileSystemError(error, "ENOENT")) return null;
       throw error;
     }
+    const parsed: unknown = JSON.parse(text);
+    if (!isUnknownRecord(parsed)) throw new Error(`Invalid Host Profile at ${path}`);
+    return parsed;
+  }
 
-    const parsed = JSON.parse(text) as Partial<HostProfile>;
-    if (
-      parsed.schemaVersion !== PROFILE_SCHEMA_VERSION ||
-      parsed.name !== name ||
-      typeof parsed.workspace !== "string" ||
-      typeof parsed.deviceId !== "string"
-    ) {
-      throw new Error(`Invalid Host Profile at ${path}`);
+  private migrateLegacyProfile(stored: Record<string, unknown>, name: string): HostProfile | HostProfileDraft {
+    const draft = draftFromStored(stored, name, this.profilePath(name));
+    if (!hasAccessToken(stored)) return draft;
+    const restUrl = normalizeLegacyHttpOrigin(stored.baseUrl, "REST", name);
+    const websocketUrl = normalizeLegacyWebSocketUrl(stored.websocketUrl, name);
+    const customEndpoints =
+      restUrl !== DEFAULT_REST_URL || websocketUrl !== DEFAULT_WEBSOCKET_URL;
+    if (!this.legacyMediaUrl && customEndpoints) {
+      throw new Error(
+        `Legacy Host Profile '${name}' has custom endpoints but no Media origin; set CLAWCHAT_MEDIA_URL and retry, or reactivate the profile`
+      );
     }
-    return parsed as HostProfile | HostProfileDraft;
+    const mediaUrl = normalizeHttpOrigin(
+      this.legacyMediaUrl ?? DEFAULT_MEDIA_URL,
+      "CLAWCHAT_MEDIA_URL"
+    );
+    const agent = stored.agent;
+    if (!isUnknownRecord(agent)) {
+      throw legacyIdentityError(name, "agent");
+    }
+    const migrated: HostProfile = {
+      ...draft,
+      restUrl,
+      websocketUrl,
+      mediaUrl,
+      accessToken: requireOpaqueProfileToken(stored.accessToken, "accessToken"),
+      ...(typeof stored.refreshToken === "string" && stored.refreshToken.trim()
+        ? { refreshToken: stored.refreshToken }
+        : {}),
+      ...(typeof stored.ownerChatId === "string" && stored.ownerChatId.trim()
+        ? { ownerChatId: stored.ownerChatId.trim() }
+        : {}),
+      agent: {
+        id: requireLegacyIdentity(agent.id, name, "agent.id"),
+        userId: requireLegacyIdentity(agent.userId, name, "agent.userId"),
+        ownerId: requireLegacyIdentity(agent.ownerId, name, "agent.ownerId")
+      },
+      output: storedOutput(stored)
+    };
+    return migrated;
   }
 
   private async resetIdentityState(name: string): Promise<void> {
@@ -287,18 +359,158 @@ function toDraft(profile: HostProfile | HostProfileDraft): HostProfileDraft {
   };
 }
 
+function draftFromStored(
+  stored: Record<string, unknown>,
+  name: string,
+  path: string
+): HostProfileDraft {
+  if (
+    (stored.schemaVersion !== PROFILE_SCHEMA_VERSION &&
+      stored.schemaVersion !== LEGACY_PROFILE_SCHEMA_VERSION) ||
+    stored.name !== name ||
+    typeof stored.workspace !== "string" ||
+    stored.workspace.trim() === "" ||
+    typeof stored.deviceId !== "string" ||
+    stored.deviceId.trim() === ""
+  ) {
+    throw new Error(`Invalid Host Profile at ${path}`);
+  }
+  return {
+    schemaVersion: PROFILE_SCHEMA_VERSION,
+    name,
+    workspace: stored.workspace,
+    deviceId: stored.deviceId
+  };
+}
+
+function parseCurrentProfile(
+  stored: Record<string, unknown>,
+  name: string,
+  path: string
+): HostProfile | HostProfileDraft {
+  const draft = draftFromStored(stored, name, path);
+  if (!hasAccessToken(stored)) return draft;
+  const agent = stored.agent;
+  if (!isUnknownRecord(agent)) throw new Error(`Invalid Host Profile at ${path}: agent is required`);
+  const restUrl = normalizeHttpOrigin(
+    requireProfileString(stored.restUrl, "restUrl"),
+    "Host Profile REST origin"
+  );
+  const websocketUrl = normalizeWebSocketUrl(
+    requireProfileString(stored.websocketUrl, "websocketUrl"),
+    "Host Profile WebSocket URL"
+  );
+  const mediaUrl = normalizeHttpOrigin(
+    requireProfileString(stored.mediaUrl, "mediaUrl"),
+    "Host Profile Media origin"
+  );
+  if (
+    restUrl !== stored.restUrl ||
+    websocketUrl !== stored.websocketUrl ||
+    mediaUrl !== stored.mediaUrl
+  ) {
+    throw new Error(`Invalid Host Profile at ${path}: endpoints are not normalized`);
+  }
+  return {
+    ...draft,
+    restUrl,
+    websocketUrl,
+    mediaUrl,
+    accessToken: requireOpaqueProfileToken(stored.accessToken, "accessToken"),
+    ...(typeof stored.refreshToken === "string" && stored.refreshToken.trim()
+      ? { refreshToken: stored.refreshToken }
+      : {}),
+    ...(typeof stored.ownerChatId === "string" && stored.ownerChatId.trim()
+      ? { ownerChatId: stored.ownerChatId.trim() }
+      : {}),
+    agent: {
+      id: requireProfileString(agent.id, "agent.id"),
+      userId: requireProfileString(agent.userId, "agent.userId"),
+      ownerId: requireProfileString(agent.ownerId, "agent.ownerId")
+    },
+    output: storedOutput(stored)
+  };
+}
+
 function isActiveProfile(profile: HostProfile | HostProfileDraft): profile is HostProfile {
-  return (
-    "accessToken" in profile &&
-    typeof profile.accessToken === "string" &&
-    profile.accessToken.length > 0 &&
-    "agent" in profile &&
-    typeof profile.agent?.userId === "string" &&
-    typeof profile.agent.ownerId === "string" &&
-    "output" in profile &&
-    (profile.output?.toolCallsDefault === "on" || profile.output?.toolCallsDefault === "off")
+  return "accessToken" in profile;
+}
+
+function hasAccessToken(stored: Record<string, unknown>): boolean {
+  return typeof stored.accessToken === "string" && stored.accessToken.trim() !== "";
+}
+
+function hasOutput(stored: Record<string, unknown>): boolean {
+  return isUnknownRecord(stored.output);
+}
+
+function storedOutput(stored: Record<string, unknown>): HostProfile["output"] {
+  if (
+    !isUnknownRecord(stored.output) ||
+    (stored.output.toolCallsDefault !== "on" && stored.output.toolCallsDefault !== "off")
+  ) {
+    throw new Error("Invalid Host Profile output.toolCallsDefault");
+  }
+  return { toolCallsDefault: stored.output.toolCallsDefault };
+}
+
+function requireProfileString(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`Invalid Host Profile: ${field} is required`);
+  }
+  return value.trim();
+}
+
+function requireOpaqueProfileToken(value: unknown, field: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error(`Invalid Host Profile: ${field} is required`);
+  }
+  return value;
+}
+
+function requireLegacyIdentity(value: unknown, name: string, field: string): string {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw legacyIdentityError(name, field);
+  }
+  return value.trim();
+}
+
+function legacyIdentityError(name: string, field: string): Error {
+  return new Error(
+    `Legacy Host Profile '${name}' is missing ${field}; reactivate the profile to obtain structured agent identity`
   );
 }
+
+function normalizeLegacyHttpOrigin(value: unknown, endpoint: string, name: string): string {
+  if (typeof value !== "string") {
+    throw new Error(
+      `Legacy Host Profile '${name}' is missing its ${endpoint} origin; configure endpoints and reactivate the profile`
+    );
+  }
+  try {
+    return normalizeHttpOrigin(value, `Legacy Host Profile ${endpoint} origin`);
+  } catch {
+    throw new Error(
+      `Legacy Host Profile '${name}' has an invalid ${endpoint} origin; configure endpoints and reactivate the profile`
+    );
+  }
+}
+
+function normalizeLegacyWebSocketUrl(value: unknown, name: string): string {
+  if (typeof value !== "string") {
+    throw new Error(
+      `Legacy Host Profile '${name}' is missing its WebSocket URL; configure endpoints and reactivate the profile`
+    );
+  }
+  try {
+    return normalizeWebSocketUrl(value, "Legacy Host Profile WebSocket URL");
+  } catch {
+    throw new Error(
+      `Legacy Host Profile '${name}' has an invalid WebSocket URL; configure endpoints and reactivate the profile`
+    );
+  }
+}
+
 
 async function canonicalizeWorkspace(workspace: string): Promise<string> {
   const canonical = await realpath(workspace);

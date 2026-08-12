@@ -7,6 +7,8 @@ import type {
 import {
   ClawchatOutputProjector,
   outputTurnFromInbound,
+  type OutputTurn,
+  type OutputVisibility,
   type PiOutputEvent
 } from "./output-projector.js";
 import type { ClawchatInboundMessage, ClawchatTransport } from "./types.js";
@@ -15,6 +17,7 @@ import {
   appendClawchatSystemPrompt,
   registerClawchatTools,
   uploadClawchatMediaFile,
+  type ActiveClawchatTurn,
   type ClawchatToolEnvironment
 } from "./clawchat-tools.js";
 
@@ -26,8 +29,20 @@ export interface HeadlessClawchatPiExtensionOptions {
   tools?: ClawchatToolEnvironment;
 }
 
+export interface HostedSessionBinding {
+  target: OutputTurn;
+  auditSource?: string;
+  outputVisibility: OutputVisibility;
+  toolContext: ActiveClawchatTurn;
+}
+
+export interface AwarenessTurnBinding extends Omit<HostedSessionBinding, "target"> {
+  target: Extract<OutputTurn, { chatType: "direct" }>;
+}
+
 export interface HeadlessExtensionController {
   beginTurn(message: ClawchatInboundMessage): Promise<void>;
+  beginAwarenessTurn(binding: AwarenessTurnBinding): Promise<void>;
   abortTurn(): Promise<void>;
   isActive(): boolean;
 }
@@ -44,21 +59,50 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
     ...(options.now ? { now: options.now } : {}),
     ...(options.idFactory ? { idFactory: options.idFactory } : {})
   });
-  let active: ClawchatInboundMessage | undefined;
+  let active: HostedSessionBinding | undefined;
   let piApi: ExtensionAPI | undefined;
   let terminalReplySent = false;
 
+  const activate = async (binding: HostedSessionBinding): Promise<void> => {
+    if (active) {
+      throw new Error(`A Hosted Session Binding is already active for ${active.target.chatId}`);
+    }
+    active = binding;
+    terminalReplySent = false;
+    try {
+      await projector.beginTurn(binding.target);
+    } catch (error: unknown) {
+      active = undefined;
+      throw error;
+    }
+  };
+
   const controller: HeadlessExtensionController = {
     beginTurn: async (message) => {
-      if (active) throw new Error(`A Headless Extension turn is already active for ${active.chat_id}`);
-      active = message;
-      terminalReplySent = false;
-      try {
-        await projector.beginTurn(outputTurnFromInbound(message));
-      } catch (error: unknown) {
-        active = undefined;
-        throw error;
+      if (!piApi) throw new Error("Headless Extension is not initialized");
+      await activate({
+        target: outputTurnFromInbound(message),
+        auditSource: message.payload.message_id,
+        outputVisibility: {
+          thinking: piApi.getThinkingLevel() !== "off",
+          tools: options.toolsVisible(message)
+        },
+        toolContext: {
+          chatId: message.chat_id,
+          chatType: message.chat_type,
+          messageId: message.payload.message_id
+        }
+      });
+    },
+    beginAwarenessTurn: async (binding) => {
+      if (!piApi) throw new Error("Headless Extension is not initialized");
+      if (binding.toolContext.chatId !== binding.target.chatId) {
+        throw new Error("Awareness tool context must target the owner direct Chat Session");
       }
+      if (binding.toolContext.chatType !== "direct") {
+        throw new Error("Awareness tool context must be direct");
+      }
+      await activate(binding);
     },
     abortTurn: async () => {
       if (!active) return;
@@ -77,10 +121,16 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
   ): Promise<void> => {
     if (!active || !piApi) return;
     if (terminalReplySent && (event.type === "message_end" || event.type === "tool_execution_end")) return;
-    await projector.handle(event as PiOutputEvent, {
-      thinking: piApi.getThinkingLevel() !== "off",
-      tools: options.toolsVisible(active)
-    });
+    try {
+      await projector.handle(event as PiOutputEvent, active.outputVisibility);
+    } catch (error: unknown) {
+      try {
+        await controller.abortTurn();
+      } catch {
+        // Preserve the materialization failure while still clearing the binding in abortTurn's finally.
+      }
+      throw error;
+    }
   };
 
   const extension = (pi: ExtensionAPI): void => {
@@ -88,18 +138,19 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
     if (options.tools) {
       registerClawchatTools(pi, {
         ...options.tools,
-        activeTurn: () =>
-          active
-            ? {
-                chatId: active.chat_id,
-                chatType: active.chat_type,
-                messageId: active.payload.message_id
-              }
-            : undefined,
+        activeTurn: () => active?.toolContext,
         recordToolCall: (record) =>
           options.tools?.recordToolCall?.({
             ...record,
-            ...(active ? { chatId: active.chat_id, messageId: active.payload.message_id } : {})
+            ...(active
+              ? {
+                  chatId: active.toolContext.chatId,
+                  ...(active.auditSource ? { auditSource: active.auditSource } : {}),
+                  ...(active.toolContext.messageId
+                    ? { messageId: active.toolContext.messageId }
+                    : {})
+                }
+              : {})
           }),
         onTerminalSend: () => {
           terminalReplySent = true;
@@ -109,10 +160,11 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
     pi.on("before_agent_start", async (event) => {
       let systemPrompt = appendClawchatSystemPrompt(event.systemPrompt);
       if (active && options.tools) {
-        systemPrompt = await appendClawchatMemoryPrompt(systemPrompt, options.tools.memory, {
-          chatId: active.chat_id,
-          chatType: active.chat_type
-        });
+        systemPrompt = await appendClawchatMemoryPrompt(
+          systemPrompt,
+          options.tools.memory,
+          active.toolContext
+        );
       }
       return { systemPrompt };
     });

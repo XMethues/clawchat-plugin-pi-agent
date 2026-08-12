@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, realpath, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -17,24 +17,32 @@ describe("HostProfileRepository", () => {
     });
 
     const prepared = await profiles.prepareActivation("default", workspace);
-    await profiles.completeActivation("default", {
-      baseUrl: "https://app.clawling.com",
-      accessToken: "access-1",
-      ownerChatId: "owner-chat-1",
-      refreshToken: "refresh-1",
-      agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" }
-    });
+    await profiles.completeActivation(
+      "default",
+      {
+        restUrl: "https://app.clawling.com",
+        accessToken: "opaque access token",
+        ownerChatId: "owner-chat-1",
+        refreshToken: "opaque refresh token",
+        agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" }
+      },
+      {
+        websocketUrl: "wss://app.clawling.com/ws",
+        mediaUrl: "https://media.example.test/"
+      }
+    );
 
     await expect(profiles.load("default")).resolves.toEqual({
-      schemaVersion: 1,
+      schemaVersion: 2,
       name: "default",
       workspace: canonicalWorkspace,
       deviceId: "clawchat-pi-device-1",
-      baseUrl: "https://app.clawling.com",
+      restUrl: "https://app.clawling.com",
       websocketUrl: "wss://app.clawling.com/ws",
-      accessToken: "access-1",
+      mediaUrl: "https://media.example.test",
+      accessToken: "opaque access token",
       ownerChatId: "owner-chat-1",
-      refreshToken: "refresh-1",
+      refreshToken: "opaque refresh token",
       agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" },
       output: { toolCallsDefault: "off" }
     });
@@ -51,11 +59,18 @@ describe("HostProfileRepository", () => {
       createDeviceId: () => "clawchat-pi-device-1"
     });
     await profiles.prepareActivation("default", workspace);
-    await profiles.completeActivation("default", {
-      baseUrl: "https://app.clawling.com",
-      accessToken: "access-1",
-      agent: { userId: "user-1", ownerId: "owner-1" }
-    });
+    await profiles.completeActivation(
+      "default",
+      {
+        restUrl: "https://app.clawling.com",
+        accessToken: "access-1",
+        agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" }
+      },
+      {
+        websocketUrl: "wss://app.clawling.com/ws",
+        mediaUrl: "https://app.clawling.com"
+      }
+    );
 
     const profileDirectory = profiles.profileDirectory("default");
     const sessionDirectory = join(agentDir, "sessions", "workspace");
@@ -69,18 +84,26 @@ describe("HostProfileRepository", () => {
     const gatewayPath = join(profileDirectory, "gateway.sqlite");
     const gateway = GatewayStore.open(gatewayPath);
     gateway.getOrCreateChatSession("chat-1", () => ({ sessionId: "session-1", sessionPath }));
-    gateway.enqueueOutbound({ traceId: "out-1", chatId: "chat-1", frame: { event: "message.send" } });
+    gateway.enqueueOutbound({
+      traceId: "out-1",
+      chatId: "chat-1",
+      frame: { event: "message.send", payload: { message_id: "msg-out-1" } }
+    });
     gateway.close();
 
     const rebound = await profiles.prepareActivation("default", workspace);
     await profiles.completeActivation(
       "default",
       {
-        baseUrl: "https://app.clawling.com",
+        restUrl: "https://app.clawling.com",
         accessToken: "access-2",
-        agent: { userId: "user-2", ownerId: "owner-2" }
+        agent: { id: "agent-2", userId: "user-2", ownerId: "owner-2" }
       },
-      { resetIdentityState: true }
+      {
+        websocketUrl: "wss://app.clawling.com/ws",
+        mediaUrl: "https://app.clawling.com",
+        resetIdentityState: true
+      }
     );
 
     expect(rebound.deviceId).toBe("clawchat-pi-device-1");
@@ -99,31 +122,135 @@ describe("HostProfileRepository", () => {
     });
   });
 
-  it("allows only one running process to own a Host Profile", async () => {
+  it("allows only one Host Profile operation at a time", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-profile-"));
     const profiles = new HostProfileRepository({ agentDir });
 
-    const first = await profiles.acquireLock("default");
-    await expect(profiles.acquireLock("default")).rejects.toThrow("already running");
+    const first = await profiles.acquireOperationLease("default");
+
+    await expect(profiles.acquireOperationLease("default")).rejects.toThrow("active operation");
 
     await first.release();
-    const next = await profiles.acquireLock("default");
+    const next = await profiles.acquireOperationLease("default");
     await next.release();
   });
 
-  it("reclaims a lock left by a process that is no longer alive", async () => {
+  it("transactionally migrates an eligible legacy profile with the production Media origin", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-profile-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const profiles = new HostProfileRepository({ agentDir });
+    await mkdir(profiles.profileDirectory("default"), { recursive: true });
+    await writeFile(
+      profiles.profilePath("default"),
+      JSON.stringify({
+        schemaVersion: 1,
+        name: "default",
+        workspace: await realpath(workspace),
+        deviceId: "device-1",
+        baseUrl: "https://app.clawling.com",
+        websocketUrl: "wss://app.clawling.com/ws",
+        accessToken: "opaque-not-jwt",
+        refreshToken: "opaque-refresh",
+        agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" },
+        output: { toolCallsDefault: "off" }
+      })
+    );
+
+    await expect(profiles.load("default")).resolves.toMatchObject({
+      schemaVersion: 2,
+      restUrl: "https://app.clawling.com",
+      websocketUrl: "wss://app.clawling.com/ws",
+      mediaUrl: "https://app.clawling.com",
+      accessToken: "opaque-not-jwt",
+      refreshToken: "opaque-refresh",
+      agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" }
+    });
+    expect(JSON.parse(await readFile(profiles.profilePath("default"), "utf8"))).toMatchObject({
+      schemaVersion: 2,
+      mediaUrl: "https://app.clawling.com"
+    });
+  });
+
+  it("requires explicit Media configuration to migrate custom legacy endpoints", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-profile-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const withoutMedia = new HostProfileRepository({ agentDir });
+    await mkdir(withoutMedia.profileDirectory("default"), { recursive: true });
+    await writeFile(
+      withoutMedia.profilePath("default"),
+      JSON.stringify({
+        schemaVersion: 1,
+        name: "default",
+        workspace: await realpath(workspace),
+        deviceId: "device-1",
+        baseUrl: "https://api.example.test",
+        websocketUrl: "wss://gateway.example.test/ws",
+        accessToken: "access",
+        agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" },
+        output: { toolCallsDefault: "off" }
+      })
+    );
+
+    await expect(withoutMedia.load("default")).rejects.toThrow(
+      "set CLAWCHAT_MEDIA_URL and retry, or reactivate"
+    );
+    expect(JSON.parse(await readFile(withoutMedia.profilePath("default"), "utf8"))).toMatchObject({
+      schemaVersion: 1
+    });
+
+    const configured = new HostProfileRepository({
+      agentDir,
+      legacyMediaUrl: "https://media.example.test/"
+    });
+    await expect(configured.load("default")).resolves.toMatchObject({
+      schemaVersion: 2,
+      restUrl: "https://api.example.test",
+      websocketUrl: "wss://gateway.example.test/ws",
+      mediaUrl: "https://media.example.test"
+    });
+  });
+
+  it("gives field-specific reactivation guidance for legacy profiles without agent identity", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-profile-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const profiles = new HostProfileRepository({ agentDir });
+    await mkdir(profiles.profileDirectory("default"), { recursive: true });
+    await writeFile(
+      profiles.profilePath("default"),
+      JSON.stringify({
+        schemaVersion: 1,
+        name: "default",
+        workspace: await realpath(workspace),
+        deviceId: "device-1",
+        baseUrl: "https://app.clawling.com",
+        websocketUrl: "wss://app.clawling.com/ws",
+        accessToken: "access",
+        agent: { userId: "user-1", ownerId: "owner-1" },
+        output: { toolCallsDefault: "off" }
+      })
+    );
+
+    await expect(profiles.load("default")).rejects.toThrow(
+      "missing agent.id; reactivate the profile"
+    );
+  });
+
+  it("reclaims a stale lease without letting its old token release the new owner", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-profile-"));
     const crashedProcess = new HostProfileRepository({ agentDir, processId: 999_991 });
-    const staleLock = await crashedProcess.acquireLock("default");
+    const staleLease = await crashedProcess.acquireOperationLease("default");
     const restartedProcess = new HostProfileRepository({
       agentDir,
       processId: 999_992,
       isProcessAlive: (pid) => pid === 999_992
     });
 
-    const reclaimed = await restartedProcess.acquireLock("default");
-    await staleLock.release();
-    await expect(restartedProcess.acquireLock("default")).rejects.toThrow("already running");
+    const reclaimed = await restartedProcess.acquireOperationLease("default");
+    await staleLease.release();
+    await expect(restartedProcess.acquireOperationLease("default")).rejects.toThrow("active operation");
     await reclaimed.release();
   });
 });

@@ -67,27 +67,36 @@ interface ClawchatOutboundBase {
   };
 }
 
-export interface ClawchatReplyMessage extends ClawchatOutboundBase {
-  event: "message.reply";
-  payload: {
-    message_mode: ClawchatMessageMode;
-    message: {
-      body: {
-        fragments: ClawchatFragment[];
-      };
-      context: {
-        mentions: [];
-        reply: {
-          reply_to_msg_id: string;
-          reply_preview: {
-            id: string;
-            nick_name?: string;
-            fragments: ClawchatFragment[];
-          };
-        };
-      };
+interface ClawchatOutboundMessagePayload<Reply> {
+  message_mode: ClawchatMessageMode;
+  message: {
+    body: {
+      fragments: ClawchatFragment[];
+    };
+    context: {
+      mentions: [];
+      reply: Reply;
     };
   };
+}
+
+interface ClawchatReplyContext {
+  reply_to_msg_id: string;
+  reply_preview: {
+    id: string;
+    nick_name?: string;
+    fragments: ClawchatFragment[];
+  };
+}
+
+export interface ClawchatSendMessage extends ClawchatOutboundBase {
+  event: "message.send";
+  payload: ClawchatOutboundMessagePayload<null>;
+}
+
+export interface ClawchatReplyMessage extends ClawchatOutboundBase {
+  event: "message.reply";
+  payload: ClawchatOutboundMessagePayload<ClawchatReplyContext>;
 }
 
 export interface ClawchatTypingUpdate extends ClawchatOutboundBase {
@@ -97,7 +106,7 @@ export interface ClawchatTypingUpdate extends ClawchatOutboundBase {
   };
 }
 
-export type ClawchatOutboundMessage = ClawchatReplyMessage | ClawchatTypingUpdate;
+export type ClawchatOutboundMessage = ClawchatSendMessage | ClawchatReplyMessage | ClawchatTypingUpdate;
 type WithoutEnvelope<T> = T extends ClawchatOutboundMessage
   ? Omit<T, "version" | "trace_id" | "emitted_at">
   : never;

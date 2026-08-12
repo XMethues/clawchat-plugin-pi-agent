@@ -42,7 +42,8 @@ const METADATA_FIELDS: Record<ClawchatMemoryTargetType, Record<string, true>> = 
     agent_owner_avatar_url: true,
     agent_owner_bio: true,
     agent_owner_locale: true,
-    agent_behavior: true
+    agent_behavior: true,
+    conversation_ids: true
   },
   user: {
     updated_at: true,
@@ -58,6 +59,9 @@ const METADATA_FIELDS: Record<ClawchatMemoryTargetType, Record<string, true>> = 
     group_type: true,
     group_title: true,
     group_description: true,
+    group_avatar_url: true,
+    group_member_add_policy: true,
+    group_announcements: true,
     group_owner_id: true,
     group_owner_nickname: true,
     group_owner_profile_type: true,
@@ -168,16 +172,44 @@ export class ClawchatMemoryStore {
     metadata: Record<string, unknown>
   ): Promise<void> {
     const current = await this.read(target);
-    const allowed = METADATA_FIELDS[target.targetType];
-    const filtered: Record<string, string> = {};
-    for (const [key, value] of Object.entries(metadata)) {
-      if (!allowed[key] || value === undefined || value === null) continue;
-      filtered[key] = normalizeMetadataValue(value);
-    }
+    const filtered = filterMetadata(target, metadata);
     if (!filtered.updated_at) filtered.updated_at = String(Date.now());
-    if (target.targetType === "user" && !filtered.id) filtered.id = target.targetId;
-    if (target.targetType === "group" && !filtered.group_id) filtered.group_id = target.targetId;
     await this.atomicWrite(current.path, renderContent(filtered, current.body));
+  }
+
+  async writeMetadataIfChanged(
+    target: ClawchatMemoryTarget,
+    metadata: Record<string, unknown>
+  ): Promise<boolean> {
+    const current = await this.read(target);
+    const filtered = filterMetadata(target, metadata);
+    if (!filtered.updated_at && current.metadata.updated_at) {
+      filtered.updated_at = current.metadata.updated_at;
+    }
+    if (metadataEquals(current.metadata, filtered)) return false;
+    if (!filtered.updated_at) filtered.updated_at = String(Date.now());
+    await this.atomicWrite(current.path, renderContent(filtered, current.body));
+    return true;
+  }
+
+  async writeRecoverySnapshotIfChanged(snapshot: unknown): Promise<boolean> {
+    const path = join(this.root, ".authoritative-recovery.json");
+    const rootStat = await optionalLstat(this.root);
+    if (rootStat && (rootStat.isSymbolicLink() || !rootStat.isDirectory())) {
+      throw new Error("ClawChat memory root must be a real directory");
+    }
+    const targetStat = await optionalLstat(path);
+    if (targetStat && (targetStat.isSymbolicLink() || !targetStat.isFile())) {
+      throw new Error("ClawChat recovery snapshot must be a regular file");
+    }
+    const content = `${serializeClawchatSnapshot(snapshot)}\n`;
+    try {
+      if ((await readFile(path, "utf8")) === content) return false;
+    } catch (error: unknown) {
+      if (!isFileSystemError(error, "ENOENT")) throw error;
+    }
+    await this.atomicWrite(path, content);
+    return true;
   }
 
   async delete(target: ClawchatMemoryTarget): Promise<void> {
@@ -315,6 +347,48 @@ function normalizeLines(value: string): string {
 
 function normalizeMetadataValue(value: unknown): string {
   return String(value).replace(/[\r\n]+/g, " ").trim();
+}
+
+function filterMetadata(
+  target: ClawchatMemoryTarget,
+  metadata: Record<string, unknown>
+): Record<string, string> {
+  const allowed = METADATA_FIELDS[target.targetType];
+  const filtered: Record<string, string> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (!allowed[key] || value === undefined || value === null) continue;
+    filtered[key] = normalizeMetadataValue(value);
+  }
+  if (target.targetType === "user" && !filtered.id) filtered.id = target.targetId;
+  if (target.targetType === "group" && !filtered.group_id) filtered.group_id = target.targetId;
+  return filtered;
+}
+
+function metadataEquals(
+  left: Record<string, string>,
+  right: Record<string, string>
+): boolean {
+  const leftKeys = Object.keys(left);
+  const rightKeys = Object.keys(right);
+  return (
+    leftKeys.length === rightKeys.length &&
+    leftKeys.every((key) => left[key] === right[key])
+  );
+}
+
+export function serializeClawchatSnapshot(value: unknown): string {
+  return JSON.stringify(sortSnapshotValue(value) ?? null) ?? "null";
+}
+
+function sortSnapshotValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortSnapshotValue);
+  if (!value || typeof value !== "object") return value;
+  const record = value as Record<string, unknown>;
+  return Object.fromEntries(
+    Object.keys(record)
+      .sort()
+      .map((key) => [key, sortSnapshotValue(record[key])])
+  );
 }
 
 function escapePromptValue(value: string): string {

@@ -8,7 +8,10 @@ import {
   type ClawchatGatewayEvent
 } from "./gateway.js";
 import { GatewayStore } from "./gateway-store.js";
-import { HostProfileRepository, type HostProfileLock } from "./host-profile.js";
+import {
+  HostProfileRepository,
+  type HostProfileOperationLease
+} from "./host-profile.js";
 import { ClawchatInboundRouter } from "./inbound-router.js";
 import { ClawchatOutputProjector } from "./output-projector.js";
 import { PiChatSessionFactory } from "./pi-session-factory.js";
@@ -24,6 +27,8 @@ export interface HeadlessPiHostOptions {
   onAwarenessSignal?: (event: ClawchatGatewayEvent) => Promise<void>;
   onHistoryTransit?: (event: ClawchatGatewayEvent) => Promise<void>;
   onDeliveryReceipt?: (event: ClawchatGatewayEvent) => Promise<void> | void;
+  recoveryRetryDelay?: (attempt: number) => number;
+  gatewayReconnectDelay?: (attempt: number) => number;
 }
 
 export class HeadlessPiHost {
@@ -34,37 +39,53 @@ export class HeadlessPiHost {
   private readonly onAwarenessSignal: ((event: ClawchatGatewayEvent) => Promise<void>) | undefined;
   private readonly onHistoryTransit: ((event: ClawchatGatewayEvent) => Promise<void>) | undefined;
   private readonly onDeliveryReceipt: ((event: ClawchatGatewayEvent) => Promise<void> | void) | undefined;
-  private lock: HostProfileLock | undefined;
+  private readonly recoveryRetryDelay: ((attempt: number) => number) | undefined;
+  private readonly gatewayReconnectDelay: ((attempt: number) => number) | undefined;
+  private operationLease: HostProfileOperationLease | undefined;
   private store: GatewayStore | undefined;
   private gateway: ClawChatGateway | undefined;
   private registry: ChatSessionRegistry | undefined;
   private readonly awarenessRetryTimers = new Set<ReturnType<typeof setTimeout>>();
   private readonly historyRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+  private recoveryRetryTimer: NodeJS.Timeout | undefined;
+  private recoveryInFlight: Promise<void> | undefined;
+  private recoveryRequested = false;
+  private recoveryAttempt = 0;
   private stopping = false;
   private started = false;
 
   constructor(options: HeadlessPiHostOptions = {}) {
     this.profileName = options.profileName ?? "default";
     this.agentDir = options.agentDir ?? getAgentDir();
-    this.profiles = options.profiles ?? new HostProfileRepository({ agentDir: this.agentDir });
+    this.profiles = options.profiles ??
+      new HostProfileRepository({
+        agentDir: this.agentDir,
+        ...(process.env.CLAWCHAT_MEDIA_URL
+          ? { legacyMediaUrl: process.env.CLAWCHAT_MEDIA_URL }
+          : {})
+      });
     this.onStatus = options.onStatus;
     this.onAwarenessSignal = options.onAwarenessSignal;
     this.onHistoryTransit = options.onHistoryTransit;
     this.onDeliveryReceipt = options.onDeliveryReceipt;
+    this.recoveryRetryDelay = options.recoveryRetryDelay;
+    this.gatewayReconnectDelay = options.gatewayReconnectDelay;
   }
 
   async start(): Promise<void> {
     this.stopping = false;
     if (this.started) throw new Error("Headless Pi Host is already started");
-    const profile = await this.profiles.load(this.profileName);
-    if (!profile) throw new Error(`Host Profile '${this.profileName}' is not activated`);
-    const toolRuntime = await createClawchatToolRuntime({
-      profiles: this.profiles,
-      profileName: this.profileName
-    });
-    this.lock = await this.profiles.acquireLock(this.profileName);
+    this.recoveryRequested = false;
+    this.recoveryAttempt = 0;
+    this.operationLease = await this.profiles.acquireOperationLease(this.profileName);
 
     try {
+      const profile = await this.profiles.load(this.profileName);
+      if (!profile) throw new Error(`Host Profile '${this.profileName}' is not activated`);
+      const toolRuntime = await createClawchatToolRuntime({
+        profiles: this.profiles,
+        profileName: this.profileName
+      });
       const store = GatewayStore.open(join(this.profiles.profileDirectory(this.profileName), "gateway.sqlite"));
       this.store = store;
       let gateway: ClawChatGateway | undefined;
@@ -121,7 +142,11 @@ export class HeadlessPiHost {
             store,
             ownerChatId: awarenessOwnerChatId,
             agentId: awarenessAgentId,
+            agentUserId: profile.agent.userId,
+            agentOwnerId: profile.agent.ownerId,
+            memory: toolRuntime.environment.memory,
             wake: (chatId) => {
+              if (this.stopping) return;
               void registry.wake(chatId).catch((error: unknown) => {
                 this.onStatus?.(
                   `awareness turn for ${chatId} failed: ${error instanceof Error ? error.message : String(error)}`
@@ -172,6 +197,9 @@ export class HeadlessPiHost {
                     }`
                   );
                 });
+              },
+              onConnectionReady: () => {
+                this.requestRecovery(awareness);
               }
             }
           : {}),
@@ -191,6 +219,9 @@ export class HeadlessPiHost {
           this.onStatus?.(`message ${String(event.payload?.message_id ?? "unknown")} delivered`);
           await this.onDeliveryReceipt?.(event);
         },
+        ...(this.gatewayReconnectDelay
+          ? { reconnectDelay: this.gatewayReconnectDelay }
+          : {}),
         ...(this.onStatus ? { onStatus: this.onStatus } : {})
       });
       this.gateway = gateway;
@@ -238,6 +269,53 @@ export class HeadlessPiHost {
     }
   }
 
+  private requestRecovery(awareness: ClawchatAwarenessCoordinator): void {
+    if (this.stopping) return;
+    this.recoveryRequested = true;
+    if (this.recoveryRetryTimer) {
+      clearTimeout(this.recoveryRetryTimer);
+      this.recoveryRetryTimer = undefined;
+    }
+    this.startRecovery(awareness);
+  }
+
+  private startRecovery(awareness: ClawchatAwarenessCoordinator): void {
+    if (this.stopping || this.recoveryInFlight || !this.recoveryRequested) return;
+    this.recoveryRequested = false;
+    const recovery = (async () => {
+      try {
+        await awareness.recover();
+        this.recoveryAttempt = 0;
+      } catch (error: unknown) {
+        if (this.stopping) return;
+        this.recoveryRequested = true;
+        const configuredDelay = this.recoveryRetryDelay?.(this.recoveryAttempt);
+        const delay = Math.max(
+          0,
+          Math.min(
+            30_000,
+            configuredDelay ?? 1_000 * 2 ** Math.min(this.recoveryAttempt, 5)
+          )
+        );
+        this.recoveryAttempt += 1;
+        this.onStatus?.(
+          `metadata recovery failed; retrying in ${delay}ms: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+        this.recoveryRetryTimer = setTimeout(() => {
+          this.recoveryRetryTimer = undefined;
+          this.startRecovery(awareness);
+        }, delay);
+      }
+    })();
+    this.recoveryInFlight = recovery;
+    void recovery.finally(() => {
+      if (this.recoveryInFlight === recovery) this.recoveryInFlight = undefined;
+      if (!this.recoveryRetryTimer) this.startRecovery(awareness);
+    });
+  }
+
   private async processHistory(
     historySync: ClawchatPlaintextHistorySync,
     event: ClawchatGatewayEvent,
@@ -268,6 +346,12 @@ export class HeadlessPiHost {
     this.awarenessRetryTimers.clear();
     for (const timer of this.historyRetryTimers) clearTimeout(timer);
     this.historyRetryTimers.clear();
+    clearTimeout(this.recoveryRetryTimer);
+    this.recoveryRetryTimer = undefined;
+    this.recoveryRequested = false;
+    const recovery = this.recoveryInFlight;
+    await recovery;
+    if (this.recoveryInFlight === recovery) this.recoveryInFlight = undefined;
 
     const registry = this.registry;
     this.registry = undefined;
@@ -281,8 +365,8 @@ export class HeadlessPiHost {
     this.store = undefined;
     store?.close();
 
-    const lock = this.lock;
-    this.lock = undefined;
-    await lock?.release();
+    const operationLease = this.operationLease;
+    await operationLease?.release();
+    if (this.operationLease === operationLease) this.operationLease = undefined;
   }
 }

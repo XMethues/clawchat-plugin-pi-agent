@@ -54,12 +54,20 @@ export interface HistoryTransferState {
   conversationsTransferred: number;
   reason?: string;
 }
+export interface HistorySourceRejection {
+  sourceId: string;
+  status: "rejected";
+  reason: string;
+}
 
 export interface OutboundRecord {
   traceId: string;
+  messageId: string;
   chatId: string;
   frame: unknown;
+  serializedFrame: string;
   attempts: number;
+  lastAttemptAt: number | null;
 }
 
 export interface GatewayStoreStatus {
@@ -72,6 +80,22 @@ export interface GatewayStoreStatus {
   pendingOutbound: number;
   failedOutbound: number;
   quarantinedFrames: number;
+  inboxHistoryUnavailableBefore: InboxHistoryBoundary | null;
+}
+
+export interface InboxHistoryBoundary {
+  oldestSeq: number;
+  observedAt: number;
+}
+
+export interface QuarantinedFrameRecord {
+  ackEpoch: string | null;
+  dseq: number | null;
+  ackable: boolean;
+  event: string;
+  reason: string;
+  frame: unknown;
+  createdAt: number;
 }
 
 export class GatewayStore {
@@ -120,10 +144,12 @@ export class GatewayStore {
 
       CREATE TABLE IF NOT EXISTS outbound_messages (
         trace_id TEXT PRIMARY KEY,
+        message_id TEXT NOT NULL,
         chat_id TEXT NOT NULL,
         frame_json TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('pending', 'acknowledged', 'failed')),
         attempts INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at INTEGER,
         created_at INTEGER NOT NULL,
         acknowledged_at INTEGER,
         failed_at INTEGER,
@@ -150,11 +176,24 @@ export class GatewayStore {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ack_epoch TEXT,
         dseq INTEGER,
+        ackable INTEGER NOT NULL DEFAULT 0 CHECK (ackable IN (0, 1)),
         event TEXT NOT NULL,
         reason TEXT NOT NULL,
         frame_json TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         UNIQUE (ack_epoch, dseq)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS reliable_ingress_state (
+        ack_epoch TEXT PRIMARY KEY,
+        high_water INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS inbox_history_boundary (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        oldest_seq INTEGER NOT NULL CHECK (oldest_seq > 0),
+        observed_at INTEGER NOT NULL
       ) STRICT;
 
       CREATE TABLE IF NOT EXISTS reliable_frames (
@@ -178,6 +217,11 @@ export class GatewayStore {
       CREATE TABLE IF NOT EXISTS history_sources (
         source_id TEXT PRIMARY KEY,
         processed_at INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS history_source_rejections (
+        source_id TEXT PRIMARY KEY REFERENCES history_sources(source_id),
+        reason TEXT NOT NULL
       ) STRICT;
 
       CREATE TABLE IF NOT EXISTS history_transfers (
@@ -270,29 +314,50 @@ export class GatewayStore {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const existing = this.database
-        .prepare("SELECT chat_id, turn_id FROM inbound_frames WHERE dedupe_key = ?")
-        .get(input.dedupeKey) as { chat_id: string; turn_id: string | null } | undefined;
+        .prepare(
+          `SELECT message_id, chat_id, frame_json, turn_id
+           FROM inbound_frames
+           WHERE dedupe_key = ?`
+        )
+        .get(input.dedupeKey) as
+        | {
+            message_id: string;
+            chat_id: string;
+            frame_json: string;
+            turn_id: string | null;
+          }
+        | undefined;
       if (existing) {
         if (existing.chat_id !== input.chatId) {
           throw new Error(`Inbound dedupe identity '${input.dedupeKey}' changed chats`);
         }
         const now = Date.now();
-        const frameJson = JSON.stringify(input.frame);
-        this.database
-          .prepare(
-            `UPDATE inbound_frames
-             SET message_id = ?, frame_json = ?, admitted_at = ?
-             WHERE dedupe_key = ?`
-          )
-          .run(input.messageId, frameJson, now, input.dedupeKey);
-        if (existing.turn_id) {
+        const suppressRewrite =
+          existing.message_id === input.messageId &&
+          classifyReply(JSON.parse(existing.frame_json) as unknown) === "author-final" &&
+          classifyReply(input.frame) === "provisional";
+        if (suppressRewrite) {
+          this.database
+            .prepare("UPDATE inbound_frames SET admitted_at = ? WHERE dedupe_key = ?")
+            .run(now, input.dedupeKey);
+        } else {
+          const frameJson = JSON.stringify(input.frame);
           this.database
             .prepare(
-              `UPDATE chat_turns
-               SET message_id = ?, frame_json = ?
-               WHERE id = ? AND status = 'queued'`
+              `UPDATE inbound_frames
+               SET message_id = ?, frame_json = ?, admitted_at = ?
+               WHERE dedupe_key = ?`
             )
-            .run(input.messageId, frameJson, existing.turn_id);
+            .run(input.messageId, frameJson, now, input.dedupeKey);
+          if (existing.turn_id) {
+            this.database
+              .prepare(
+                `UPDATE chat_turns
+                 SET message_id = ?, frame_json = ?
+                 WHERE id = ? AND status = 'queued'`
+              )
+              .run(input.messageId, frameJson, existing.turn_id);
+          }
         }
         this.database.exec("COMMIT");
         return { status: "duplicate", turnId: existing.turn_id };
@@ -507,20 +572,32 @@ export class GatewayStore {
     }
   }
 
-  enqueueOutbound(input: { traceId: string; chatId: string; frame: unknown }): void {
+  enqueueOutbound(input: { traceId: string; chatId: string; frame: unknown }): OutboundRecord {
+    const messageId = getOutboundMessageId(input.frame);
+    if (!messageId) throw new Error("Outbound materialized message is missing payload.message_id");
+    const serializedFrame = JSON.stringify(input.frame);
     this.database
       .prepare(
         `INSERT INTO outbound_messages
-          (trace_id, chat_id, frame_json, status, attempts, created_at)
-         VALUES (?, ?, ?, 'pending', 0, ?)`
+          (trace_id, message_id, chat_id, frame_json, status, attempts, last_attempt_at, created_at)
+         VALUES (?, ?, ?, ?, 'pending', 0, NULL, ?)`
       )
-      .run(input.traceId, input.chatId, JSON.stringify(input.frame), Date.now());
+      .run(input.traceId, messageId, input.chatId, serializedFrame, Date.now());
+    return {
+      traceId: input.traceId,
+      messageId,
+      chatId: input.chatId,
+      frame: input.frame,
+      serializedFrame,
+      attempts: 0,
+      lastAttemptAt: null
+    };
   }
 
   listPendingOutbound(): OutboundRecord[] {
     const rows = this.database
       .prepare(
-        `SELECT trace_id, chat_id, frame_json, attempts
+        `SELECT trace_id, message_id, chat_id, frame_json, attempts, last_attempt_at
          FROM outbound_messages
          WHERE status = 'pending'
          ORDER BY created_at, rowid`
@@ -529,14 +606,14 @@ export class GatewayStore {
     return rows.map(mapOutbound);
   }
 
-  recordOutboundAttempt(traceId: string): void {
+  recordOutboundAttempt(traceId: string, attemptedAt = Date.now()): void {
     const result = this.database
       .prepare(
         `UPDATE outbound_messages
-         SET attempts = attempts + 1
+         SET attempts = attempts + 1, last_attempt_at = ?
          WHERE trace_id = ? AND status = 'pending'`
       )
-      .run(traceId);
+      .run(attemptedAt, traceId);
     if (result.changes !== 1) {
       throw new Error(`Outbound trace '${traceId}' is not pending`);
     }
@@ -627,35 +704,127 @@ export class GatewayStore {
       })),
       pendingOutbound: pending.count,
       failedOutbound: failed.count,
-      quarantinedFrames: quarantined.count
+      quarantinedFrames: quarantined.count,
+      inboxHistoryUnavailableBefore: this.getInboxHistoryBoundary()
     };
   }
 
-  quarantineInboundFrame(input: {
-    ackEpoch?: string;
-    dseq?: number;
+  recordInboxHistoryBoundary(oldestSeq: number, observedAt = Date.now()): boolean {
+    if (!Number.isSafeInteger(oldestSeq) || oldestSeq < 1) {
+      throw new Error("Inbox history boundary requires a positive integer oldest_seq");
+    }
+    if (!Number.isSafeInteger(observedAt) || observedAt < 0) {
+      throw new Error("Inbox history boundary requires a valid observation time");
+    }
+    const result = this.database
+      .prepare(
+        `INSERT INTO inbox_history_boundary (singleton, oldest_seq, observed_at)
+         VALUES (1, ?, ?)
+         ON CONFLICT(singleton) DO UPDATE SET
+           oldest_seq = excluded.oldest_seq,
+           observed_at = excluded.observed_at
+         WHERE excluded.oldest_seq > inbox_history_boundary.oldest_seq`
+      )
+      .run(oldestSeq, observedAt);
+    return result.changes === 1;
+  }
+
+  getInboxHistoryBoundary(): InboxHistoryBoundary | null {
+    const row = this.database
+      .prepare("SELECT oldest_seq, observed_at FROM inbox_history_boundary WHERE singleton = 1")
+      .get() as { oldest_seq: number; observed_at: number } | undefined;
+    return row ? { oldestSeq: row.oldest_seq, observedAt: row.observed_at } : null;
+  }
+
+  getReliableHighWater(ackEpoch: string): number {
+    const row = this.database
+      .prepare("SELECT high_water FROM reliable_ingress_state WHERE ack_epoch = ?")
+      .get(ackEpoch) as { high_water: number } | undefined;
+    return row?.high_water ?? 0;
+  }
+
+  advanceReliableHighWater(ackEpoch: string, dseq: number): void {
+    if (ackEpoch.length === 0 || !Number.isSafeInteger(dseq) || dseq < 1) {
+      throw new Error("Reliable high-water requires a non-empty epoch and positive integer dseq");
+    }
+    this.database
+      .prepare(
+        `INSERT INTO reliable_ingress_state (ack_epoch, high_water, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(ack_epoch) DO UPDATE SET
+           high_water = MAX(high_water, excluded.high_water),
+           updated_at = excluded.updated_at`
+      )
+      .run(ackEpoch, dseq, Date.now());
+  }
+
+  quarantineReliableInbound(input: {
+    ackEpoch: string;
+    dseq: number;
     event: string;
     reason: string;
     frame: unknown;
   }): void {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database
+        .prepare(
+          `INSERT INTO quarantined_frames
+            (ack_epoch, dseq, ackable, event, reason, frame_json, created_at)
+           VALUES (?, ?, 1, ?, ?, ?, ?)
+           ON CONFLICT(ack_epoch, dseq) DO NOTHING`
+        )
+        .run(
+          input.ackEpoch,
+          input.dseq,
+          input.event,
+          input.reason,
+          JSON.stringify(input.frame),
+          Date.now()
+        );
+      this.advanceReliableHighWater(input.ackEpoch, input.dseq);
+      this.database.exec("COMMIT");
+    } catch (error: unknown) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  quarantineRawInbound(input: { event: string; reason: string; frame: unknown }): void {
     this.database
       .prepare(
         `INSERT INTO quarantined_frames
-          (ack_epoch, dseq, event, reason, frame_json, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(ack_epoch, dseq) DO UPDATE SET
-           event = excluded.event,
-           reason = excluded.reason,
-           frame_json = excluded.frame_json`
+          (ack_epoch, dseq, ackable, event, reason, frame_json, created_at)
+         VALUES (NULL, NULL, 0, ?, ?, ?, ?)`
       )
-      .run(
-        input.ackEpoch ?? null,
-        input.dseq ?? null,
-        input.event,
-        input.reason,
-        JSON.stringify(input.frame),
-        Date.now()
-      );
+      .run(input.event, input.reason, JSON.stringify(input.frame), Date.now());
+  }
+
+  listQuarantinedFrames(): QuarantinedFrameRecord[] {
+    const rows = this.database
+      .prepare(
+        `SELECT ack_epoch, dseq, ackable, event, reason, frame_json, created_at
+         FROM quarantined_frames
+         ORDER BY id`
+      )
+      .all() as unknown as Array<{
+      ack_epoch: string | null;
+      dseq: number | null;
+      ackable: number;
+      event: string;
+      reason: string;
+      frame_json: string;
+      created_at: number;
+    }>;
+    return rows.map((row) => ({
+      ackEpoch: row.ack_epoch,
+      dseq: row.dseq,
+      ackable: row.ackable === 1,
+      event: row.event,
+      reason: row.reason,
+      frame: JSON.parse(row.frame_json) as unknown,
+      createdAt: row.created_at
+    }));
   }
 
   failOutbound(traceId: string, code: string, reason?: string): void {
@@ -766,6 +935,41 @@ export class GatewayStore {
       .run(sourceId, Date.now());
   }
 
+  rejectHistorySource(sourceId: string, reason: string): void {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      this.database
+        .prepare(
+          `INSERT OR IGNORE INTO history_sources (source_id, processed_at)
+           VALUES (?, ?)`
+        )
+        .run(sourceId, Date.now());
+      this.database
+        .prepare(
+          `INSERT OR IGNORE INTO history_source_rejections (source_id, reason)
+           VALUES (?, ?)`
+        )
+        .run(sourceId, reason);
+      this.database.exec("COMMIT");
+    } catch (error: unknown) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getHistorySourceRejection(sourceId: string): HistorySourceRejection | null {
+    const row = this.database
+      .prepare(
+        `SELECT source_id, reason
+         FROM history_source_rejections
+         WHERE source_id = ?`
+      )
+      .get(sourceId) as { source_id: string; reason: string } | undefined;
+    return row
+      ? { sourceId: row.source_id, status: "rejected", reason: row.reason }
+      : null;
+  }
+
   updateHistoryTransfer(state: HistoryTransferState): void {
     this.database
       .prepare(
@@ -867,9 +1071,11 @@ interface ChatTurnRow {
 
 interface OutboundRow {
   trace_id: string;
+  message_id: string;
   chat_id: string;
   frame_json: string;
   attempts: number;
+  last_attempt_at: number | null;
 }
 
 interface HistoryTransferRow {
@@ -905,20 +1111,155 @@ function mapChatTurn(row: ChatTurnRow): ChatTurn {
   };
 }
 
+function classifyReply(frame: unknown): "provisional" | "author-final" | null {
+  if (!frame || typeof frame !== "object" || !("event" in frame) || frame.event !== "message.reply") {
+    return null;
+  }
+  const payload = "payload" in frame ? frame.payload : undefined;
+  return payload &&
+    typeof payload === "object" &&
+    "stream_merged" in payload &&
+    payload.stream_merged === true
+    ? "provisional"
+    : "author-final";
+}
+
 function mapOutbound(row: OutboundRow): OutboundRecord {
   return {
     traceId: row.trace_id,
+    messageId: row.message_id,
     chatId: row.chat_id,
     frame: JSON.parse(row.frame_json) as unknown,
-    attempts: row.attempts
+    serializedFrame: row.frame_json,
+    attempts: row.attempts,
+    lastAttemptAt: row.last_attempt_at
   };
 }
 
+const CROCKFORD_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+export function createProtocolMessageId(timestamp = Date.now()): string {
+  if (!Number.isInteger(timestamp) || timestamp < 0 || timestamp > 0xffffffffffff) {
+    throw new Error("ULID timestamp must be an integer between 0 and 2^48 - 1");
+  }
+  const random = crypto.getRandomValues(new Uint8Array(10));
+  let randomValue = 0n;
+  for (const byte of random) randomValue = (randomValue << 8n) | BigInt(byte);
+  return `msg-${encodeCrockford(BigInt(timestamp), 10)}${encodeCrockford(randomValue, 16)}`;
+}
+
+function encodeCrockford(value: bigint, length: number): string {
+  let encoded = "";
+  for (let index = 0; index < length; index += 1) {
+    encoded = CROCKFORD_BASE32[Number(value & 31n)]! + encoded;
+    value >>= 5n;
+  }
+  return encoded;
+}
+
+function getOutboundMessageId(frame: unknown): string | undefined {
+  if (!frame || typeof frame !== "object" || !("payload" in frame)) return undefined;
+  const payload = frame.payload;
+  if (!payload || typeof payload !== "object" || !("message_id" in payload)) return undefined;
+  return typeof payload.message_id === "string" && payload.message_id.length > 0
+    ? payload.message_id
+    : undefined;
+}
+
+function persistOutboundMessageId(frame: unknown, messageId: string): void {
+  if (!frame || typeof frame !== "object") {
+    throw new Error("Legacy outbound frame is not an object");
+  }
+  let payload: object;
+  if ("payload" in frame && frame.payload && typeof frame.payload === "object") {
+    payload = frame.payload;
+  } else {
+    payload = {};
+    Reflect.set(frame, "payload", payload);
+  }
+  Reflect.set(payload, "message_id", messageId);
+}
+
 function migrateGatewaySchema(database: DatabaseSyncType): void {
-  const columns = database.prepare("PRAGMA table_info(outbound_messages)").all() as Array<{
-    name: string;
-  }>;
-  if (columns.some((column) => column.name === "message_id")) {
-    database.exec("ALTER TABLE outbound_messages RENAME COLUMN message_id TO trace_id");
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    let columns = database.prepare("PRAGMA table_info(outbound_messages)").all() as Array<{
+      name: string;
+    }>;
+    const hasTraceId = columns.some((column) => column.name === "trace_id");
+    const hasMessageId = columns.some((column) => column.name === "message_id");
+    if (!hasTraceId && hasMessageId) {
+      database.exec("ALTER TABLE outbound_messages RENAME COLUMN message_id TO trace_id");
+      columns = database.prepare("PRAGMA table_info(outbound_messages)").all() as Array<{
+        name: string;
+      }>;
+    }
+    if (!columns.some((column) => column.name === "message_id")) {
+      database.exec("ALTER TABLE outbound_messages ADD COLUMN message_id TEXT");
+    }
+    if (!columns.some((column) => column.name === "last_attempt_at")) {
+      database.exec("ALTER TABLE outbound_messages ADD COLUMN last_attempt_at INTEGER");
+    }
+
+    const rows = database
+      .prepare("SELECT trace_id, message_id, frame_json FROM outbound_messages ORDER BY rowid")
+      .all() as Array<{ trace_id: string; message_id: string | null; frame_json: string }>;
+    const update = database.prepare(
+      "UPDATE outbound_messages SET message_id = ?, frame_json = ? WHERE trace_id = ?"
+    );
+    const generatedIds = new Set<string>();
+    for (const row of rows) {
+      const frame = JSON.parse(row.frame_json) as unknown;
+      let messageId = row.message_id ?? getOutboundMessageId(frame);
+      if (!messageId) {
+        do {
+          messageId = createProtocolMessageId();
+        } while (generatedIds.has(messageId));
+        generatedIds.add(messageId);
+      }
+      if (row.message_id !== messageId || getOutboundMessageId(frame) !== messageId) {
+        persistOutboundMessageId(frame, messageId);
+        update.run(messageId, JSON.stringify(frame), row.trace_id);
+      }
+    }
+    database.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS outbound_messages_message_id ON outbound_messages (message_id)"
+    );
+    database.exec("COMMIT");
+  } catch (error: unknown) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const quarantineColumns = database
+      .prepare("PRAGMA table_info(quarantined_frames)")
+      .all() as Array<{ name: string }>;
+    if (!quarantineColumns.some((column) => column.name === "ackable")) {
+      database.exec(
+        "ALTER TABLE quarantined_frames ADD COLUMN ackable INTEGER NOT NULL DEFAULT 0 CHECK (ackable IN (0, 1))"
+      );
+    }
+    database.exec(
+      `UPDATE quarantined_frames
+       SET ackable = 1
+       WHERE ack_epoch IS NOT NULL AND dseq IS NOT NULL`
+    );
+    database
+      .prepare(
+        `INSERT INTO reliable_ingress_state (ack_epoch, high_water, updated_at)
+         SELECT ack_epoch, MAX(dseq), ?
+         FROM quarantined_frames
+         WHERE ack_epoch IS NOT NULL AND dseq IS NOT NULL
+         GROUP BY ack_epoch
+         ON CONFLICT(ack_epoch) DO UPDATE SET
+           high_water = MAX(high_water, excluded.high_water),
+           updated_at = excluded.updated_at`
+      )
+      .run(Date.now());
+    database.exec("COMMIT");
+  } catch (error: unknown) {
+    database.exec("ROLLBACK");
+    throw error;
   }
 }

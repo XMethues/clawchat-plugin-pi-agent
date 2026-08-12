@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { activateClawchat, type ActivateClawchatOptions, type ActivationResult } from "./activation.js";
-import { DEFAULT_BASE_URL, DEFAULT_WEBSOCKET_URL } from "./config.js";
+import { DEFAULT_MEDIA_URL, DEFAULT_REST_URL, DEFAULT_WEBSOCKET_URL } from "./config.js";
 import { GatewayStore } from "./gateway-store.js";
 import { HeadlessPiHost } from "./headless-host.js";
 import { HostProfileRepository } from "./host-profile.js";
@@ -14,10 +14,15 @@ export interface CliDependencies {
 }
 
 export async function runCli(args: string[], dependencies: CliDependencies = {}): Promise<number> {
-  const profiles = dependencies.profiles ?? new HostProfileRepository();
+  const environment = dependencies.environment ?? process.env;
+  const profiles = dependencies.profiles ??
+    new HostProfileRepository({
+      ...(environment.CLAWCHAT_MEDIA_URL
+        ? { legacyMediaUrl: environment.CLAWCHAT_MEDIA_URL }
+        : {})
+    });
   const activate = dependencies.activate ?? activateClawchat;
   const write = dependencies.write ?? ((line: string) => process.stdout.write(`${line}\n`));
-  const environment = dependencies.environment ?? process.env;
   const runHost =
     dependencies.runHost ??
     ((profileName: string, status: (line: string) => void) =>
@@ -26,20 +31,26 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
 
   if (command === "activate") {
     const parsed = parseCommand(rest, { positional: "invite-code", requireCwd: true });
-    const prepared = await profiles.prepareActivation(parsed.profile, parsed.cwd!);
-    const activation = await activate({
-      code: parsed.positional!,
-      baseUrl: environment.CLAWCHAT_BASE_URL ?? DEFAULT_BASE_URL,
-      deviceId: prepared.deviceId
-    });
-    const profile = await profiles.completeActivation(parsed.profile, activation, {
-      websocketUrl: environment.CLAWCHAT_WS_URL ?? DEFAULT_WEBSOCKET_URL,
-      resetIdentityState: true
-    });
-    write(`Activated Host Profile '${profile.name}'.`);
-    write(`Workspace: ${profile.workspace}`);
-    write(`Device: ${profile.deviceId}`);
-    return 0;
+    const operationLease = await profiles.acquireOperationLease(parsed.profile);
+    try {
+      const prepared = await profiles.prepareActivation(parsed.profile, parsed.cwd!);
+      const activation = await activate({
+        code: parsed.positional!,
+        restUrl: environment.CLAWCHAT_BASE_URL ?? DEFAULT_REST_URL,
+        deviceId: prepared.deviceId
+      });
+      const profile = await profiles.completeActivation(parsed.profile, activation, {
+        websocketUrl: environment.CLAWCHAT_WS_URL ?? DEFAULT_WEBSOCKET_URL,
+        mediaUrl: environment.CLAWCHAT_MEDIA_URL ?? DEFAULT_MEDIA_URL,
+        resetIdentityState: true
+      });
+      write(`Activated Host Profile '${profile.name}'.`);
+      write(`Workspace: ${profile.workspace}`);
+      write(`Device: ${profile.deviceId}`);
+      return 0;
+    } finally {
+      await operationLease.release();
+    }
   }
 
   if (command === "status") {
@@ -53,6 +64,12 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
     write("Activation: active");
     write(`Workspace: ${profile.workspace}`);
     write(`Device: ${profile.deviceId}`);
+    write(`REST origin: ${profile.restUrl}`);
+    write(`WebSocket URL: ${profile.websocketUrl}`);
+    write(`Media origin: ${profile.mediaUrl}`);
+    write(`Agent: ${profile.agent.id}`);
+    write(`Agent user: ${profile.agent.userId}`);
+    write(`Owner: ${profile.agent.ownerId}`);
     const lock = await profiles.getLockStatus(profile.name);
     write(lock.running ? `Process: running (pid ${lock.pid})` : "Process: stopped");
     const gatewayPath = join(profiles.profileDirectory(profile.name), "gateway.sqlite");
@@ -69,6 +86,12 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
       write(`Outbound pending: ${status.pendingOutbound}`);
       write(`Outbound failed: ${status.failedOutbound}`);
       write(`Inbound quarantined: ${status.quarantinedFrames}`);
+      const boundary = status.inboxHistoryUnavailableBefore;
+      if (boundary) {
+        write(
+          `Inbox history before sequence ${boundary.oldestSeq} is unavailable (observed ${new Date(boundary.observedAt).toISOString()})`
+        );
+      }
     } finally {
       gateway.close();
     }

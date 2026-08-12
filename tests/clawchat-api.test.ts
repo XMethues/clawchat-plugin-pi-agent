@@ -17,7 +17,8 @@ describe("ClawchatApiClient", () => {
       accessToken = "access-2";
     });
     const api = new ClawchatApiClient({
-      baseUrl: "https://app.clawling.com",
+      restUrl: "https://app.clawling.com",
+      mediaUrl: "https://app.clawling.com",
       accessToken: () => accessToken,
       refreshAccessToken,
       fetchFn: fetchFn as typeof fetch
@@ -33,7 +34,8 @@ describe("ClawchatApiClient", () => {
       throw new Error("network unavailable");
     });
     const api = new ClawchatApiClient({
-      baseUrl: "https://app.clawling.com",
+      restUrl: "https://app.clawling.com",
+      mediaUrl: "https://app.clawling.com",
       accessToken: () => "access-1",
       fetchFn: fetchFn as typeof fetch
     });
@@ -47,21 +49,22 @@ describe("ClawchatApiClient", () => {
   it("parses rotated tokens only from a successful refresh envelope", async () => {
     const fetchFn = vi.fn(async () => jsonResponse({
       code: 0,
-      data: { access_token: "access-2", refresh_token: "refresh-2" }
+      data: { access_token: " opaque-access ", refresh_token: " opaque-refresh " }
     }));
     const api = new ClawchatApiClient({
-      baseUrl: "https://app.clawling.com",
+      restUrl: "https://app.clawling.com",
+      mediaUrl: "https://media.example.test",
       accessToken: () => "access-1",
       fetchFn: fetchFn as typeof fetch
     });
 
-    await expect(api.refresh("refresh-1", "device-1")).resolves.toEqual({
-      accessToken: "access-2",
-      refreshToken: "refresh-2"
+    await expect(api.refresh(" refresh input ", "device-1")).resolves.toEqual({
+      accessToken: " opaque-access ",
+      refreshToken: " opaque-refresh "
     });
     expect(fetchFn).toHaveBeenCalledWith("https://app.clawling.com/v1/auth/refresh", expect.objectContaining({
       method: "POST",
-      body: JSON.stringify({ refresh_token: "refresh-1" })
+      body: JSON.stringify({ refresh_token: " refresh input " })
     }));
   });
   it("routes media uploads to the gateway origin without moving REST uploads", async () => {
@@ -71,8 +74,8 @@ describe("ClawchatApiClient", () => {
       return jsonResponse({ code: 0, data: { url: "https://cdn.example/file", mime: "text/plain", size: 1 } });
     });
     const api = new ClawchatApiClient({
-      baseUrl: "https://api.example.test",
-      mediaBaseUrl: "https://gateway.example.test",
+      restUrl: "https://api.example.test",
+      mediaUrl: "https://gateway.example.test",
       accessToken: () => "access-1",
       fetchFn: fetchFn as typeof fetch
     });
@@ -101,8 +104,8 @@ describe("ClawchatApiClient", () => {
       accessToken = "access-2";
     });
     const api = new ClawchatApiClient({
-      baseUrl: "https://api.example.test",
-      mediaBaseUrl: "https://gateway.example.test",
+      restUrl: "https://api.example.test",
+      mediaUrl: "https://gateway.example.test",
       accessToken: () => accessToken,
       refreshAccessToken,
       fetchFn: fetchFn as typeof fetch
@@ -128,7 +131,8 @@ describe("ClawchatApiClient", () => {
       accessToken = "access-2";
     });
     const api = new ClawchatApiClient({
-      baseUrl: "https://app.clawling.com",
+      restUrl: "https://app.clawling.com",
+      mediaUrl: "https://app.clawling.com",
       accessToken: () => accessToken,
       refreshAccessToken,
       fetchFn: fetchFn as typeof fetch

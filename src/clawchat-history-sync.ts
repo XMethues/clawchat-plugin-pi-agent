@@ -51,8 +51,23 @@ export class ClawchatPlaintextHistorySync {
     const sourceId = requireNonEmpty(event.trace_id, "trace_id");
     if (this.store.isHistorySourceProcessed(sourceId)) return;
     const payload = requireRecord(event.payload, "history.transit payload");
+    const payloadSource =
+      typeof payload.source_device_id === "string" && payload.source_device_id.trim() !== ""
+        ? payload.source_device_id
+        : undefined;
+    const envelopeSource =
+      typeof event.origin_device_id === "string" && event.origin_device_id.trim() !== ""
+        ? event.origin_device_id
+        : undefined;
+    const sourceDeviceId = payloadSource ?? envelopeSource;
+    if (!sourceDeviceId) {
+      this.store.rejectHistorySource(
+        sourceId,
+        "History Sync source device is missing; expected payload.source_device_id or origin_device_id"
+      );
+      return;
+    }
     const kind = requireNonEmpty(payload.kind, "history.transit payload.kind");
-    const sourceDeviceId = requireNonEmpty(event.origin_device_id, "origin_device_id");
 
     if (kind === "history_sync_request") {
       if (sourceDeviceId !== this.deviceId) await this.exportTo(sourceDeviceId);
@@ -193,7 +208,7 @@ export class ClawchatPlaintextHistorySync {
       target_device_id: targetDeviceId,
       sender: { id: this.userId },
       origin_device_id: this.deviceId,
-      payload
+      payload: { ...payload, source_device_id: this.deviceId }
     });
   }
 }

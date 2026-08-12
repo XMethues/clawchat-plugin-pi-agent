@@ -1,5 +1,5 @@
 import WebSocket from "ws";
-import type { GatewayStore } from "./gateway-store.js";
+import { createProtocolMessageId, type GatewayStore } from "./gateway-store.js";
 import type { InboundDecision } from "./inbound-router.js";
 import type { ClawchatFragment, ClawchatInboundMessage, ClawchatPeer } from "./types.js";
 import { isUnknownRecord } from "./type-guards.js";
@@ -22,6 +22,18 @@ export function isClawchatGatewayEvent(value: unknown): value is ClawchatGateway
   return value.payload === undefined || isUnknownRecord(value.payload);
 }
 
+export interface GatewayTimer {
+  schedule(callback: () => void, delayMs: number): unknown;
+  cancel(handle: unknown): void;
+}
+
+export const DEFAULT_OUTBOUND_ACK_DEADLINE_MS = 30_000;
+
+const DEFAULT_GATEWAY_TIMER: GatewayTimer = {
+  schedule: (callback, delayMs) => setTimeout(callback, delayMs),
+  cancel: (handle) => clearTimeout(handle as NodeJS.Timeout)
+};
+
 export interface ClawChatGatewayOptions {
   websocketUrl: string;
   accessToken: string;
@@ -36,6 +48,7 @@ export interface ClawChatGatewayOptions {
   onAwarenessSignal?: (event: ClawchatGatewayEvent) => Promise<void>;
   onHistoryTransit?: (event: ClawchatGatewayEvent) => Promise<void>;
   onDeliveryReceipt?: (event: ClawchatGatewayEvent) => Promise<void>;
+  onConnectionReady?: () => Promise<void> | void;
   queueTurns?: boolean;
   onStatus?: (status: string) => void;
   reconnect?: boolean;
@@ -44,6 +57,8 @@ export interface ClawChatGatewayOptions {
   ackHeartbeatMs?: number;
   replayIdleTimeoutMs?: number;
   handshakeTimeoutMs?: number;
+  outboundAckDeadlineMs?: number;
+  timer?: GatewayTimer;
   now?: () => number;
   idFactory?: () => string;
 }
@@ -64,11 +79,16 @@ interface InboundStreamState {
   messageMode: unknown;
   nextSequence: number;
 }
+interface OutboundAckDeadline {
+  handle: unknown;
+}
 
 export class ClawChatGateway {
   private readonly options: ClawChatGatewayOptions;
   private readonly now: () => number;
   private readonly idFactory: () => string;
+  private readonly timer: GatewayTimer;
+  private readonly outboundAckDeadlineMs: number;
   private socket: WebSocket | undefined;
   private stopping = false;
   private accessToken: string;
@@ -78,13 +98,17 @@ export class ClawChatGateway {
   private lastReadDseq = 0;
   private ackHighWater = 0;
   private ackTimer: ReturnType<typeof setTimeout> | undefined;
+  private ackImmediate: NodeJS.Immediate | undefined;
+  private ackGeneration = 0;
   private ackHeartbeat: ReturnType<typeof setInterval> | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private replayIdleTimer: ReturnType<typeof setTimeout> | undefined;
   private replayIdleGeneration = 0;
   private reconnectAttempt = 0;
   private replayComplete = false;
-  private handshakeRefreshAttempted = false;
+  private refreshAttemptedSinceHelloOk = false;
+  private readonly outboundAckDeadlines = new Map<string, OutboundAckDeadline>();
+  private outboxReconciliationPending = false;
   private readonly inboundStreams = new Map<string, InboundStreamState>();
 
   constructor(options: ClawChatGatewayOptions) {
@@ -92,11 +116,13 @@ export class ClawChatGateway {
     this.accessToken = options.accessToken;
     this.now = options.now ?? Date.now;
     this.idFactory = options.idFactory ?? (() => crypto.randomUUID());
+    this.timer = options.timer ?? DEFAULT_GATEWAY_TIMER;
+    this.outboundAckDeadlineMs =
+      options.outboundAckDeadlineMs ?? DEFAULT_OUTBOUND_ACK_DEADLINE_MS;
   }
 
   async start(): Promise<void> {
     this.stopping = false;
-    this.handshakeRefreshAttempted = false;
     let attempt = 0;
     while (!this.stopping) {
       try {
@@ -118,8 +144,9 @@ export class ClawChatGateway {
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
     this.clearReplayIdleFallback();
-    clearTimeout(this.ackTimer);
-    this.ackTimer = undefined;
+    this.clearOutboundAckDeadlines();
+    this.outboxReconciliationPending = false;
+    this.clearAcknowledgementScheduling();
     clearInterval(this.ackHeartbeat);
     this.ackHeartbeat = undefined;
     this.flushAcknowledgement();
@@ -138,13 +165,17 @@ export class ClawChatGateway {
     const envelope = cloneOutboundEnvelope(message);
     if (envelope.event === "message.reply" || envelope.event === "message.send") {
       const traceId = requireString(envelope.trace_id, "trace_id");
-      if (envelope.payload) delete envelope.payload.message_id;
-      this.options.store.enqueueOutbound({
+      const payload = envelope.payload ?? {};
+      envelope.payload = payload;
+      if (typeof payload.message_id !== "string" || payload.message_id.length === 0) {
+        payload.message_id = createProtocolMessageId(this.now());
+      }
+      const pending = this.options.store.enqueueOutbound({
         traceId,
         chatId: requireString(envelope.chat_id, "chat_id"),
         frame: envelope
       });
-      this.sendApplicationFrame(envelope, traceId);
+      this.sendApplicationFrame(pending.serializedFrame, traceId);
       return;
     }
     if (envelope.event === "typing.update") {
@@ -168,6 +199,7 @@ export class ClawChatGateway {
   }
 
   private openConnection(): Promise<void> {
+    this.resetAcknowledgementState();
     const { promise, resolve, reject } = Promise.withResolvers<void>();
     const socket = new WebSocket(this.options.websocketUrl);
     this.socket = socket;
@@ -189,7 +221,7 @@ export class ClawChatGateway {
       if (ready && !this.replayComplete) this.armReplayIdleFallback();
       this.frameQueue = this.frameQueue
         .then(() =>
-          this.handleFrame(parseEnvelope(raw), {
+          this.handleRawFrame(raw, {
             ready: () => {
               if (ready) return;
               ready = true;
@@ -210,6 +242,11 @@ export class ClawChatGateway {
     });
     socket.on("close", () => {
       clearTimeout(handshakeTimer);
+      this.resetAcknowledgementState();
+      if (ready && this.options.store.listPendingOutbound().length > 0) {
+        this.outboxReconciliationPending = true;
+      }
+      this.clearOutboundAckDeadlines();
       this.clearReplayIdleFallback();
       if (!ready) reject(new ReconnectableHandshakeError("ClawChat WebSocket closed before hello-ok"));
       if (!this.stopping) {
@@ -220,11 +257,81 @@ export class ClawChatGateway {
     return promise;
   }
 
-  private async handleFrame(
-    envelope: ProtocolEnvelope | null,
+  private async handleRawFrame(
+    raw: WebSocket.RawData,
     handshake: { ready: () => void; reject: (error: Error) => void }
   ): Promise<void> {
-    if (!envelope) return;
+    const rawText = raw.toString();
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(rawText) as unknown;
+    } catch (error: unknown) {
+      const reason = `invalid JSON: ${error instanceof Error ? error.message : String(error)}`;
+      this.options.store.quarantineRawInbound({
+        event: "<invalid-json>",
+        reason,
+        frame: rawText
+      });
+      this.options.onStatus?.("quarantined non-ackable invalid JSON frame");
+      throw new ReconnectableProtocolError(reason);
+    }
+    if (!isUnknownRecord(decoded)) {
+      const reason = "invalid outer envelope: expected a JSON object";
+      this.options.store.quarantineRawInbound({
+        event: "<invalid-envelope>",
+        reason,
+        frame: decoded
+      });
+      this.options.onStatus?.("quarantined non-ackable invalid outer envelope");
+      throw new ReconnectableProtocolError(reason);
+    }
+
+    if (this.ackMode === "dseq" && Object.hasOwn(decoded, "dseq")) {
+      const dseq = decoded.dseq;
+      if (typeof dseq !== "number" || !Number.isSafeInteger(dseq) || dseq < 1) {
+        const reason = `untrusted dseq ${String(dseq)}`;
+        this.options.store.quarantineRawInbound({
+          event: eventLabel(decoded.event),
+          reason,
+          frame: decoded
+        });
+        this.options.onStatus?.("quarantined non-ackable frame with untrusted dseq");
+        throw new ReconnectableProtocolError(reason);
+      }
+      await this.handleDseqFrame(decoded, dseq);
+      return;
+    }
+
+    let envelope: ProtocolEnvelope;
+    try {
+      envelope = mapProtocolEnvelope(decoded);
+    } catch (error: unknown) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.options.store.quarantineRawInbound({
+        event: eventLabel(decoded.event),
+        reason,
+        frame: decoded
+      });
+      this.options.onStatus?.("quarantined non-ackable invalid outer envelope");
+      throw new ReconnectableProtocolError(reason);
+    }
+    if (this.ackMode === "dseq" && isReliableDeliveryEvent(envelope.event)) {
+      const reason = `reliable ${envelope.event} frame has no trustworthy dseq`;
+      this.options.store.quarantineRawInbound({
+        event: envelope.event,
+        reason,
+        frame: decoded
+      });
+      this.options.onStatus?.("quarantined non-ackable reliable frame without dseq");
+      throw new ReconnectableProtocolError(reason);
+    }
+    await this.handleFrame(envelope, handshake);
+  }
+
+  private async handleFrame(
+    envelope: ProtocolEnvelope,
+    handshake: { ready: () => void; reject: (error: Error) => void }
+  ): Promise<void> {
     if (envelope.event === "connect.challenge") {
       this.sendRaw({
         version: "2",
@@ -251,21 +358,39 @@ export class ClawChatGateway {
       return;
     }
     if (envelope.event === "hello-ok") {
-      if (envelope.payload?.ack_mode === "dseq" && typeof envelope.payload.ack_epoch === "string") {
+      this.resetAcknowledgementState();
+      this.refreshAttemptedSinceHelloOk = false;
+      if (
+        envelope.payload?.ack_mode === "dseq" &&
+        typeof envelope.payload.ack_epoch === "string" &&
+        envelope.payload.ack_epoch.length > 0
+      ) {
         this.ackMode = "dseq";
         this.ackEpoch = envelope.payload.ack_epoch;
-        this.lastReadDseq = 0;
-        this.ackHighWater = 0;
+        const durableHighWater = this.options.store.getReliableHighWater(this.ackEpoch);
+        this.lastReadDseq = durableHighWater;
+        this.ackHighWater = durableHighWater;
       } else {
         this.ackMode = "cursor";
         this.ackEpoch = undefined;
       }
-      clearInterval(this.ackHeartbeat);
-      this.ackHeartbeat = setInterval(
-        () => this.flushAcknowledgement(),
-        this.options.ackHeartbeatMs ?? 30_000
-      );
+      const ackGeneration = this.ackGeneration;
+      this.ackHeartbeat = setInterval(() => {
+        if (ackGeneration === this.ackGeneration) this.flushAcknowledgement();
+      }, this.options.ackHeartbeatMs ?? 30_000);
       handshake.ready();
+      setImmediate(() => {
+        if (this.stopping) return;
+        void Promise.resolve()
+          .then(() => this.options.onConnectionReady?.())
+          .catch((error: unknown) => {
+            this.options.onStatus?.(
+              `connection-ready observer failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            );
+          });
+      });
       this.armReplayIdleFallback();
       return;
     }
@@ -277,9 +402,9 @@ export class ClawChatGateway {
       } else if (
         reason === "authentication failed" &&
         this.options.refreshAccessToken &&
-        !this.handshakeRefreshAttempted
+        !this.refreshAttemptedSinceHelloOk
       ) {
-        this.handshakeRefreshAttempted = true;
+        this.refreshAttemptedSinceHelloOk = true;
         try {
           this.accessToken = await this.options.refreshAccessToken();
           handshake.reject(new ReconnectableHandshakeError("ClawChat token refreshed"));
@@ -290,8 +415,9 @@ export class ClawChatGateway {
             )
           );
         }
+      } else if (reason === "nonce mismatch") {
+        handshake.reject(new ReconnectableHandshakeError(`ClawChat hello failed: ${reason}`));
       } else if (
-        reason === "nonce mismatch" ||
         reason === "authentication failed" ||
         reason === "invalid connect event" ||
         reason === "invalid connect payload"
@@ -316,6 +442,7 @@ export class ClawChatGateway {
     }
     if (envelope.event === "message.ack") {
       if (typeof envelope.trace_id === "string") {
+        this.cancelOutboundAckDeadline(envelope.trace_id);
         this.options.store.acknowledgeOutbound(envelope.trace_id);
       }
       return;
@@ -323,6 +450,7 @@ export class ClawChatGateway {
     if (envelope.event === "message.error") {
       const code = envelope.payload?.code;
       if (typeof envelope.trace_id === "string" && typeof code === "string") {
+        this.cancelOutboundAckDeadline(envelope.trace_id);
         const reason =
           typeof envelope.payload?.reason === "string" ? envelope.payload.reason : undefined;
         this.options.store.failOutbound(envelope.trace_id, code, reason);
@@ -347,10 +475,25 @@ export class ClawChatGateway {
       await this.handleInboundStream(envelope);
       return;
     }
-    if (this.ackMode === "dseq" && typeof envelope.dseq === "number") {
-      await this.handleDseqFrame(envelope);
+
+    if (envelope.event === "history.truncated") {
+      try {
+        await this.persistReliableInbound(envelope);
+      } catch (error: unknown) {
+        this.options.onStatus?.(
+          `ignored invalid history.truncated boundary: ${
+            error instanceof Error ? error.message : String(error)
+          }`
+        );
+        return;
+      }
+      if (this.ackMode === "cursor" && typeof envelope.seq === "number") {
+        this.ackHighWater = Math.max(this.ackHighWater, envelope.seq);
+        this.scheduleAcknowledgement();
+      }
       return;
     }
+
     if (this.ackMode === "cursor" && typeof envelope.seq === "number") {
       await this.persistReliableInbound(envelope);
       this.ackHighWater = Math.max(this.ackHighWater, envelope.seq);
@@ -371,30 +514,37 @@ export class ClawChatGateway {
     }
   }
 
-  private async handleDseqFrame(envelope: ProtocolEnvelope): Promise<void> {
-    const dseq = envelope.dseq as number;
-    if (!Number.isSafeInteger(dseq) || dseq !== this.lastReadDseq + 1) {
+  private async handleDseqFrame(decoded: Record<string, unknown>, dseq: number): Promise<void> {
+    if (dseq <= this.lastReadDseq) {
+      this.ackHighWater = Math.max(this.ackHighWater, this.lastReadDseq);
+      this.scheduleAcknowledgement();
+      return;
+    }
+    if (dseq !== this.lastReadDseq + 1) {
       throw new Error(`expected dseq ${this.lastReadDseq + 1}, received ${dseq}`);
     }
     this.lastReadDseq = dseq;
+    let envelope: ProtocolEnvelope | undefined;
     try {
-      await this.persistReliableInbound(envelope);
+      envelope = mapProtocolEnvelope(decoded);
+      await this.persistReliableInbound(envelope, dseq);
+      this.options.store.advanceReliableHighWater(this.ackEpoch!, dseq);
     } catch (error: unknown) {
-      this.options.store.quarantineInboundFrame({
-        ...(this.ackEpoch ? { ackEpoch: this.ackEpoch } : {}),
+      this.options.store.quarantineReliableInbound({
+        ackEpoch: this.ackEpoch!,
         dseq,
-        event: envelope.event,
+        event: eventLabel(decoded.event),
         reason: error instanceof Error ? error.message : String(error),
-        frame: envelope
+        frame: decoded
       });
       this.options.onStatus?.(`quarantined dseq ${dseq}`);
     }
     this.ackHighWater = dseq;
-    this.scheduleAcknowledgement(envelope.event === "replay.done");
-    if (envelope.event === "replay.done") this.completeReplay();
+    this.scheduleAcknowledgement(envelope?.event === "replay.done");
+    if (envelope?.event === "replay.done") this.completeReplay();
   }
 
-  private async persistReliableInbound(envelope: ProtocolEnvelope): Promise<void> {
+  private async persistReliableInbound(envelope: ProtocolEnvelope, dseq?: number): Promise<void> {
     if (envelope.event === "message.send" || envelope.event === "message.reply") {
       await this.persistInboundMessage(envelope);
       return;
@@ -419,9 +569,44 @@ export class ClawChatGateway {
       if (inserted) await this.options.onAwarenessSignal?.(envelope);
       return;
     }
+    if (envelope.event === "history.truncated") {
+      const oldestSeq = envelope.payload?.oldest_seq;
+      if (typeof oldestSeq !== "number" || !Number.isSafeInteger(oldestSeq) || oldestSeq < 1) {
+        throw new Error("oldest_seq must be a positive integer");
+      }
+      this.options.store.recordInboxHistoryBoundary(oldestSeq, this.now());
+      const boundary = this.options.store.getInboxHistoryBoundary()!;
+      this.options.onStatus?.(
+        `inbox history before sequence ${boundary.oldestSeq} is unavailable`
+      );
+      return;
+    }
+
     if (envelope.event === "sync.mark" || envelope.event === "replay.done") return;
-    const traceId = requireString(envelope.trace_id, "trace_id");
-    this.options.store.persistReliableFrame(`event:${traceId}`, envelope.event, envelope);
+    if (
+      envelope.event === "message.created" ||
+      envelope.event === "message.add" ||
+      envelope.event === "message.done" ||
+      envelope.event === "message.failed"
+    ) {
+      await this.handleInboundStream(envelope);
+      return;
+    }
+    const dedupeKey =
+      dseq === undefined
+        ? `event:${requireString(envelope.trace_id, "trace_id")}`
+        : `dseq:${this.ackEpoch}:${dseq}`;
+    if (envelope.event === "chat.metadata.invalidated") {
+      const inserted = this.options.store.persistReliableFrame(dedupeKey, envelope.event, envelope);
+      if (inserted) await this.options.onAwarenessSignal?.(envelope);
+      return;
+    }
+    if (envelope.event === "message.delivered") {
+      const inserted = this.options.store.persistReliableFrame(dedupeKey, envelope.event, envelope);
+      if (inserted) await this.options.onDeliveryReceipt?.(envelope);
+      return;
+    }
+    this.options.store.persistReliableFrame(dedupeKey, envelope.event, envelope);
   }
 
   private async persistInboundMessage(
@@ -571,7 +756,7 @@ export class ClawChatGateway {
     this.clearReplayIdleFallback();
     this.reconnectAttempt = 0;
     this.replayComplete = true;
-    this.flushOutbox();
+    this.reconcileOutboxAfterReplay();
   }
 
   private scheduleAcknowledgement(immediate = false): void {
@@ -579,11 +764,39 @@ export class ClawChatGateway {
       this.flushAcknowledgement();
       return;
     }
+    if (!this.ackImmediate) {
+      const generation = this.ackGeneration;
+      this.ackImmediate = setImmediate(() => {
+        if (generation !== this.ackGeneration) return;
+        this.ackImmediate = undefined;
+        this.flushAcknowledgement();
+      });
+    }
     if (this.ackTimer) return;
+    const generation = this.ackGeneration;
     this.ackTimer = setTimeout(() => {
+      if (generation !== this.ackGeneration) return;
       this.ackTimer = undefined;
       this.flushAcknowledgement();
     }, this.options.ackDebounceMs ?? 200);
+  }
+
+  private clearAcknowledgementScheduling(): void {
+    this.ackGeneration += 1;
+    clearImmediate(this.ackImmediate);
+    this.ackImmediate = undefined;
+    clearTimeout(this.ackTimer);
+    this.ackTimer = undefined;
+  }
+
+  private resetAcknowledgementState(): void {
+    this.clearAcknowledgementScheduling();
+    clearInterval(this.ackHeartbeat);
+    this.ackHeartbeat = undefined;
+    this.ackMode = "legacy";
+    this.ackEpoch = undefined;
+    this.lastReadDseq = 0;
+    this.ackHighWater = 0;
   }
 
   private flushAcknowledgement(): void {
@@ -607,17 +820,77 @@ export class ClawChatGateway {
     }
   }
 
-  private flushOutbox(): void {
-    for (const pending of this.options.store.listPendingOutbound()) {
-      this.sendApplicationFrame(cloneOutboundEnvelope(pending.frame), pending.traceId);
+  private reconcileOutboxAfterReplay(): void {
+    const pending = this.options.store.listPendingOutbound();
+    if (this.outboxReconciliationPending) {
+      this.outboxReconciliationPending = false;
+      for (const record of pending) {
+        this.sendApplicationFrame(record.serializedFrame, record.traceId);
+      }
+      return;
+    }
+    for (const record of pending) {
+      if (record.lastAttemptAt === null) {
+        this.sendApplicationFrame(record.serializedFrame, record.traceId);
+      } else {
+        this.armOutboundAckDeadline(record.traceId, record.lastAttemptAt);
+      }
     }
   }
 
-  private sendApplicationFrame(frame: ProtocolEnvelope, traceId: string): void {
-    if (!this.replayComplete || this.socket?.readyState !== WebSocket.OPEN) return;
-    if (frame.payload) delete frame.payload.message_id;
-    this.options.store.recordOutboundAttempt(traceId);
-    this.socket.send(JSON.stringify(frame));
+  private sendApplicationFrame(serializedFrame: string, traceId: string): void {
+    const socket = this.socket;
+    if (!this.replayComplete || socket?.readyState !== WebSocket.OPEN) return;
+    socket.send(serializedFrame);
+    const attemptedAt = this.now();
+    this.options.store.recordOutboundAttempt(traceId, attemptedAt);
+    this.armOutboundAckDeadline(traceId, attemptedAt);
+  }
+
+  private armOutboundAckDeadline(traceId: string, attemptedAt: number): void {
+    this.cancelOutboundAckDeadline(traceId);
+    const deadline: OutboundAckDeadline = { handle: undefined };
+    this.outboundAckDeadlines.set(traceId, deadline);
+    const delayMs = Math.max(0, attemptedAt + this.outboundAckDeadlineMs - this.now());
+    deadline.handle = this.timer.schedule(() => {
+      if (this.outboundAckDeadlines.get(traceId) !== deadline) return;
+      this.outboundAckDeadlines.delete(traceId);
+      this.handleOutboundAckDeadline();
+    }, delayMs);
+  }
+
+  private cancelOutboundAckDeadline(traceId: string): void {
+    const deadline = this.outboundAckDeadlines.get(traceId);
+    if (!deadline) return;
+    this.outboundAckDeadlines.delete(traceId);
+    if (deadline.handle !== undefined) this.timer.cancel(deadline.handle);
+  }
+
+  private clearOutboundAckDeadlines(): void {
+    for (const deadline of this.outboundAckDeadlines.values()) {
+      if (deadline.handle !== undefined) this.timer.cancel(deadline.handle);
+    }
+    this.outboundAckDeadlines.clear();
+  }
+
+  private handleOutboundAckDeadline(): void {
+    if (this.stopping || this.outboxReconciliationPending) return;
+    const now = this.now();
+    const expired = this.options.store
+      .listPendingOutbound()
+      .filter(
+        (record) =>
+          record.lastAttemptAt !== null &&
+          record.lastAttemptAt + this.outboundAckDeadlineMs <= now
+      );
+    if (expired.length === 0) return;
+    this.outboxReconciliationPending = true;
+    this.clearOutboundAckDeadlines();
+    this.options.onStatus?.(
+      `${expired.length} outbound message${expired.length === 1 ? "" : "s"} exceeded the ACK deadline; closing the socket to reconcile after replay`
+    );
+    const socket = this.socket;
+    if (socket && socket.readyState !== WebSocket.CLOSED) socket.close();
   }
 
   private scheduleReconnect(): void {
@@ -633,7 +906,7 @@ export class ClawChatGateway {
         this.options.onStatus?.(
           `reconnect failed: ${error instanceof Error ? error.message : String(error)}`
         );
-        this.scheduleReconnect();
+        if (error instanceof ReconnectableHandshakeError) this.scheduleReconnect();
       });
     }, delay);
   }
@@ -644,14 +917,31 @@ export class ClawChatGateway {
     }
   }
 }
-
-function parseEnvelope(raw: WebSocket.RawData): ProtocolEnvelope | null {
-  try {
-    const parsed = JSON.parse(raw.toString()) as Partial<ProtocolEnvelope>;
-    return parsed.version === "2" && typeof parsed.event === "string" ? (parsed as ProtocolEnvelope) : null;
-  } catch {
-    return null;
+function mapProtocolEnvelope(value: Record<string, unknown>): ProtocolEnvelope {
+  if (value.version !== "2") throw new Error("invalid outer envelope version");
+  if (typeof value.event !== "string" || value.event.length === 0) {
+    throw new Error("invalid outer envelope event");
   }
+  if (value.payload !== undefined && !isUnknownRecord(value.payload)) {
+    throw new Error("invalid outer envelope payload");
+  }
+  return value as ProtocolEnvelope;
+}
+
+function eventLabel(value: unknown): string {
+  return typeof value === "string" && value.length > 0 ? value : "<invalid-event>";
+}
+
+function isReliableDeliveryEvent(event: string): boolean {
+  return (
+    event === "message.send" ||
+    event === "message.reply" ||
+    event === "history.transit" ||
+    event === "notify.signal" ||
+    event === "sync.mark" ||
+    event === "replay.done" ||
+    event === "history.truncated"
+  );
 }
 
 function isInboundMessage(
@@ -746,6 +1036,8 @@ function defaultReconnectDelay(attempt: number): number {
 class ReconnectableHandshakeError extends Error {}
 
 class TransientHandshakeError extends ReconnectableHandshakeError {}
+
+class ReconnectableProtocolError extends ReconnectableHandshakeError {}
 
 function delay(milliseconds: number): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();

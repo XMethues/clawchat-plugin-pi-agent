@@ -6,6 +6,7 @@ import {
   ClawchatAwarenessCoordinator,
   renderAwarenessPrompt
 } from "../src/clawchat-awareness.js";
+import { ClawchatMemoryStore, clawchatMemoryTarget } from "../src/clawchat-memory.js";
 import { GatewayStore } from "../src/gateway-store.js";
 
 describe("ClawchatAwarenessCoordinator", () => {
@@ -182,6 +183,129 @@ describe("ClawchatAwarenessCoordinator", () => {
     });
     store.close();
   });
+  it("converges reconnect snapshots idempotently into one owner Awareness Turn", async () => {
+    const store = await openStore();
+    store.getOrCreateChatSession("group-1", () => ({
+      sessionId: "session-group-1",
+      sessionPath: "/sessions/group-1.jsonl"
+    }));
+    const memoryRoot = await mkdtemp(join(tmpdir(), "clawchat-pi-recovery-memory-"));
+    const memory = new ClawchatMemoryStore(memoryRoot);
+    let behavior = "Answer concisely";
+    let announcement = "Release today";
+    const get = vi.fn(async (path: string) => {
+      if (path === "/v1/conversations?limit=100") {
+        return { conversations: [{ id: "group-1" }, { id: "direct-1" }] };
+      }
+      if (path === "/v1/conversations/group-1") {
+        return {
+          conversation: {
+            id: "group-1",
+            type: "group",
+            title: "Maintainers",
+            description: "Release coordination",
+            avatar_url: "https://cdn.example/group.png",
+            member_add_policy: "admin",
+            creator_id: "owner-1",
+            updated_at: 7,
+            participants: [{ user_id: "owner-1" }, { user_id: "user-2" }]
+          }
+        };
+      }
+      if (path === "/v1/conversations/group-1/announcements") {
+        return { announcements: [{ id: "announcement-1", text: announcement }] };
+      }
+      if (path === "/v1/conversations/owner-chat-1") {
+        return { conversation: { id: "owner-chat-1", type: "direct", updated_at: 3 } };
+      }
+      if (path === "/v1/agents/agent-1") {
+        return { agent: { id: "agent-1", nickname: "Pi", behavior } };
+      }
+      if (path === "/v1/agents/me/owner") {
+        return { user: { id: "owner-1", nickname: "Owner", locale: "en" } };
+      }
+      throw new Error(`Unexpected recovery path ${path}`);
+    });
+    const wake = vi.fn();
+    const coordinator = new ClawchatAwarenessCoordinator({
+      api: { get },
+      store,
+      ownerChatId: "owner-chat-1",
+      agentId: "agent-1",
+      agentUserId: "agent-user-1",
+      agentOwnerId: "owner-1",
+      memory,
+      wake
+    });
+
+    await expect(coordinator.recover()).resolves.toMatchObject({ changed: true });
+    const initialTurn = store.claimNextTurn("owner-chat-1");
+    expect(initialTurn?.frame).toMatchObject({
+      kind: "clawchat.awareness",
+      coalesceKey: "general",
+      sources: [{ signalType: "metadata.recovered", entityId: "agent-1" }]
+    });
+    if (!initialTurn) throw new Error("expected recovery Awareness Turn");
+    store.completeTurn(initialTurn.id);
+    await expect(coordinator.recover()).resolves.toEqual({ changed: false, admission: null });
+    expect(wake).toHaveBeenCalledTimes(1);
+
+    behavior = "Answer with detailed citations";
+    announcement = "Release tomorrow";
+    await expect(coordinator.recover()).resolves.toMatchObject({ changed: true });
+    await expect(coordinator.recover()).resolves.toEqual({ changed: false, admission: null });
+    const changedTurn = store.claimNextTurn("owner-chat-1");
+    expect(changedTurn?.frame).toMatchObject({
+      sources: [
+        {
+          signalType: "metadata.recovered",
+          authoritativeState: {
+            conversations: [
+              {
+                chatId: "group-1",
+                announcements: {
+                  announcements: [{ id: "announcement-1", text: "Release tomorrow" }]
+                }
+              },
+              {
+                chatId: "owner-chat-1"
+              }
+            ],
+            agent: {
+              agent: { behavior: "Answer with detailed citations" }
+            }
+          }
+        }
+      ]
+    });
+    expect(wake).toHaveBeenCalledTimes(2);
+    await expect(memory.read(clawchatMemoryTarget("owner", "owner"))).resolves.toMatchObject({
+      metadata: {
+        agent_behavior: "Answer with detailed citations",
+        conversation_ids: "direct-1,group-1"
+      }
+    });
+    await expect(memory.read(clawchatMemoryTarget("group", "group-1"))).resolves.toMatchObject({
+      metadata: {
+        group_title: "Maintainers",
+        group_member_add_policy: "admin",
+        group_announcements:
+          '{"announcements":[{"id":"announcement-1","text":"Release tomorrow"}]}'
+      }
+    });
+    expect(get.mock.calls.map(([path]) => path)).toEqual(
+      Array.from({ length: 4 }, () => [
+        "/v1/conversations?limit=100",
+        "/v1/agents/agent-1",
+        "/v1/agents/me/owner",
+        "/v1/conversations/group-1",
+        "/v1/conversations/owner-chat-1",
+        "/v1/conversations/group-1/announcements"
+      ]).flat()
+    );
+    store.close();
+  });
+
 });
 
 async function openStore(): Promise<GatewayStore> {

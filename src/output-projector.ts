@@ -20,13 +20,18 @@ export interface OutputVisibility {
   tools: boolean;
 }
 
-export interface OutputTurn {
-  chatId: string;
-  chatType: ClawchatInboundMessage["chat_type"];
-  inboundMessageId: string;
-  sender: ClawchatInboundMessage["sender"];
-  preview: TextFragment[];
-}
+export type OutputTurn =
+  | {
+      chatId: string;
+      chatType: "direct";
+    }
+  | {
+      chatId: string;
+      chatType: "group";
+      inboundMessageId: string;
+      sender: ClawchatInboundMessage["sender"];
+      preview: TextFragment[];
+    };
 
 export interface OutputProjectorOptions {
   transport: ClawchatTransport;
@@ -53,7 +58,13 @@ export class ClawchatOutputProjector {
   async beginTurn(turn: OutputTurn): Promise<void> {
     if (this.activeTurn) throw new Error("A ClawChat output turn is already active");
     this.activeTurn = turn;
-    await this.sendTyping(turn, true);
+    try {
+      await this.sendTyping(turn, true);
+    } catch (error: unknown) {
+      this.activeTurn = undefined;
+      this.toolArguments.clear();
+      throw error;
+    }
   }
 
   async handle(event: PiOutputEvent, visibility: OutputVisibility): Promise<void> {
@@ -109,6 +120,21 @@ export class ClawchatOutputProjector {
   private async sendMaterialized(turn: OutputTurn, text: string, mode: ClawchatMessageMode): Promise<void> {
     const fragments = mode === "normal" ? await this.materializeFragments(text) : [{ kind: "text" as const, text }];
     if (fragments.length === 0) return;
+    if (turn.chatType === "direct") {
+      await this.send({
+        event: "message.send",
+        chat_id: turn.chatId,
+        to: { id: turn.chatId, type: turn.chatType },
+        payload: {
+          message_mode: mode,
+          message: {
+            body: { fragments },
+            context: { mentions: [], reply: null }
+          }
+        }
+      });
+      return;
+    }
     await this.send({
       event: "message.reply",
       chat_id: turn.chatId,
@@ -182,9 +208,12 @@ export class ClawchatOutputProjector {
 }
 
 export function outputTurnFromInbound(message: ClawchatInboundMessage): OutputTurn {
+  if (message.chat_type === "direct") {
+    return { chatId: message.chat_id, chatType: "direct" };
+  }
   return {
     chatId: message.chat_id,
-    chatType: message.chat_type,
+    chatType: "group",
     inboundMessageId: message.payload.message_id,
     sender: message.sender,
     preview: trimPreview(message.payload.message.body.fragments)

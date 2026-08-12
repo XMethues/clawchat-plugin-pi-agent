@@ -20,8 +20,8 @@ export class ClawchatApiError extends Error {
 }
 
 export interface ClawchatApiClientOptions {
-  baseUrl: string;
-  mediaBaseUrl?: string;
+  restUrl: string;
+  mediaUrl: string;
   accessToken: () => string;
   refreshAccessToken?: () => Promise<void>;
   fetchFn?: typeof fetch;
@@ -39,16 +39,16 @@ interface ApiEnvelope {
 }
 
 export class ClawchatApiClient {
-  private readonly baseUrl: string;
-  private readonly mediaBaseUrl: string;
+  private readonly restUrl: string;
+  private readonly mediaUrl: string;
   private readonly accessToken: () => string;
   private readonly fetchFn: typeof fetch;
   private readonly refreshAccessToken: (() => Promise<void>) | undefined;
   private refreshInFlight: Promise<void> | undefined;
 
   constructor(options: ClawchatApiClientOptions) {
-    this.baseUrl = options.baseUrl.replace(/\/+$/, "");
-    this.mediaBaseUrl = (options.mediaBaseUrl ?? options.baseUrl).replace(/\/+$/, "");
+    this.restUrl = options.restUrl;
+    this.mediaUrl = options.mediaUrl;
     this.accessToken = options.accessToken;
     this.fetchFn = options.fetchFn ?? fetch;
     this.refreshAccessToken = options.refreshAccessToken;
@@ -84,10 +84,10 @@ export class ClawchatApiClient {
     const path = "/v1/auth/refresh";
     let response: Response;
     try {
-      response = await this.fetchFn(`${this.baseUrl}${path}`, {
+      response = await this.fetchFn(`${this.restUrl}${path}`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-device-id": deviceId },
-        body: JSON.stringify({ refresh_token: refreshToken.trim() })
+        body: JSON.stringify({ refresh_token: refreshToken })
       });
     } catch (error: unknown) {
       throw new ClawchatApiError("transport", error instanceof Error ? error.message : String(error), {
@@ -110,8 +110,8 @@ export class ClawchatApiClient {
     if (!isUnknownRecord(envelope.data)) {
       throw new ClawchatApiError("transport", "refresh response missing data", { status: response.status, path });
     }
-    const accessToken = stringValue(envelope.data.access_token);
-    const nextRefreshToken = stringValue(envelope.data.refresh_token);
+    const accessToken = opaqueTokenValue(envelope.data.access_token);
+    const nextRefreshToken = opaqueTokenValue(envelope.data.refresh_token);
     if (!accessToken || !nextRefreshToken) {
       throw new ClawchatApiError("transport", "refresh response missing rotated tokens", {
         status: response.status,
@@ -125,7 +125,7 @@ export class ClawchatApiClient {
     const { response, envelope, code } = await this.authenticatedEnvelope(
       path,
       (accessToken) =>
-        this.fetchFn(`${this.baseUrl}${path}`, {
+        this.fetchFn(`${this.restUrl}${path}`, {
           method,
           headers: {
             authorization: `Bearer ${accessToken}`,
@@ -167,7 +167,7 @@ export class ClawchatApiClient {
         const form = new FormData();
         form.append("file", new Blob([blobBytes], { type: file.mime }), file.filename);
         return this.fetchFn(
-          `${path === "/media/upload" ? this.mediaBaseUrl : this.baseUrl}${path}`,
+          `${path === "/media/upload" ? this.mediaUrl : this.restUrl}${path}`,
           {
             method: "POST",
             headers: { authorization: `Bearer ${accessToken}` },
@@ -258,8 +258,8 @@ export class ClawchatApiClient {
   }
 
   private requireToken(): string {
-    const token = this.accessToken().trim();
-    if (!token) throw new ClawchatApiError("auth", "ClawChat is not activated");
+    const token = this.accessToken();
+    if (!token.trim()) throw new ClawchatApiError("auth", "ClawChat is not activated");
     return token;
   }
 }
@@ -298,5 +298,9 @@ function classifyApiFailure(
 
 function stringValue(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function opaqueTokenValue(value: unknown): string {
+  return typeof value === "string" && value.trim() !== "" ? value : "";
 }
 

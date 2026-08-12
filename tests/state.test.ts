@@ -19,17 +19,22 @@ describe("ClawChat Extension profile state", () => {
     const prepared = await prepareClawchatState(options);
     await saveClawchatState(
       {
-        baseUrl: "https://app.clawling.com",
+        restUrl: "https://app.clawling.com",
         accessToken: "token-1",
         refreshToken: "refresh-1",
         agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" }
       },
-      { ...options, websocketUrl: "wss://app.clawling.com/ws" }
+      {
+        ...options,
+        websocketUrl: "wss://app.clawling.com/ws",
+        mediaUrl: "https://media.example.test"
+      }
     );
 
     await expect(loadClawchatState(options)).resolves.toEqual({
-      baseUrl: "https://app.clawling.com",
+      restUrl: "https://app.clawling.com",
       websocketUrl: "wss://app.clawling.com/ws",
+      mediaUrl: "https://media.example.test",
       accessToken: "token-1",
       refreshToken: "refresh-1",
       agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" },

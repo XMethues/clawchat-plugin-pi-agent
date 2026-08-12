@@ -19,7 +19,7 @@ describe("activateClawchat", () => {
 
     const result = await activateClawchat({
       code: "invite-1",
-      baseUrl: "https://clawchat.example",
+      restUrl: "https://clawchat.example/",
       fetchFn
     });
 
@@ -41,17 +41,18 @@ describe("activateClawchat", () => {
     );
   });
 
-  it("accepts the production response envelope", async () => {
-    const accessToken = `header.${Buffer.from(
-      JSON.stringify({ aid: "agent-2" })
-    ).toString("base64url")}.signature`;
+  it("accepts opaque credentials from the production response envelope unchanged", async () => {
+    const accessToken = "deliberately-not-a-jwt";
+    const refreshToken = "opaque refresh token";
     const fetchFn = vi.fn(async () => {
       return new Response(
         JSON.stringify({
           code: 0,
           data: {
             access_token: accessToken,
+            refresh_token: refreshToken,
             agent: {
+              id: "agent-2",
               user_id: "user-2",
               owner_id: "owner-2"
             },
@@ -67,13 +68,37 @@ describe("activateClawchat", () => {
 
     const result = await activateClawchat({
       code: "invite-2",
-      baseUrl: "https://app.clawling.com",
+      restUrl: "https://app.clawling.com/",
       fetchFn
     });
 
-    expect(result.accessToken).toBe(accessToken);
-    expect(result.agent.userId).toBe("user-2");
-    expect(result.agent.id).toBe("agent-2");
-    expect(result.ownerChatId).toBe("owner-chat-2");
+    expect(result).toMatchObject({
+      accessToken,
+      refreshToken,
+      restUrl: "https://app.clawling.com",
+      agent: { id: "agent-2", userId: "user-2", ownerId: "owner-2" },
+      ownerChatId: "owner-chat-2"
+    });
+  });
+
+  it.each([
+    ["agent.id", { user_id: "user-2", owner_id: "owner-2" }],
+    ["agent.user_id", { id: "agent-2", owner_id: "owner-2" }],
+    ["agent.owner_id", { id: "agent-2", user_id: "user-2" }]
+  ])("rejects an activation response missing %s", async (field, agent) => {
+    const fetchFn = vi.fn(async () =>
+      new Response(JSON.stringify({ access_token: "opaque", agent }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      })
+    );
+
+    await expect(
+      activateClawchat({
+        code: "invite",
+        restUrl: "https://app.clawling.com",
+        fetchFn
+      })
+    ).rejects.toThrow(`Activation response missing ${field}`);
   });
 });

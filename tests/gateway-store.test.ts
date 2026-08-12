@@ -69,6 +69,99 @@ describe("GatewayStore", () => {
     store.close();
   });
 
+  it("preserves an author-final reply when its provisional copy arrives later", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const authorFinal = {
+      event: "message.reply",
+      payload: { message_id: "msg-final-first", text: "polished", stream_merged: false }
+    };
+
+    const admitted = store.admitInbound({
+      dedupeKey: "message:msg-final-first",
+      messageId: "msg-final-first",
+      chatId: "chat-1",
+      frame: authorFinal,
+      dispatch: true
+    });
+    const duplicate = store.admitInbound({
+      dedupeKey: "message:msg-final-first",
+      messageId: "msg-final-first",
+      chatId: "chat-1",
+      frame: {
+        event: "message.reply",
+        payload: { message_id: "msg-final-first", text: "draft", stream_merged: true }
+      },
+      dispatch: true
+    });
+
+    expect(duplicate).toEqual({ status: "duplicate", turnId: admitted.turnId });
+    expect(store.claimNextTurn("chat-1")).toMatchObject({ frame: authorFinal });
+    store.close();
+  });
+
+  it("atomically replaces a queued provisional reply with a later author-final reply", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const provisional = store.admitInbound({
+      dedupeKey: "message:msg-provisional-first",
+      messageId: "msg-provisional-first",
+      chatId: "chat-1",
+      frame: {
+        event: "message.reply",
+        payload: { message_id: "msg-provisional-first", text: "draft", stream_merged: true }
+      },
+      dispatch: true
+    });
+    const authorFinal = {
+      event: "message.reply",
+      payload: { message_id: "msg-provisional-first", text: "polished" }
+    };
+
+    const duplicate = store.admitInbound({
+      dedupeKey: "message:msg-provisional-first",
+      messageId: "msg-provisional-first",
+      chatId: "chat-1",
+      frame: authorFinal,
+      dispatch: true
+    });
+
+    expect(duplicate).toEqual({ status: "duplicate", turnId: provisional.turnId });
+    expect(store.claimNextTurn("chat-1")).toMatchObject({
+      id: provisional.turnId,
+      frame: authorFinal
+    });
+    store.close();
+  });
+
+  it("preserves ordinary same-message-ID rewrites outside reply precedence", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const admitted = store.admitInbound({
+      dedupeKey: "message:msg-rewritten",
+      messageId: "msg-rewritten",
+      chatId: "chat-1",
+      frame: { event: "message.send", payload: { message_id: "msg-rewritten", text: "before" } },
+      dispatch: true
+    });
+    const rewritten = {
+      event: "message.send",
+      payload: { message_id: "msg-rewritten", text: "after", stream_merged: true }
+    };
+
+    const duplicate = store.admitInbound({
+      dedupeKey: "message:msg-rewritten",
+      messageId: "msg-rewritten",
+      chatId: "chat-1",
+      frame: rewritten,
+      dispatch: true
+    });
+
+    expect(duplicate).toEqual({ status: "duplicate", turnId: admitted.turnId });
+    expect(store.claimNextTurn("chat-1")).toMatchObject({ frame: rewritten });
+    store.close();
+  });
+
   it("does not replay a turn that was running when the Host stopped", async () => {
     const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
     const path = join(directory, "gateway.sqlite");
@@ -100,21 +193,32 @@ describe("GatewayStore", () => {
     const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
     const path = join(directory, "gateway.sqlite");
     const store = GatewayStore.open(path);
+    const frame = {
+      event: "message.reply",
+      trace_id: "trace-out-1",
+      payload: { message_id: "msg-01HVB6S7K8L9M0N1P2Q3R4S5T6" }
+    };
     store.enqueueOutbound({
       traceId: "trace-out-1",
       chatId: "chat-1",
-      frame: { event: "message.reply", trace_id: "trace-out-1", payload: {} }
+      frame
     });
     store.close();
 
+    const attempted = GatewayStore.open(path);
+    attempted.recordOutboundAttempt("trace-out-1", 1_776_162_600_000);
+    attempted.close();
+
     const reopened = GatewayStore.open(path);
-    reopened.recordOutboundAttempt("trace-out-1");
     expect(reopened.listPendingOutbound()).toEqual([
       {
         traceId: "trace-out-1",
+        messageId: "msg-01HVB6S7K8L9M0N1P2Q3R4S5T6",
         chatId: "chat-1",
-        frame: { event: "message.reply", trace_id: "trace-out-1", payload: {} },
-        attempts: 1
+        frame,
+        serializedFrame: JSON.stringify(frame),
+        attempts: 1,
+        lastAttemptAt: 1_776_162_600_000
       }
     ]);
     reopened.acknowledgeOutbound("trace-out-1");
@@ -135,24 +239,131 @@ describe("GatewayStore", () => {
     store.close();
   });
 
-  it("migrates legacy outbound message ids to trace correlation ids", async () => {
+  it("transactionally gives a pending legacy row one durable message identity", async () => {
     const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
     const path = join(directory, "gateway.sqlite");
-    const original = GatewayStore.open(path);
-    original.enqueueOutbound({
-      traceId: "trace-out-1",
-      chatId: "chat-1",
-      frame: { event: "message.reply", trace_id: "trace-out-1", payload: {} }
-    });
-    original.close();
     const legacy = new DatabaseSync(path);
-    legacy.exec("ALTER TABLE outbound_messages RENAME COLUMN trace_id TO message_id");
+    legacy.exec(`
+      CREATE TABLE outbound_messages (
+        message_id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        frame_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'acknowledged', 'failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        acknowledged_at INTEGER,
+        failed_at INTEGER,
+        error_code TEXT,
+        error_reason TEXT
+      ) STRICT
+    `);
+    legacy
+      .prepare(
+        `INSERT INTO outbound_messages
+          (message_id, chat_id, frame_json, status, attempts, created_at)
+         VALUES (?, ?, ?, 'pending', 0, ?)`
+      )
+      .run(
+        "trace-out-1",
+        "chat-1",
+        JSON.stringify({ event: "message.reply", trace_id: "trace-out-1", payload: {} }),
+        1
+      );
     legacy.close();
 
     const migrated = GatewayStore.open(path);
-    expect(migrated.listPendingOutbound()).toEqual([
-      expect.objectContaining({ traceId: "trace-out-1" })
-    ]);
+    const [first] = migrated.listPendingOutbound();
+    expect(first!.traceId).toBe("trace-out-1");
+    expect(first!.messageId).toMatch(/^msg-[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+    expect(first!.frame).toMatchObject({ payload: { message_id: first!.messageId } });
+    expect(first!.serializedFrame).toBe(JSON.stringify(first!.frame));
     migrated.close();
+
+    const reopened = GatewayStore.open(path);
+    expect(reopened.listPendingOutbound()).toEqual([first]);
+    expect(() =>
+      reopened.enqueueOutbound({
+        traceId: "trace-out-2",
+        chatId: "chat-1",
+        frame: {
+          event: "message.reply",
+          trace_id: "trace-out-2",
+          payload: { message_id: first!.messageId }
+        }
+      })
+    ).toThrow();
+    reopened.close();
   });
+
+  it("durably advances reliable quarantine once per epoch and keeps raw input non-ackable", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const path = join(directory, "gateway.sqlite");
+    const first = GatewayStore.open(path);
+    const poison = { version: "2", event: "future.poison", dseq: 1, payload: null };
+
+    first.quarantineReliableInbound({
+      ackEpoch: "epoch-1",
+      dseq: 1,
+      event: "future.poison",
+      reason: "invalid outer envelope payload",
+      frame: poison
+    });
+    first.quarantineReliableInbound({
+      ackEpoch: "epoch-1",
+      dseq: 1,
+      event: "future.poison",
+      reason: "a replay must not replace the original diagnosis",
+      frame: poison
+    });
+    first.quarantineRawInbound({
+      event: "<invalid-json>",
+      reason: "invalid JSON",
+      frame: "{"
+    });
+
+    expect(first.listQuarantinedFrames()).toEqual([
+      expect.objectContaining({
+        ackEpoch: "epoch-1",
+        dseq: 1,
+        ackable: true,
+        event: "future.poison",
+        reason: "invalid outer envelope payload",
+        frame: poison
+      }),
+      expect.objectContaining({
+        ackEpoch: null,
+        dseq: null,
+        ackable: false,
+        event: "<invalid-json>",
+        frame: "{"
+      })
+    ]);
+    expect(first.getReliableHighWater("epoch-1")).toBe(1);
+    first.close();
+
+    const reopened = GatewayStore.open(path);
+    expect(reopened.getReliableHighWater("epoch-1")).toBe(1);
+    expect(reopened.getStatus().quarantinedFrames).toBe(2);
+    reopened.close();
+  });
+  it("persists a monotonic idempotent inbox history boundary", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const path = join(directory, "gateway.sqlite");
+    const first = GatewayStore.open(path);
+
+    expect(first.recordInboxHistoryBoundary(20, 1_000)).toBe(true);
+    expect(first.recordInboxHistoryBoundary(20, 2_000)).toBe(false);
+    expect(first.recordInboxHistoryBoundary(10, 3_000)).toBe(false);
+    expect(first.getStatus().inboxHistoryUnavailableBefore).toEqual({
+      oldestSeq: 20,
+      observedAt: 1_000
+    });
+    expect(first.recordInboxHistoryBoundary(30, 4_000)).toBe(true);
+    first.close();
+
+    const reopened = GatewayStore.open(path);
+    expect(reopened.getInboxHistoryBoundary()).toEqual({ oldestSeq: 30, observedAt: 4_000 });
+    reopened.close();
+  });
+
 });

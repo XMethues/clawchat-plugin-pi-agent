@@ -1,6 +1,12 @@
 export { activateClawchat } from "./activation.js";
 export type { ActivateClawchatOptions, ActivationResult } from "./activation.js";
-export { DEFAULT_BASE_URL, DEFAULT_WEBSOCKET_URL } from "./config.js";
+export {
+  DEFAULT_MEDIA_URL,
+  DEFAULT_REST_URL,
+  DEFAULT_WEBSOCKET_URL,
+  normalizeHttpOrigin,
+  normalizeWebSocketUrl
+} from "./config.js";
 export { createClawchatPiExtension } from "./extension.js";
 export type { ClawchatPiExtensionOptions } from "./extension.js";
 export { ClawChatGateway } from "./gateway.js";
@@ -11,6 +17,7 @@ export type {
   ChatSessionRecord,
   ChatTurn,
   GatewayStoreStatus,
+  InboxHistoryBoundary,
   InboundAdmission,
   OutboundRecord
 } from "./gateway-store.js";
@@ -24,7 +31,7 @@ export type { HeadlessPiHostOptions } from "./headless-host.js";
 export { HostProfileRepository } from "./host-profile.js";
 export type {
   HostProfile,
-  HostProfileLock,
+  HostProfileOperationLease,
   HostProfileLockStatus,
   HostProfileRepositoryOptions
 } from "./host-profile.js";
@@ -69,6 +76,7 @@ export type {
   ClawchatOutboundMessage,
   ClawchatPeer,
   ClawchatReplyMessage,
+  ClawchatSendMessage,
   ClawchatTransport,
   ClawchatTypingUpdate,
   TextFragment

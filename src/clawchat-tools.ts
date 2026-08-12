@@ -16,7 +16,7 @@ import { isUnknownRecord } from "./type-guards.js";
 export interface ActiveClawchatTurn {
   chatId: string;
   chatType: "direct" | "group";
-  messageId: string;
+  messageId?: string;
 }
 
 export interface ClawchatToolCallRecord {
@@ -26,6 +26,7 @@ export interface ClawchatToolCallRecord {
   error?: string;
   startedAt: number;
   endedAt: number;
+  auditSource?: string;
   chatId?: string;
   messageId?: string;
 }
@@ -748,7 +749,7 @@ async function sendReaction(args: Record<string, unknown>, env: ClawchatToolEnvi
   if (chatId !== turn.chatId) throw new Error("chatId must match the Active ClawChat Turn");
   const targetMessageId = typeof args.targetMessageId === "string" && args.targetMessageId.trim()
     ? args.targetMessageId.trim()
-    : turn.messageId;
+    : requiredString(turn.messageId, "targetMessageId");
   const emoji = requiredString(args.emoji, "emoji");
   await env.sendFrame?.({
     version: "2",

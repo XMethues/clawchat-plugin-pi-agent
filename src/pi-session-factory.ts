@@ -105,15 +105,30 @@ export class PiChatSessionFactory implements ChatSessionFactory {
     return {
       runTurn: async (turn: ChatTurn) => {
         if (isClawchatAwarenessFrame(turn.frame)) {
-          await session.sendCustomMessage(
-            {
-              customType: "clawchat.awareness",
-              content: renderAwarenessPrompt(turn.frame),
-              display: false,
-              details: turn.frame
+          await headless.controller.beginAwarenessTurn({
+            target: { chatId: mapping.chatId, chatType: "direct" },
+            auditSource: turn.messageId,
+            outputVisibility: {
+              thinking: session.thinkingLevel !== "off",
+              tools:
+                (this.store.getToolOutputOverrides()[mapping.chatId] ?? this.toolCallsDefault) ===
+                "on"
             },
-            { triggerTurn: true }
-          );
+            toolContext: { chatId: mapping.chatId, chatType: "direct" }
+          });
+          try {
+            await session.sendCustomMessage(
+              {
+                customType: "clawchat.awareness",
+                content: renderAwarenessPrompt(turn.frame),
+                display: false,
+                details: turn.frame
+              },
+              { triggerTurn: true }
+            );
+          } finally {
+            await headless.controller.abortTurn();
+          }
           return;
         }
         const message = requireInboundMessage(turn.frame);
@@ -127,12 +142,18 @@ export class PiChatSessionFactory implements ChatSessionFactory {
         }
       },
       abort: async () => {
-        await session.abort();
-        await headless.controller.abortTurn();
+        try {
+          await session.abort();
+        } finally {
+          await headless.controller.abortTurn();
+        }
       },
       dispose: async () => {
-        await headless.controller.abortTurn();
-        session.dispose();
+        try {
+          await headless.controller.abortTurn();
+        } finally {
+          session.dispose();
+        }
       }
     };
   }

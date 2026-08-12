@@ -5,7 +5,7 @@ import type {
   ExtensionContext
 } from "@earendil-works/pi-coding-agent";
 import { activateClawchat, type ActivateClawchatOptions, type ActivationResult } from "./activation.js";
-import { DEFAULT_BASE_URL, DEFAULT_WEBSOCKET_URL } from "./config.js";
+import { DEFAULT_MEDIA_URL, DEFAULT_REST_URL, DEFAULT_WEBSOCKET_URL } from "./config.js";
 import { GatewayStore } from "./gateway-store.js";
 import { HostProfileRepository } from "./host-profile.js";
 import { createClawchatToolRuntime, type ClawchatToolRuntime } from "./clawchat-runtime.js";
@@ -28,7 +28,7 @@ export interface ClawchatPiExtensionOptions {
   loadState?: () => Promise<ClawchatState | null>;
   saveState?: (
     state: ClawchatState | ActivationResult,
-    options?: StatePathOptions & { websocketUrl?: string }
+    options?: StatePathOptions & { websocketUrl?: string; mediaUrl?: string }
   ) => Promise<string>;
   profileName?: string;
   profiles?: HostProfileRepository;
@@ -70,7 +70,7 @@ class ClawchatPiManagementExtension {
   private readonly loadStateFn: () => Promise<ClawchatState | null>;
   private readonly saveStateFn: (
     state: ClawchatState | ActivationResult,
-    options?: StatePathOptions & { websocketUrl?: string }
+    options?: StatePathOptions & { websocketUrl?: string; mediaUrl?: string }
   ) => Promise<string>;
   private readonly profileName: string;
   private readonly profiles: HostProfileRepository;
@@ -82,7 +82,12 @@ class ClawchatPiManagementExtension {
   constructor(pi: ExtensionAPI, options: ClawchatPiExtensionOptions) {
     this.pi = pi;
     this.profileName = options.profileName ?? process.env.CLAWCHAT_PI_PROFILE ?? "default";
-    this.profiles = options.profiles ?? new HostProfileRepository();
+    this.profiles = options.profiles ??
+      new HostProfileRepository({
+        ...(process.env.CLAWCHAT_MEDIA_URL
+          ? { legacyMediaUrl: process.env.CLAWCHAT_MEDIA_URL }
+          : {})
+      });
     this.activateFn = options.activate ?? activateClawchat;
     this.prepareStateFn =
       options.prepareState ??
@@ -113,20 +118,26 @@ class ClawchatPiManagementExtension {
       ctx.ui.notify("Usage: /clawchat-activate <code>", "warning");
       return;
     }
-    const prepared = await this.prepareStateFn({ workspace: ctx.cwd });
-    const result = await this.activateFn({
-      code,
-      baseUrl: process.env.CLAWCHAT_BASE_URL ?? DEFAULT_BASE_URL,
-      deviceId: prepared.deviceId
-    });
-    this.resetToolRuntime();
-    await this.saveStateFn(result, {
-      websocketUrl: process.env.CLAWCHAT_WS_URL ?? DEFAULT_WEBSOCKET_URL,
-      workspace: prepared.workspace,
-      resetIdentityState: true
-    });
-    ctx.ui.notify("ClawChat activated and saved.", "info");
-    if (this.ctx) await this.start(this.ctx);
+    const operationLease = await this.profiles.acquireOperationLease(this.profileName);
+    try {
+      const prepared = await this.prepareStateFn({ workspace: ctx.cwd });
+      const result = await this.activateFn({
+        code,
+        restUrl: process.env.CLAWCHAT_BASE_URL ?? DEFAULT_REST_URL,
+        deviceId: prepared.deviceId
+      });
+      this.resetToolRuntime();
+      await this.saveStateFn(result, {
+        websocketUrl: process.env.CLAWCHAT_WS_URL ?? DEFAULT_WEBSOCKET_URL,
+        mediaUrl: process.env.CLAWCHAT_MEDIA_URL ?? DEFAULT_MEDIA_URL,
+        workspace: prepared.workspace,
+        resetIdentityState: true
+      });
+      ctx.ui.notify("ClawChat activated and saved.", "info");
+      if (this.ctx) await this.start(this.ctx);
+    } finally {
+      await operationLease.release();
+    }
   }
 
   async start(ctx: ExtensionContext): Promise<void> {

@@ -57,7 +57,7 @@ export class ClawchatInboundRouter {
     const mode = this.store.getGroupDispatchMode(message.chat_id);
     if (mode === "all") return { dispatch: true };
     if (mode === "muted") return { dispatch: false };
-    return { dispatch: hasStructuredMention(message, this.agentUserId) };
+    return { dispatch: hasMention(message, this.agentUserId) };
   }
 
   async applyAcceptedControl(message: ClawchatInboundMessage, decision: InboundDecision): Promise<void> {
@@ -84,14 +84,12 @@ export class ClawchatInboundRouter {
   }
 }
 
-function hasStructuredMention(message: ClawchatInboundMessage, userId: string): boolean {
+function hasMention(message: ClawchatInboundMessage, userId: string): boolean {
   const mentions = message.payload.message.context?.mentions;
   if (!Array.isArray(mentions)) return false;
-  return mentions.some(
-    (mention) =>
-      Boolean(mention) &&
-      typeof mention === "object" &&
-      "id" in mention &&
-      (mention as { id?: unknown }).id === userId
-  );
+  return mentions.some((mention) => {
+    if (typeof mention === "string") return mention === userId;
+    if (!mention || typeof mention !== "object" || !("user_id" in mention)) return false;
+    return mention.user_id === userId || mention.user_id === "all";
+  });
 }

@@ -24,8 +24,10 @@ The package continues to ship a standard Pi Extension. The Headless Pi Host embe
 - Live attachment of a TUI to a Host-owned session.
 - Selecting or changing a local `cwd` from a ClawChat message.
 - Sharing one Pi session across multiple chats or projects.
-- Token streaming or ClawChat streaming lifecycle events.
-- ClawChat-specific tool restrictions, sender permissions, approval prompts, or a sandbox.
+- Token streaming or production of ClawChat streaming lifecycle events. The
+  Gateway may consume a lifecycle and materialize it after `message.done`.
+- ClawChat owner permission events, presence subscriptions, read cursors,
+  E2EE, sender-specific tool restrictions, approval prompts, or a sandbox.
 - Per-chat WebSockets, idle runtime eviction, TTLs, or an LRU limit.
 - Backward compatibility with the current single-file `~/.pi/agent/clawchat.json` state shape. The implementation replaces it with Host Profiles.
 
@@ -40,10 +42,21 @@ clawchat-pi status [--profile <name>]
 - The default profile name is `default`.
 - A profile name must match `[A-Za-z0-9._-]+`.
 - `activate` resolves `--cwd` through the filesystem and persists its canonical absolute path. The path must exist and be a directory.
-- Activating an existing profile refreshes its credentials but may not change its Workspace. A different Workspace requires a different profile.
-- `run` is a foreground process. The operating system or the user's process manager owns daemonization and restart policy.
-- `run` fails when another process holds the same profile lock.
-- `status` reports activation state, canonical Workspace, device ID, process-lock state, WebSocket state when available, known Chat Sessions, queue counts, and each Pi session file path. It never prints tokens.
+- Activating an existing profile explicitly rebinds its identity but may not
+  change its Workspace or stable device. A different Workspace requires a
+  different profile.
+- CLI Activation, Management Extension Activation, and `run` use one exclusive
+  Host Profile operation lease. Activation takes it before reading profile state
+  and holds it through remote redemption, Profile Rebinding reset, profile
+  commit, and output-setting restoration.
+- `run` is a foreground process. The operating system or the user's process
+  manager owns daemonization and restart policy.
+- `run` fails when another Host or Activation holds the same profile lease.
+- `status` reports activation state, canonical Workspace, stable device,
+  separate REST/WebSocket/Media endpoints, structured agent identity,
+  process-lock state, known Chat Sessions and queue counts, pending/failed
+  Outbox counts, quarantined frames, and any durable replay-truncation boundary.
+  It never prints tokens or message content.
 
 The interactive Extension keeps `/clawchat-activate`. It reads and writes the same named Host Profile state as the executable, with `default` as its default profile.
 
@@ -61,10 +74,12 @@ State lives below Pi's agent directory:
 
 - schema version and profile name;
 - canonical Workspace path;
-- stable `device_id`, generated once and reused across activation and reconnects;
-- ClawChat base and WebSocket URLs;
-- access and refresh credentials;
-- ClawChat agent, user, and owner IDs;
+- stable `device_id`, generated once and reused across Activation and reconnects;
+- independently normalized REST and Media HTTP(S) origins plus the validated
+  WebSocket URL; none is derived from another;
+- opaque access and refresh credentials, never decoded for claims;
+- required structured ClawChat agent ID, agent-user ID, and owner ID from
+  Activation;
 - default Tool Output Visibility, initially `off`.
 
 `gateway.sqlite` is mode `0600` and is the Gateway Store described in ADR 0011. It stores protocol and routing state, not model context or secrets duplicated from the profile file.
@@ -75,22 +90,38 @@ Pi sessions remain in Pi's standard session directory for the profile Workspace.
 
 | Module | Interface and responsibility |
 | --- | --- |
-| `HostProfileRepository` | Activates, loads, validates, and atomically saves one profile; owns credentials, stable identity, Workspace binding, and process lock. |
-| `GatewayStore` | Transactionally admits inbound frames, records dedupe keys and replay high-water state, owns durable per-chat queues and outbound attempts, and maps chats to Pi sessions. SQLite is the production adapter; tests use a temporary SQLite file. |
-| `ClawChatGateway` | Exposes start, stop, admitted-frame delivery, and materialized send operations. Internally owns challenge/connect handshake, capability negotiation, replay, ack batching, reconnect, self-echo filtering, and the outbound outbox. Callers do not manage protocol cursors. |
+| `HostProfileRepository` | Activates, loads, validates, and atomically saves one profile; owns opaque credentials, structured identity, separate endpoints, stable device identity, Workspace binding, and the exclusive operation lease shared by Activation and Host ownership. |
+| `GatewayStore` | Transactionally admits inbound frames, records message dedupe and reliable ACK high-water state, stores poison quarantine and replay truncation, owns durable per-chat queues and materialized outbound attempts, and maps chats to Pi sessions. SQLite is the production adapter; tests use a temporary SQLite file. |
+| `ClawChatGateway` | Exposes start, stop, admitted-frame delivery, and materialized send operations. Internally owns challenge/connect, capability negotiation, token/nonce recovery, replay, ACK scheduling, reconnect, self-echo filtering, stable outbound identity, and ACK-timeout reconciliation. Callers do not manage protocol cursors. |
 | `ChatSessionRegistry` | Resolves an admitted `chat_id` to one runtime, lazily creates or restores it, serializes its turns, and disposes all runtimes during Host shutdown. It does not own the WebSocket. |
 | `ChatSessionRuntime` | Owns one Pi `AgentSessionRuntime`, `SessionManager`, `SettingsManager`, `ResourceLoader`/Extension runtime, Chat Turn Queue consumer, and effective output settings. It processes one turn at a time. |
-| `OutputProjector` | Converts completed Pi assistant, thinking, and visible tool events to complete ClawChat `message.reply` frames and brackets a turn with `typing.update`. It does not own transport or persistence. |
+| `OutputProjector` | Converts completed Pi assistant, thinking, and visible tool events to unquoted ClawChat `message.send` frames in direct chats and quoted `message.reply` frames in group chats, and brackets a turn with `typing.update`. It does not own transport or persistence. |
 
 These are module seams, not one-class-per-row requirements. Public interfaces stay small; handshake state, SQL tables, Pi event assembly, and retry mechanics remain hidden inside their owning modules. Tests target each interface's behavior.
 
 ## Activation and startup
 
-1. `activate` sends the invite-code request with `platform: "pi"`, the persisted stable device ID, and the existing ClawChat agent type.
-2. On success it atomically stores the returned credentials and identity without changing the profile's Workspace or device ID.
-3. `run` loads and validates the profile, acquires the profile lock, opens and initializes the Gateway Store, creates the Chat Session Registry, then starts the Gateway.
-4. The Host remains online and reconnecting until explicitly stopped. A network disconnect does not dispose Chat Session runtimes or end the process.
-5. A profile with an invalid Workspace, unreadable state, unsupported schema, or unavailable lock fails before opening the WebSocket.
+1. `activate` acquires the profile operation lease before reading or preparing
+   state, then sends the invite-code request with `platform: "pi"`, the
+   persisted stable device ID, and the existing ClawChat agent type.
+2. It requires structured agent, agent-user, and owner IDs; stores the returned
+   access/refresh credentials as opaque strings; and retains independently
+   configured REST, WebSocket, and Media endpoints.
+3. A Profile Rebinding clears the previous identity's Gateway Store, ClawChat
+   Tool State, profile-local Skills, mappings, queues, and mapped Pi history
+   before atomically committing the new identity. Workspace and device remain.
+4. The operation lease remains held through invite redemption, reset, commit,
+   and output-setting restoration, and is released on every success or error
+   path. A running Host blocks Activation before the remote request; an
+   Activation in progress blocks Host startup.
+5. `run` acquires the same lease before loading the profile, opens and
+   initializes the Gateway Store, creates the Chat Session Registry, then starts
+   the Gateway.
+6. The Host remains online and reconnecting until explicitly stopped. A network
+   disconnect does not dispose Chat Session runtimes or end the process.
+7. A profile with an invalid Workspace, unreadable state, unsupported schema,
+   missing structured identity, incomplete endpoint configuration, or
+   unavailable lease fails before opening the WebSocket.
 
 ## WebSocket behavior
 
@@ -98,11 +129,22 @@ The Gateway follows `docs/client-integration.md` and uses exactly one connection
 
 ### Handshake and capabilities
 
-- Complete `connect.challenge` -> `connect` -> `hello-ok` before sending application frames.
-- Advertise only implemented capabilities. The Headless Host advertises `multi_device`, `device_replay`, `chat_meta_events`, `notify_signals`, `delivery_receipt`, `history_sync`, `reliable_delivery`, and `reliable_delivery_v2`.
-- Do not advertise permission events, streaming, or encryption until their full contracts exist.
-- If `hello-ok.ack_mode` is `dseq`, use reliable-delivery v2. Otherwise fall back to v1 when storage `seq` is present, or legacy behavior when neither reliable mode is granted.
-- Treat authentication `hello-fail` as requiring fresh credentials before retry. Treat a remote authentication-service failure or a close without `hello-fail` as reconnectable with backoff.
+- Complete `connect.challenge` -> `connect` -> `hello-ok` before sending
+  application frames.
+- Advertise only implemented capabilities. The Headless Host advertises
+  `multi_device`, `device_replay`, `delivery_receipt`, plaintext `history_sync`,
+  `reliable_delivery`, and `reliable_delivery_v2`; when owner-awareness is
+  configured it also advertises `chat_meta_events` and `notify_signals`.
+- Do not advertise E2EE or `permission_events`. Do not subscribe to presence,
+  produce read cursors, or emit production streaming lifecycle output.
+- If `hello-ok.ack_mode` is `dseq`, use reliable-delivery v2. Otherwise fall
+  back to v1 when storage `seq` is present, or legacy behavior when neither
+  reliable mode is granted.
+- On exact `authentication failed`, permit one single-flight reactive refresh
+  since the last successful `hello-ok`. Only another successful `hello-ok`
+  resets the latch, so an immediately rejected replacement cannot hot-loop.
+  Remote-auth-service and unknown transient failures reconnect with the same
+  opaque token rather than refreshing it.
 
 ### Reconnect and replay
 
@@ -112,35 +154,81 @@ The Gateway follows `docs/client-integration.md` and uses exactly one connection
 - For v2, validate dense `dseq` at the socket read layer and bind `message.sync_ack` to the negotiated epoch.
 - For v1, treat storage `seq` as sparse and opaque; never wait for missing values.
 - Unknown event values are tolerated and logged without crashing the connection.
+- Treat exact `nonce mismatch` as recoverable: use normal reconnect backoff,
+  open a fresh socket, accept its new challenge, and reuse the same token.
+  `invalid connect event` and `invalid connect payload` remain terminal.
 
 ### Durable admission and acknowledgement
 
 For every inbound frame eligible for reliable delivery:
 
-1. validate its envelope and materialized message body;
-2. suppress a self-echo when `sender.id` is the profile's own ClawChat user ID;
-3. in one Gateway Store transaction, upsert its stable dedupe identity, record routing state, and either enqueue it or record its terminal skipped state;
-4. only after commit, advance the contiguous v2 acknowledgement or v1 cursor acknowledgement;
-5. dispatch an accepted queued turn to the Chat Session Registry independently of protocol acknowledgement.
+1. decode raw JSON and extract a trustworthy next dense `dseq` before strict
+   version, event, payload, or business mapping;
+2. validate its envelope and materialized message body;
+3. suppress a self-echo when `sender.id` is the profile's own ClawChat user ID;
+4. in one Gateway Store transaction, upsert its stable dedupe identity, record
+   routing state, and either enqueue it or record its terminal skipped state;
+5. only after commit, advance the contiguous v2 acknowledgement or v1 cursor
+   acknowledgement;
+6. dispatch an accepted queued turn to the Chat Session Registry independently
+   of protocol acknowledgement.
 
-Duplicate replay or live delivery never creates a second Pi turn. Dedupe uses the protocol's stable message/event identity, not `trace_id` or arrival time.
+Duplicate replay or live delivery never creates a second Pi turn. Dedupe uses
+the protocol's stable message/event identity, not `trace_id` or arrival time.
+For a same-ID reply, only `stream_merged: true` is provisional: it cannot
+overwrite an author-final copy, while a later author-final copy atomically
+replaces a provisional persisted frame and any still-queued turn.
+
+If a trustworthy dseq-bearing frame fails later parsing, processing, or
+persistence, the Store quarantines it idempotently by connection epoch and
+`dseq`, advances the durable high-water, and schedules ACK. This includes
+unknown future events. Invalid JSON or an envelope without a trustworthy
+`dseq` is quarantined as raw non-ackable input and forces fail-safe reconnect;
+the Gateway never invents a sequence.
+
+Every durable ACK-high-water advancement schedules one coalesced frame-path
+flush of the current high-water. The 200 ms fallback debounce, immediate
+`replay.done` flush, graceful-disconnect flush, and unconditional 30-second
+connected resend remain active. Per-connection callbacks and high-water state
+cannot cross `hello-ok` epochs.
+
+`history.truncated` is handled in v1 and v2. A valid positive `oldest_seq` and
+observation time are stored monotonically and exposed by diagnostics and
+`status` as an unavailable-earlier-history boundary; it is never injected into
+chat. An invalid dseq-bearing boundary follows poison quarantine, while a
+non-identifiable invalid boundary is diagnosed without changing stored state.
 
 ### Outbound delivery
 
-- `message.reply` is inserted into an outbox before the Gateway writes it to the socket.
-- Ordinary materialized uplinks omit `payload.message_id`; the server mints the stable message identity.
-- The outbox uses the client-generated `trace_id` as its local correlation key. `message.ack` or `message.error` echoes that trace and settles the matching row.
-- Reconnect resends an unacknowledged frame with the same `trace_id` after replay completes or the replay stream becomes idle.
-- `typing.update` is ephemeral, best effort, and never enters the outbox.
-- A retry can be delivered more than once because `trace_id` is correlation, not a server idempotency key; the protocol's ordinary-uplink identifier rule takes precedence over client-side deduplication.
+- Materialized `message.send` and `message.reply` frames receive a canonical
+  `msg-` Crockford-base32 ULID before their first Outbox insert.
+- The same indexed `message_id` is serialized into the frame and survives first
+  send, reconnect resend, process restart, and transactional legacy-row
+  migration. It is the server-inbox dedupe identity.
+- The client-generated `trace_id` is a separate local correlation key.
+  `message.ack` settles the matching row; `message.error` is the only path that
+  marks it failed.
+- Attempt count and last-attempt time become durable only after writing the
+  frame to an open socket. An ACK deadline starts then and is cancelled by
+  positive or negative settlement.
+- Expiry leaves the row pending, emits actionable status, coalesces an expired
+  batch into one backoff-controlled reconnect, waits for the replay barrier,
+  then resends the exact serialized frame and `message_id`. Disconnect clears
+  only in-memory deadlines, so restart recovery uses durable attempt timestamps.
+- `typing.update` is ephemeral, best effort, and never enters the Outbox.
 
 ## Routing and chat policy
 
 Direct messages always enter their Chat Session after durable admission. Groups use a persisted Group Dispatch Mode and default to `mention`:
 
-- `mention`: dispatch only when `context.mentions` structurally includes the profile's ClawChat user ID;
+- `mention`: dispatch when `context.mentions` contains a canonical mention
+  object for the profile's ClawChat user ID, a legacy bare string equal to that
+  ID, or a canonical object naming the reserved `all` sentinel. Missing,
+  non-array, null, malformed, and unknown opaque mention entries are ignored
+  without blocking persistence or ACK;
 - `all`: dispatch every accepted materialized text message;
-- `muted`: durably consume, deduplicate, and acknowledge the message, then mark it skipped without invoking Pi.
+- `muted`: durably consume, deduplicate, and acknowledge the message, then mark
+  it skipped without invoking Pi.
 
 Integration control commands are recognized before group dispatch policy, never enter Pi context, and remain usable while a group is muted or a Chat Session is busy:
 
@@ -152,6 +240,31 @@ Integration control commands are recognized before group dispatch policy, never 
 `/clawchat-group` is valid only in a group. `/clawchat-output` persists a per-Chat-Session Tool Output Visibility override. Consistent with Execution Authority, the integration does not add an owner-only command gate; any participant whose message reaches the ClawChat agent can issue these integration commands.
 
 Unsupported ClawChat content is durably acknowledged and marked skipped. It is not rendered into synthetic prompt text.
+
+## Awareness, History Sync, and reconnect convergence
+
+A ClawChat Awareness Turn targets only the owner's direct Chat Session through
+an explicit Hosted Session Binding; it does not fabricate an inbound user
+message or require an inbound `message_id`. The binding supplies Owner Turn
+Memory, optional audit source, output visibility, and Active ClawChat Turn tool
+context. Binding state is cleared on success, failure, and abort. Visible
+awareness output is an unquoted direct `message.send`; ordinary user turns keep
+their inbound quote context and Group Dispatch behavior.
+
+Every successful `hello-ok` starts one non-blocking, single-flight
+authoritative recovery. It refreshes the conversation list, detail and
+announcement state for known mapped or loaded conversations, and the connected
+agent's structured behavior/profile state. Identical snapshots are no-ops;
+changed snapshots coalesce into at most one owner Awareness Turn per cycle.
+Failures retry with bounded exponential backoff, while live metadata
+invalidations remain the low-latency path.
+
+Sibling History Sync is plaintext-only. Every emitted opaque transit payload
+includes non-empty `source_device_id` in addition to envelope origin. Receivers
+prefer the payload source, fall back to a non-empty envelope origin, preserve
+target-device and self-export filtering, and durably reject and mark processed
+a transfer with no usable source so it can be acknowledged instead of replayed
+forever.
 
 ## Chat Session lifecycle
 
@@ -225,14 +338,34 @@ Structured logs include profile name, connection generation, `chat_id`, turn ID,
 - Two chats can run Pi turns concurrently; two messages in one busy chat execute strictly FIFO.
 - Restart resumes never-started queued messages but does not repeat a turn that was already running.
 - Muted groups receive, persist, deduplicate, and acknowledge frames without invoking Pi; `/clawchat-group mention` can unmute them.
-- Mention mode uses structured mention metadata, not display-name or text matching.
-- WebSocket replay duplicates do not create duplicate Pi turns.
-- Reliable v2 acknowledgement never advances past an uncommitted or missing dense `dseq`; v1 never assumes dense `seq` values.
-- An unacknowledged outbound reply is retried with the same `trace_id` and without a client-supplied `payload.message_id`.
+- Mention mode accepts canonical agent mentions, legacy bare IDs, and the
+  canonical everyone sentinel while malformed mention data remains ackable.
+- WebSocket replay duplicates do not create duplicate Pi turns, and
+  author-final replies win over provisional stream-merged copies in either
+  arrival order.
+- Reliable v2 acknowledgement never advances past an uncommitted or missing
+  dense `dseq`; poison with trustworthy dseq is quarantined and acknowledged,
+  while non-identifiable input is never falsely acknowledged.
+- Frame-path, debounce, replay-boundary, disconnect, and heartbeat ACK paths
+  remain live, and a monotonic replay-truncation boundary is visible in status.
+- An unacknowledged outbound reply retains one durable canonical `message_id`
+  through ACK-timeout/backoff/replay reconciliation and process restart;
+  `trace_id` remains only its ACK/error correlation key.
 - Thinking output follows the Pi thinking level; tool output follows profile default plus the per-chat override.
 - No streaming lifecycle frame or synthetic busy/failure reply is emitted.
 - A stopped Host session opens through `pi --session <path>` and is subsequently reusable by the Host.
 - A second Host process for the same profile fails fast, while another profile with another Workspace can run concurrently.
+- Reactive token refresh is reusable after each healthy connection without a
+  rejected-token hot loop, and nonce mismatch retries with a fresh challenge.
+- Activation and Host startup exclude each other for the complete profile
+  transaction, including remote redemption and Profile Rebinding reset.
+- Awareness runs through the owner's Hosted Session Binding with Owner Turn
+  Memory and tool context; reconnect metadata recovery is idempotent and
+  coalesced.
+- Plaintext History Sync resolves payload source identity, falls back to
+  envelope origin, and terminates malformed source-less transfers durably.
+- REST, WebSocket, and Media endpoints remain independent, tokens remain
+  opaque, and identity authority comes only from structured Activation fields.
 
 ## Implementation sequence
 
