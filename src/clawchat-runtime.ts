@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { ClawchatApiClient } from "./clawchat-api.js";
-import { ClawchatMemoryStore } from "./clawchat-memory.js";
+import { ClawchatMemoryStore, clawchatMemoryTarget } from "./clawchat-memory.js";
 import type { ClawchatToolEnvironment } from "./clawchat-tools.js";
 import { HostProfileRepository, type HostProfile } from "./host-profile.js";
 
@@ -49,6 +49,13 @@ export async function createClawchatToolRuntime(options: {
   const memory = new ClawchatMemoryStore(
     join(options.profiles.profileDirectory(options.profileName), "memory")
   );
+  const ownerTarget = clawchatMemoryTarget("owner", "owner");
+  const ownerMemory = await memory.read(ownerTarget);
+  await memory.writeMetadata(ownerTarget, {
+    ...ownerMemory.metadata,
+    agent_user_id: profile.agent.userId,
+    agent_owner_id: profile.agent.ownerId
+  });
 
   return {
     profile: () => profile,
