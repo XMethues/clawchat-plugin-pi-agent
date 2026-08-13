@@ -99,7 +99,7 @@ export class HeadlessPiHost {
       const router = new ClawchatInboundRouter({
         store,
         agentUserId: profile.agent.userId,
-        toolCallsDefault: profile.output.toolCallsDefault,
+        modeDefault: profile.output.modeDefault,
         reply: async (message, text) => {
           await replyProjector.replyTo(message, text);
         }
@@ -109,7 +109,7 @@ export class HeadlessPiHost {
         agentDir: this.agentDir,
         store,
         transport,
-        toolCallsDefault: profile.output.toolCallsDefault,
+        outputModeDefault: profile.output.modeDefault,
         tools: {
           ...toolRuntime.environment,
           sendFrame: async (frame) => {

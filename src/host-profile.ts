@@ -12,6 +12,7 @@ import {
 import { GatewayStore } from "./gateway-store.js";
 import { isFileSystemError, optionalLstat } from "./filesystem.js";
 import { isUnknownRecord } from "./type-guards.js";
+import type { ClawchatOutputMode } from "./output-settings.js";
 
 const PROFILE_SCHEMA_VERSION = 2 as const;
 const LEGACY_PROFILE_SCHEMA_VERSION = 1 as const;
@@ -34,7 +35,7 @@ export interface HostProfile {
     ownerId: string;
   };
   output: {
-    toolCallsDefault: "on" | "off";
+    modeDefault: ClawchatOutputMode;
   };
 }
 
@@ -197,7 +198,7 @@ export class HostProfileRepository {
       },
       output: !rebinding && stored && hasOutput(stored)
         ? storedOutput(stored)
-        : { toolCallsDefault: "off" }
+        : { modeDefault: "normal" }
     };
     await this.write(name, profile);
     this.pendingActivations.delete(name);
@@ -231,7 +232,15 @@ export class HostProfileRepository {
     const stored = await this.readStoredRecord(name);
     if (!stored) return null;
     if (stored.schemaVersion === PROFILE_SCHEMA_VERSION) {
-      return parseCurrentProfile(stored, name, this.profilePath(name));
+      const profile = parseCurrentProfile(stored, name, this.profilePath(name));
+      if (
+        isActiveProfile(profile) &&
+        isUnknownRecord(stored.output) &&
+        "toolCallsDefault" in stored.output
+      ) {
+        await this.write(name, profile);
+      }
+      return profile;
     }
     if (stored.schemaVersion === LEGACY_PROFILE_SCHEMA_VERSION) {
       const migrated = this.migrateLegacyProfile(stored, name);
@@ -445,13 +454,23 @@ function hasOutput(stored: Record<string, unknown>): boolean {
 }
 
 function storedOutput(stored: Record<string, unknown>): HostProfile["output"] {
-  if (
-    !isUnknownRecord(stored.output) ||
-    (stored.output.toolCallsDefault !== "on" && stored.output.toolCallsDefault !== "off")
-  ) {
-    throw new Error("Invalid Host Profile output.toolCallsDefault");
+  if (!isUnknownRecord(stored.output)) {
+    throw new Error("Invalid Host Profile output.modeDefault");
   }
-  return { toolCallsDefault: stored.output.toolCallsDefault };
+  if ("modeDefault" in stored.output) {
+    assertOutputMode(stored.output.modeDefault);
+    return { modeDefault: stored.output.modeDefault };
+  }
+  if (stored.output.toolCallsDefault === "on") return { modeDefault: "full" };
+  if (stored.output.toolCallsDefault === "off") return { modeDefault: "normal" };
+  throw new Error("Invalid Host Profile output.modeDefault");
+}
+
+
+function assertOutputMode(value: unknown): asserts value is ClawchatOutputMode {
+  if (value !== "minimal" && value !== "normal" && value !== "full") {
+    throw new Error("Invalid Host Profile output.modeDefault");
+  }
 }
 
 function requireProfileString(value: unknown, field: string): string {

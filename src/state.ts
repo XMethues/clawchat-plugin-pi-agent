@@ -66,8 +66,8 @@ export async function loadClawchatState(options: StatePathOptions = {}): Promise
       deviceId: profile.deviceId,
       workspace: profile.workspace,
       output: {
-        toolCallsDefault: profile.output.toolCallsDefault,
-        chatOverrides: gateway.getToolOutputOverrides()
+        modeDefault: profile.output.modeDefault,
+        chatOverrides: gateway.getOutputModeOverrides()
       }
     };
   } finally {
@@ -122,20 +122,20 @@ export async function saveClawchatState(
       agent: profile.agent,
       deviceId: profile.deviceId,
       workspace: profile.workspace,
-      output: { toolCallsDefault: profile.output.toolCallsDefault, chatOverrides: {} }
+      output: { modeDefault: profile.output.modeDefault, chatOverrides: {} }
     };
   }
 
   const gateway = GatewayStore.open(gatewayPath(options, name));
   try {
-    const previous = gateway.getToolOutputOverrides();
+    const previous = gateway.getOutputModeOverrides();
     for (const chatId of Object.keys(previous)) {
       if (!(chatId in extensionState.output.chatOverrides)) {
-        gateway.setToolOutputOverride(chatId, "inherit");
+        gateway.setOutputModeOverride(chatId, "inherit");
       }
     }
     for (const [chatId, value] of Object.entries(extensionState.output.chatOverrides)) {
-      gateway.setToolOutputOverride(chatId, value);
+      gateway.setOutputModeOverride(chatId, value);
     }
   } finally {
     gateway.close();

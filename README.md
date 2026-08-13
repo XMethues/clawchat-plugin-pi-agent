@@ -21,9 +21,9 @@ The Headless Pi Host:
 - gives every materialized outbound message a durable canonical `message_id`;
   lost ACKs time out and reconcile by reconnecting, waiting for replay, and
   resending that same identity;
-- sends completed assistant, thinking, and optionally tool output as
-  unquoted `message.send` messages in direct chats and quoted `message.reply`
-  messages in group chats;
+- projects Pi output according to each chat's effective `minimal`, `normal`, or
+  `full` mode as complete unquoted `message.send` messages in direct chats and
+  quoted `message.reply` messages in group chats;
 - runs metadata-change Awareness Turns through the owner's Hosted Session
   Binding and converges authoritative metadata after every connection; and
 - registers the pinned ClawChat social, metadata, memory, mention/reaction,
@@ -109,19 +109,37 @@ It preserves the profile's device ID and Workspace but deletes the prior
 Gateway state, tool memory/audit state, profile-local skills, chat mappings,
 queues, and mapped Pi session history before saving the new credentials.
 
-Tool output defaults to `off`. From the current ClawChat conversation handled
-by the Headless Pi Host, change it with:
+ClawChat output defaults to `normal`. From the current ClawChat conversation
+handled by the Headless Pi Host, set a per-chat override with:
 
 ```text
-/clawchat-output tools on
-/clawchat-output tools off
-/clawchat-output tools inherit
+/clawchat-output minimal
+/clawchat-output normal
+/clawchat-output full
+/clawchat-output inherit
 ```
 
-`inherit` removes the per-chat override and returns to the Host Profile default.
-These commands affect output visibility only; they do not enable or disable Pi
-tools. Thinking visibility follows Pi's native thinking level and has no
-ClawChat-specific duplicate switch.
+The command reply reports the effective mode, the Host Profile default, and the
+chat override. `inherit` removes the per-chat override and follows the Host
+Profile default. A command in one chat does not change another chat.
+
+For example, when asked about the weather, Pi might emit an intermediate
+assistant message, call a weather tool, and then emit the final forecast:
+
+- `minimal` buffers assistant text until the turn ends and sends only the last
+  non-empty assistant text—the final forecast. Thinking, tool output, and an
+  intermediate “I’ll check the weather” message are not sent.
+- `normal` sends every completed assistant text block, including both “I’ll
+  check the weather” and the final forecast, but sends no thinking or tool
+  output.
+- `full` sends those assistant text blocks plus completed thinking and completed
+  tool output. Thinking uses a Markdown heading and fenced code block; tool
+  details use an emoji-labelled heading and fenced code blocks. Their protocol
+  modes remain `thinking` and `tool`.
+
+The modes control only what ClawChat displays. They do not enable, disable, or
+otherwise change Pi tool execution. Thinking can be emitted only when Pi's
+native thinking level produces it.
 
 Groups default to structured mention dispatch. From a group chat, use:
 
@@ -134,9 +152,9 @@ Groups default to structured mention dispatch. From a group chat, use:
 Control commands are durably accepted before group filtering, so a muted group
 can unmute itself. Direct messages always dispatch.
 
-The extension does not use ClawChat streaming lifecycle frames. Each visible
-thinking block, assistant text block, or enabled completed tool call is sent as
-a complete message while `typing.update` represents active work.
+The extension does not use ClawChat streaming lifecycle frames. Every output
+selected by the effective mode is sent as a complete materialized message while
+`typing.update` represents active work.
 
 ### Agent Conformance Profile
 

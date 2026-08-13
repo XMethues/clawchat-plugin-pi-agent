@@ -2,6 +2,7 @@ import { chmodSync, mkdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname } from "node:path";
 import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
+import type { ClawchatOutputMode, ClawchatOutputModeOverride } from "./output-settings.js";
 
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
 
@@ -162,7 +163,7 @@ export class GatewayStore {
 
       CREATE TABLE IF NOT EXISTS chat_output_settings (
         chat_id TEXT PRIMARY KEY,
-        tool_calls TEXT NOT NULL CHECK (tool_calls IN ('on', 'off')),
+        mode TEXT NOT NULL CHECK (mode IN ('minimal', 'normal', 'full')),
         updated_at INTEGER NOT NULL
       ) STRICT;
 
@@ -630,27 +631,33 @@ export class GatewayStore {
       .run(Date.now(), traceId, traceId);
   }
 
-  setToolOutputOverride(chatId: string, value: "on" | "off" | "inherit"): void {
+  setOutputModeOverride(chatId: string, value: ClawchatOutputModeOverride): void {
     if (value === "inherit") {
       this.database.prepare("DELETE FROM chat_output_settings WHERE chat_id = ?").run(chatId);
       return;
     }
+    assertOutputMode(value);
     this.database
       .prepare(
-        `INSERT INTO chat_output_settings (chat_id, tool_calls, updated_at)
+        `INSERT INTO chat_output_settings (chat_id, mode, updated_at)
          VALUES (?, ?, ?)
          ON CONFLICT(chat_id) DO UPDATE SET
-           tool_calls = excluded.tool_calls,
+           mode = excluded.mode,
            updated_at = excluded.updated_at`
       )
       .run(chatId, value, Date.now());
   }
 
-  getToolOutputOverrides(): Record<string, "on" | "off"> {
+  getOutputModeOverrides(): Record<string, ClawchatOutputMode> {
     const rows = this.database
-      .prepare("SELECT chat_id, tool_calls FROM chat_output_settings ORDER BY chat_id")
-      .all() as unknown as Array<{ chat_id: string; tool_calls: "on" | "off" }>;
-    return Object.fromEntries(rows.map((row) => [row.chat_id, row.tool_calls]));
+      .prepare("SELECT chat_id, mode FROM chat_output_settings ORDER BY chat_id")
+      .all() as unknown as Array<{ chat_id: string; mode: string }>;
+    return Object.fromEntries(
+      rows.map((row) => {
+        assertOutputMode(row.mode);
+        return [row.chat_id, row.mode];
+      })
+    );
   }
 
   setGroupDispatchMode(chatId: string, mode: "mention" | "all" | "muted"): void {
@@ -1180,9 +1187,16 @@ function persistOutboundMessageId(frame: unknown, messageId: string): void {
   Reflect.set(payload, "message_id", messageId);
 }
 
+
+function assertOutputMode(value: string): asserts value is ClawchatOutputMode {
+  if (value !== "minimal" && value !== "normal" && value !== "full") {
+    throw new Error(`Invalid ClawChat output mode '${value}'`);
+  }
+}
 function migrateGatewaySchema(database: DatabaseSyncType): void {
   database.exec("BEGIN IMMEDIATE");
   try {
+    migrateChatOutputSettings(database);
     let columns = database.prepare("PRAGMA table_info(outbound_messages)").all() as Array<{
       name: string;
     }>;
@@ -1230,6 +1244,7 @@ function migrateGatewaySchema(database: DatabaseSyncType): void {
     database.exec("ROLLBACK");
     throw error;
   }
+
   database.exec("BEGIN IMMEDIATE");
   try {
     const quarantineColumns = database
@@ -1262,4 +1277,48 @@ function migrateGatewaySchema(database: DatabaseSyncType): void {
     database.exec("ROLLBACK");
     throw error;
   }
+}
+function migrateChatOutputSettings(database: DatabaseSyncType): void {
+  const columns = database.prepare("PRAGMA table_info(chat_output_settings)").all() as Array<{
+    name: string;
+  }>;
+  if (columns.some((column) => column.name === "mode")) {
+    const rows = database
+      .prepare("SELECT mode FROM chat_output_settings")
+      .all() as Array<{ mode: string }>;
+    for (const row of rows) assertOutputMode(row.mode);
+    return;
+  }
+  if (!columns.some((column) => column.name === "tool_calls")) {
+    throw new Error("Invalid Gateway Store chat_output_settings schema");
+  }
+
+  const legacyRows = database
+    .prepare("SELECT chat_id, tool_calls, updated_at FROM chat_output_settings ORDER BY chat_id")
+    .all() as Array<{ chat_id: string; tool_calls: string; updated_at: number }>;
+  database.exec(`
+    CREATE TABLE chat_output_settings_migrated (
+      chat_id TEXT PRIMARY KEY,
+      mode TEXT NOT NULL CHECK (mode IN ('minimal', 'normal', 'full')),
+      updated_at INTEGER NOT NULL
+    ) STRICT
+  `);
+  const insert = database.prepare(
+    "INSERT INTO chat_output_settings_migrated (chat_id, mode, updated_at) VALUES (?, ?, ?)"
+  );
+  for (const row of legacyRows) {
+    const mode = row.tool_calls === "on"
+      ? "full"
+      : row.tool_calls === "off"
+        ? "normal"
+        : undefined;
+    if (!mode) {
+      throw new Error(`Invalid legacy ClawChat tool-output value '${row.tool_calls}'`);
+    }
+    insert.run(row.chat_id, mode, row.updated_at);
+  }
+  database.exec(`
+    DROP TABLE chat_output_settings;
+    ALTER TABLE chat_output_settings_migrated RENAME TO chat_output_settings
+  `);
 }

@@ -97,16 +97,16 @@ The native tool and operating-system authority of the Pi process. Every message 
 _Avoid_: ClawChat tool permission gate, sender-based tool policy, implicit sandbox
 
 **Reply Delivery**:
-The non-token-streaming projection of Pi output into complete materialized ClawChat messages. Final assistant text is forwarded without adapter-authored rewriting; completed thinking output is also forwarded when the Chat Session's native Pi thinking level is enabled, while tool-call visibility is controlled by persisted ClawChat output configuration that can be changed through an Extension slash command. A turn may therefore produce more than one complete message, but never `message.created` / `message.add` / `message.done` lifecycle frames or synthetic failure prose; `typing.update` brackets the active turn.
-_Avoid_: token streaming, synthetic assistant reply, adapter-owned thinking switch, unconditional tool progress
+The non-token-streaming projection of Pi output into complete materialized ClawChat messages according to the effective Output Mode. `minimal` buffers assistant text and sends only the last non-empty block at turn end; `normal` sends all assistant text blocks; `full` additionally sends completed thinking under a Markdown heading with fenced content and completed tool output under an emoji-labelled Markdown heading with fenced arguments and results. A turn may therefore produce one or more complete messages, but never `message.created` / `message.add` / `message.done` lifecycle frames or synthetic failure prose; `typing.update` brackets the active turn.
+_Avoid_: token streaming, synthetic assistant reply, adapter-authored rewriting, unconditional tool progress
 
 **Inbound Stream Materialization**:
 The conversion of one completed ClawChat streaming-message lifecycle into one accepted message and one possible Pi turn after `message.done`. Partial additions never create turns, failed streams create none, and a later materialized reply with the same message identity never creates a duplicate turn.
 _Avoid_: token-per-turn dispatch, partial-message turn, duplicate polished reply
 
-**Tool Output Visibility**:
-The effective `on` or `off` policy for materializing completed Pi tool calls in ClawChat. A Host Profile provides the default, and each Chat Session may persist an `on`, `off`, or `inherit` override through `/clawchat-output tools`; `inherit` removes the session override and follows the profile default. A command in one chat never changes another chat's override.
-_Avoid_: global-only toggle, model instruction, tool execution policy
+**Output Mode**:
+The effective `minimal`, `normal`, or `full` policy for projecting Pi output into ClawChat. A Host Profile defaults to `normal`, and each Chat Session may persist a mode override through `/clawchat-output minimal|normal|full|inherit`; `inherit` removes the session override and follows the profile default. A command in one chat never changes another chat's override, and no mode changes Pi tool execution.
+_Avoid_: tool-execution policy, global-only toggle, model instruction, independent thinking switch
 
 **Active Session Owner**:
 The single running Pi runtime allowed to operate one persisted Chat Session. A Headless Pi Host and a separate Pi TUI must not concurrently own the same session, although one host may own multiple different Chat Sessions.

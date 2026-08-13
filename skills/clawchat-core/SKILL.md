@@ -45,17 +45,22 @@ Use activation codes exactly as provided. Do not lowercase, normalize, invent, r
 
 Target the correct profile explicitly with `--profile` whenever more than one exists. A Host Profile remains bound to its canonical Workspace, so use another profile rather than changing `--cwd`.
 
-## Output Visibility
+## Output Mode
 
-When the user asks to change completed ClawChat tool-output visibility for the current conversation, use:
+When the user asks to change what Pi output appears in the current ClawChat
+conversation, use:
 
 | Intent | Command |
 | --- | --- |
-| Show completed tool calls | `/clawchat-output tools on` |
-| Hide completed tool calls | `/clawchat-output tools off` |
-| Follow the Host Profile default | `/clawchat-output tools inherit` |
+| Send only the last non-empty assistant text when the turn ends | `/clawchat-output minimal` |
+| Send all assistant text, but no thinking or tool output | `/clawchat-output normal` |
+| Send assistant text plus fenced thinking and emoji-labelled, fenced tool details | `/clawchat-output full` |
+| Follow the Host Profile default | `/clawchat-output inherit` |
 
-These commands do not enable or disable Pi tools. Thinking visibility follows Pi's native thinking level.
+The command reply reports the effective mode, profile default, and chat
+override. These modes change display only; they never enable or disable Pi
+tools. Thinking is available in `full` only when Pi's native thinking level
+produces it; thinking and tool details render in fenced Markdown code blocks.
 
 ## Quick Reference
 

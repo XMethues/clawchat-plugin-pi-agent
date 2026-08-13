@@ -16,7 +16,7 @@ describe("Headless ClawChat Pi Extension", () => {
           sent.push(message);
         }
       },
-      toolsVisible: () => false,
+      outputMode: () => "full",
       now: () => 123,
       idFactory: () => "trace-1"
     });
@@ -44,6 +44,79 @@ describe("Headless ClawChat Pi Extension", () => {
     expect(controller.isActive()).toBe(false);
   });
 
+  it("keeps only the final assistant text when the active chat uses minimal mode", async () => {
+    const handlers = new Map<string, Function>();
+    const sent: ClawchatOutboundMessage[] = [];
+    const { extension, controller } = createHeadlessClawchatPiExtension({
+      transport: {
+        send: async (message) => {
+          sent.push(message);
+        }
+      },
+      outputMode: () => "minimal"
+    });
+    extension({ on: (event: string, handler: Function) => handlers.set(event, handler) } as never);
+
+    await controller.beginTurn(inboundMessage());
+    await handlers.get("message_end")!({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "I will check." }] }
+    });
+    await handlers.get("message_end")!({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "It is raining." }] }
+    });
+    expect(sent.filter((message) => message.event === "message.send")).toHaveLength(0);
+
+    await handlers.get("agent_settled")!({ type: "agent_settled" });
+
+    const replies = sent.filter((message) => message.event === "message.send");
+    expect(replies).toHaveLength(1);
+    expect(replies[0]?.payload.message.body.fragments).toEqual([{ kind: "text", text: "It is raining." }]);
+  });
+
+  it("does not flush buffered minimal text after a terminal ClawChat tool sends the reply", async () => {
+    const handlers = new Map<string, Function>();
+    const registeredTools = new Map<string, { execute: (id: string, args: unknown) => Promise<unknown> }>();
+    const sent: ClawchatOutboundMessage[] = [];
+    const sendFrame = vi.fn(async () => undefined);
+    const { extension, controller } = createHeadlessClawchatPiExtension({
+      transport: {
+        send: async (message) => {
+          sent.push(message);
+        }
+      },
+      outputMode: () => "minimal",
+      tools: {
+        api: {},
+        memory: {},
+        profile: () => ({}),
+        sendFrame
+      } as never
+    });
+    extension({
+      on: (event: string, handler: Function) => handlers.set(event, handler),
+      registerTool: (tool: { name: string; execute: (id: string, args: unknown) => Promise<unknown> }) =>
+        registeredTools.set(tool.name, tool)
+    } as never);
+
+    await controller.beginTurn(inboundMessage());
+    await handlers.get("message_end")!({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "I will send it." }] }
+    });
+    await registeredTools.get("clawchat_mention_message")!.execute("call-1", {
+      chatId: "chat-1",
+      chatType: "direct",
+      mentions: [{ userId: "user-2", display: "Alice" }],
+      text: "done"
+    });
+    await handlers.get("agent_settled")!({ type: "agent_settled" });
+
+    expect(sendFrame).toHaveBeenCalledOnce();
+    expect(sent.filter((message) => message.event === "message.send")).toHaveLength(0);
+  });
+
   it("binds an Awareness Turn to owner memory, tools, direct output, and cleanup", async () => {
     const handlers = new Map<string, Function>();
     const registeredTools = new Map<string, { execute: (id: string, args: unknown) => Promise<unknown> }>();
@@ -64,7 +137,7 @@ describe("Headless ClawChat Pi Extension", () => {
           sent.push(message);
         }
       },
-      toolsVisible: () => false,
+      outputMode: () => "normal",
       tools: {
         api: {},
         memory: { renderTurnContext },
@@ -80,7 +153,7 @@ describe("Headless ClawChat Pi Extension", () => {
     await controller.beginAwarenessTurn({
       target: { chatId: "owner-chat-1", chatType: "direct" },
       auditSource: "notify-1",
-      outputVisibility: { thinking: false, tools: false },
+      outputMode: "normal",
       toolContext: { chatId: "owner-chat-1", chatType: "direct" }
     });
     const prompt = await handlers.get("before_agent_start")!({ systemPrompt: "base" });
@@ -138,7 +211,7 @@ describe("Headless ClawChat Pi Extension", () => {
           if (message.event === "message.send") throw new Error("transport failed");
         }
       },
-      toolsVisible: () => false
+      outputMode: () => "normal"
     });
     extension({
       on: (event: string, handler: Function) => handlers.set(event, handler),
@@ -146,7 +219,7 @@ describe("Headless ClawChat Pi Extension", () => {
     } as never);
     await controller.beginAwarenessTurn({
       target: { chatId: "owner-chat-1", chatType: "direct" },
-      outputVisibility: { thinking: false, tools: false },
+      outputMode: "normal",
       toolContext: { chatId: "owner-chat-1", chatType: "direct" }
     });
 
@@ -168,7 +241,7 @@ describe("Headless ClawChat Pi Extension", () => {
           sent.push(message);
         }
       },
-      toolsVisible: () => false
+      outputMode: () => "minimal"
     });
     extension({
       on: (event: string, handler: Function) => handlers.set(event, handler),
@@ -176,8 +249,12 @@ describe("Headless ClawChat Pi Extension", () => {
     } as never);
     await controller.beginAwarenessTurn({
       target: { chatId: "owner-chat-1", chatType: "direct" },
-      outputVisibility: { thinking: false, tools: false },
+      outputMode: "minimal",
       toolContext: { chatId: "owner-chat-1", chatType: "direct" }
+    });
+    await handlers.get("message_end")!({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "partial answer" }] }
     });
 
     await controller.abortTurn();

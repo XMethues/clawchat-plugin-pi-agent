@@ -1,10 +1,15 @@
 import type { GatewayStore } from "./gateway-store.js";
 import { extractInboundText } from "./inbound.js";
+import {
+  parseOutputModeCommand,
+  type ClawchatOutputMode,
+  type ClawchatOutputModeOverride
+} from "./output-settings.js";
 import type { ClawchatInboundMessage } from "./types.js";
 
 export type InboundControl =
   | { type: "group"; value: "mention" | "all" | "muted" }
-  | { type: "tools"; value: "on" | "off" | "inherit" };
+  | { type: "output"; value: ClawchatOutputModeOverride };
 
 export interface InboundDecision {
   dispatch: boolean;
@@ -15,23 +20,23 @@ export interface ClawchatInboundRouterOptions {
   store: GatewayStore;
   agentUserId: string;
   reply: (message: ClawchatInboundMessage, text: string) => Promise<void>;
-  toolCallsDefault?: "on" | "off";
-  onToolOutputChanged?: (chatId: string) => Promise<void> | void;
+  modeDefault?: ClawchatOutputMode;
+  onOutputModeChanged?: (chatId: string) => Promise<void> | void;
 }
 
 export class ClawchatInboundRouter {
   private readonly store: GatewayStore;
   private readonly agentUserId: string;
   private readonly reply: (message: ClawchatInboundMessage, text: string) => Promise<void>;
-  private readonly toolCallsDefault: "on" | "off";
-  private readonly onToolOutputChanged: ((chatId: string) => Promise<void> | void) | undefined;
+  private readonly modeDefault: ClawchatOutputMode;
+  private readonly onOutputModeChanged: ((chatId: string) => Promise<void> | void) | undefined;
 
   constructor(options: ClawchatInboundRouterOptions) {
     this.store = options.store;
     this.agentUserId = options.agentUserId;
     this.reply = options.reply;
-    this.toolCallsDefault = options.toolCallsDefault ?? "off";
-    this.onToolOutputChanged = options.onToolOutputChanged;
+    this.modeDefault = options.modeDefault ?? "normal";
+    this.onOutputModeChanged = options.onOutputModeChanged;
   }
 
   classify(message: ClawchatInboundMessage): InboundDecision {
@@ -45,13 +50,15 @@ export class ClawchatInboundRouter {
         control: { type: "group", value: groupCommand[1]!.toLowerCase() as "mention" | "all" | "muted" }
       };
     }
-    const toolsCommand = /^\/clawchat-output\s+tools\s+(on|off|inherit)\s*$/i.exec(text);
-    if (toolsCommand) {
+    const outputCommand = /^\/clawchat-output\s+(.+?)\s*$/i.exec(text);
+    const outputMode = outputCommand ? parseOutputModeCommand(outputCommand[1]!) : undefined;
+    if (outputMode) {
       return {
         dispatch: false,
-        control: { type: "tools", value: toolsCommand[1]!.toLowerCase() as "on" | "off" | "inherit" }
+        control: { type: "output", value: outputMode }
       };
     }
+    if (/^\/clawchat-output(?:\s|$)/i.test(text)) return { dispatch: false };
 
     if (message.chat_type === "direct") return { dispatch: true };
     const mode = this.store.getGroupDispatchMode(message.chat_id);
@@ -73,13 +80,13 @@ export class ClawchatInboundRouter {
       return;
     }
 
-    this.store.setToolOutputOverride(message.chat_id, control.value);
-    await this.onToolOutputChanged?.(message.chat_id);
-    const override = this.store.getToolOutputOverrides()[message.chat_id];
-    const effective = override ?? this.toolCallsDefault;
+    this.store.setOutputModeOverride(message.chat_id, control.value);
+    await this.onOutputModeChanged?.(message.chat_id);
+    const override = this.store.getOutputModeOverrides()[message.chat_id];
+    const effective = override ?? this.modeDefault;
     await this.reply(
       message,
-      `ClawChat tool output: ${control.value} (effective: ${effective}).`
+      `ClawChat output mode: effective ${effective}; profile default ${this.modeDefault}; override ${override ?? "inherit"}.`
     );
   }
 }

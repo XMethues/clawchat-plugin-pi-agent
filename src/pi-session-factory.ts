@@ -11,6 +11,7 @@ import { createHeadlessClawchatPiExtension } from "./headless-extension.js";
 import { renderInboundPrompt } from "./inbound.js";
 import type { ChatSessionDriver, ChatSessionFactory } from "./session-registry.js";
 import type { ClawchatInboundMessage, ClawchatTransport } from "./types.js";
+import type { ClawchatOutputMode } from "./output-settings.js";
 import type { ClawchatToolEnvironment } from "./clawchat-tools.js";
 
 export interface PiChatSessionFactoryOptions {
@@ -19,7 +20,7 @@ export interface PiChatSessionFactoryOptions {
   store: GatewayStore;
   transport: ClawchatTransport;
   sessionDir?: string;
-  toolCallsDefault?: "on" | "off";
+  outputModeDefault?: ClawchatOutputMode;
   tools?: ClawchatToolEnvironment;
 }
 
@@ -30,7 +31,7 @@ export class PiChatSessionFactory implements ChatSessionFactory {
   private readonly transport: ClawchatTransport;
   private readonly newSessions = new Map<string, SessionManager>();
   private readonly sessionDir: string | undefined;
-  private readonly toolCallsDefault: "on" | "off";
+  private readonly outputModeDefault: ClawchatOutputMode;
   private readonly tools: ClawchatToolEnvironment | undefined;
 
   constructor(options: PiChatSessionFactoryOptions) {
@@ -39,7 +40,7 @@ export class PiChatSessionFactory implements ChatSessionFactory {
     this.store = options.store;
     this.transport = options.transport;
     this.sessionDir = options.sessionDir;
-    this.toolCallsDefault = options.toolCallsDefault ?? "off";
+    this.outputModeDefault = options.outputModeDefault ?? "normal";
     this.tools = options.tools;
   }
 
@@ -76,10 +77,8 @@ export class PiChatSessionFactory implements ChatSessionFactory {
     const settingsManager = SettingsManager.create(this.workspace, this.agentDir);
     const headless = createHeadlessClawchatPiExtension({
       transport: this.transport,
-      toolsVisible: () => {
-        const override = this.store.getToolOutputOverrides()[mapping.chatId];
-        return (override ?? this.toolCallsDefault) === "on";
-      },
+      outputMode: () =>
+        this.store.getOutputModeOverrides()[mapping.chatId] ?? this.outputModeDefault,
       ...(this.tools ? { tools: this.tools } : {})
     });
     const resourceLoader = new DefaultResourceLoader({
@@ -108,12 +107,8 @@ export class PiChatSessionFactory implements ChatSessionFactory {
           await headless.controller.beginAwarenessTurn({
             target: { chatId: mapping.chatId, chatType: "direct" },
             auditSource: turn.messageId,
-            outputVisibility: {
-              thinking: session.thinkingLevel !== "off",
-              tools:
-                (this.store.getToolOutputOverrides()[mapping.chatId] ?? this.toolCallsDefault) ===
-                "on"
-            },
+            outputMode:
+              this.store.getOutputModeOverrides()[mapping.chatId] ?? this.outputModeDefault,
             toolContext: { chatId: mapping.chatId, chatType: "direct" }
           });
           try {

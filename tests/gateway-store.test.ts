@@ -226,16 +226,52 @@ describe("GatewayStore", () => {
     reopened.close();
   });
 
-  it("persists and clears per-chat tool-output overrides", async () => {
+  it("persists mode overrides across restarts and clears inherit overrides", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const path = join(directory, "gateway.sqlite");
+    const store = GatewayStore.open(path);
+
+    store.setOutputModeOverride("chat-1", "minimal");
+    store.setOutputModeOverride("chat-2", "full");
+    store.close();
+
+    const reopened = GatewayStore.open(path);
+    expect(reopened.getOutputModeOverrides()).toEqual({ "chat-1": "minimal", "chat-2": "full" });
+    reopened.setOutputModeOverride("chat-1", "inherit");
+    expect(reopened.getOutputModeOverrides()).toEqual({ "chat-2": "full" });
+    reopened.close();
+  });
+
+  it("maps legacy tool-output overrides onto output modes", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const path = join(directory, "gateway.sqlite");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE chat_output_settings (
+        chat_id TEXT PRIMARY KEY,
+        tool_calls TEXT NOT NULL CHECK (tool_calls IN ('on', 'off')),
+        updated_at INTEGER NOT NULL
+      ) STRICT;
+      INSERT INTO chat_output_settings (chat_id, tool_calls, updated_at)
+      VALUES ('chat-full', 'on', 1), ('chat-normal', 'off', 2);
+    `);
+    legacy.close();
+
+    const migrated = GatewayStore.open(path);
+    expect(migrated.getOutputModeOverrides()).toEqual({
+      "chat-full": "full",
+      "chat-normal": "normal"
+    });
+    migrated.close();
+  });
+
+  it("rejects invalid output modes explicitly", async () => {
     const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
     const store = GatewayStore.open(join(directory, "gateway.sqlite"));
 
-    store.setToolOutputOverride("chat-1", "on");
-    store.setToolOutputOverride("chat-2", "off");
-    expect(store.getToolOutputOverrides()).toEqual({ "chat-1": "on", "chat-2": "off" });
-
-    store.setToolOutputOverride("chat-1", "inherit");
-    expect(store.getToolOutputOverrides()).toEqual({ "chat-2": "off" });
+    expect(() => store.setOutputModeOverride("chat-1", "verbose" as never)).toThrow(
+      "Invalid ClawChat output mode"
+    );
     store.close();
   });
 

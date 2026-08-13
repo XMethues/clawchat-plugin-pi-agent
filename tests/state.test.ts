@@ -40,7 +40,7 @@ describe("ClawChat Extension profile state", () => {
       agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" },
       deviceId: prepared.deviceId,
       workspace: await realpath(workspace),
-      output: { toolCallsDefault: "off", chatOverrides: {} }
+      output: { modeDefault: "normal", chatOverrides: {} }
     });
     expect((await stat(getClawchatStatePath(options))).mode & 0o777).toBe(0o600);
   });

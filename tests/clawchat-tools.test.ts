@@ -140,7 +140,7 @@ function toolEnvironment(
       mediaUrl: "https://app.clawling.com",
       accessToken: "token-1",
       agent: { id: "agent-id-1", userId: "agent-1", ownerId: "owner-1" },
-      output: { toolCallsDefault: "off" }
+      output: { modeDefault: "normal" }
     }),
     api: api as unknown as ClawchatToolEnvironment["api"],
     memory: {} as ClawchatMemoryStore,

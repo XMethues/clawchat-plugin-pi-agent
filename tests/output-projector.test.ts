@@ -26,7 +26,7 @@ function inboundMessage(): ClawchatInboundMessage {
 }
 
 describe("ClawchatOutputProjector", () => {
-  it("materializes completed output without quoting a direct message", async () => {
+  it("sends assistant text, Markdown thinking, and completed tools in full mode", async () => {
     const sent: ClawchatOutboundMessage[] = [];
     const transport: ClawchatTransport = {
       send: vi.fn(async (message) => {
@@ -51,11 +51,11 @@ describe("ClawchatOutputProjector", () => {
           ]
         }
       } as unknown as MessageEndEvent,
-      { thinking: true, tools: true }
+      "full"
     );
     await projector.handle(
       { type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: { path: "README.md" } },
-      { thinking: true, tools: true }
+      "full"
     );
     await projector.handle(
       {
@@ -65,7 +65,7 @@ describe("ClawchatOutputProjector", () => {
         result: { content: [{ type: "text", text: "contents" }] },
         isError: false
       } as ToolExecutionEndEvent,
-      { thinking: true, tools: true }
+      "full"
     );
     await projector.endTurn();
 
@@ -78,9 +78,18 @@ describe("ClawchatOutputProjector", () => {
     ]);
     const replies = sent.filter((message) => message.event === "message.send");
     expect(replies.map((message) => message.payload.message_mode)).toEqual(["thinking", "normal", "tool"]);
-    expect(replies[0]?.payload.message.body.fragments).toEqual([{ kind: "text", text: "inspect first" }]);
+    expect(replies[0]?.payload.message.body.fragments).toEqual([
+      { kind: "text", text: "### Thinking\n\n```text\ninspect first\n```" }
+    ]);
     expect(replies[1]?.payload.message.body.fragments).toEqual([{ kind: "text", text: "I found it." }]);
-    expect(replies[2]?.payload.message.body.fragments[0]).toMatchObject({ text: expect.stringContaining("README.md") });
+    expect(replies[2]?.payload.message.body.fragments).toEqual([{
+      kind: "text",
+      text: [
+        "### 🔧 Tool: `read`",
+        "**Arguments**\n```json\n{\n  \"path\": \"README.md\"\n}\n```",
+        "**✅ Result**\n```json\n{\n  \"content\": [\n    {\n      \"type\": \"text\",\n      \"text\": \"contents\"\n    }\n  ]\n}\n```"
+      ].join("\n\n")
+    }]);
     expect(replies[1]).toMatchObject({
       chat_id: "chat-1",
       to: { id: "chat-1", type: "direct" },
@@ -98,6 +107,36 @@ describe("ClawchatOutputProjector", () => {
     expect(sent.every((message) => !["message.created", "message.add", "message.done"].includes(message.event))).toBe(
       true
     );
+  });
+
+  it("uses a longer Markdown fence when tool output contains backticks", async () => {
+    const sent: ClawchatOutboundMessage[] = [];
+    const projector = new ClawchatOutputProjector({
+      transport: { send: async (message) => { sent.push(message); } }
+    });
+
+    await projector.beginTurn(outputTurnFromInbound(inboundMessage()));
+    await projector.handle(
+      { type: "tool_execution_start", toolCallId: "call-1", toolName: "bash", args: undefined },
+      "full"
+    );
+    await projector.handle(
+      {
+        type: "tool_execution_end",
+        toolCallId: "call-1",
+        toolName: "bash",
+        result: "line\n```\nline",
+        isError: true
+      } as ToolExecutionEndEvent,
+      "full"
+    );
+    await projector.endTurn();
+
+    const tool = sent.find((message) => message.event === "message.send");
+    expect(tool?.payload.message.body.fragments).toEqual([{
+      kind: "text",
+      text: "### 🔧 Tool: `bash`\n\n**❌ Error**\n````text\nline\n```\nline\n````"
+    }]);
   });
 
   it("quotes the triggering message in a group reply", async () => {
@@ -134,14 +173,130 @@ describe("ClawchatOutputProjector", () => {
     });
   });
 
-  it("does not materialize thinking or tool events when their visibility is off", async () => {
-    const transport: ClawchatTransport = { send: vi.fn(async () => undefined) };
-    const projector = new ClawchatOutputProjector({ transport });
+  it("sends only the final non-empty assistant result for a direct chat in minimal mode", async () => {
+    const sent: ClawchatOutboundMessage[] = [];
+    const projector = new ClawchatOutputProjector({
+      transport: { send: async (message) => { sent.push(message); } }
+    });
+
+    await projector.beginTurn(outputTurnFromInbound(inboundMessage()));
+    await projector.handle(
+      {
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "hidden" },
+            { type: "text", text: "Draft answer" }
+          ]
+        }
+      } as unknown as MessageEndEvent,
+      "minimal"
+    );
+    await projector.handle(
+      {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "   " }] }
+      } as unknown as MessageEndEvent,
+      "minimal"
+    );
+    await projector.handle(
+      {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "Final answer" }] }
+      } as unknown as MessageEndEvent,
+      "minimal"
+    );
+    await projector.endTurn();
+
+    expect(sent.map((message) => message.event)).toEqual([
+      "typing.update",
+      "message.send",
+      "typing.update"
+    ]);
+    expect(sent[1]).toMatchObject({
+      event: "message.send",
+      chat_id: "chat-1",
+      to: { id: "chat-1", type: "direct" },
+      payload: {
+        message_mode: "normal",
+        message: {
+          body: { fragments: [{ kind: "text", text: "Final answer" }] },
+          context: { mentions: [], reply: null }
+        }
+      }
+    });
+  });
+
+  it("sends only the final non-empty assistant result as a group reply in minimal mode", async () => {
+    const sent: ClawchatOutboundMessage[] = [];
+    const projector = new ClawchatOutputProjector({
+      transport: { send: async (message) => { sent.push(message); } }
+    });
+    const inbound = inboundMessage();
+    inbound.chat_type = "group";
+    inbound.sender.type = "group";
+
+    await projector.beginTurn(outputTurnFromInbound(inbound));
+    await projector.handle(
+      {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "Group draft" }] }
+      } as unknown as MessageEndEvent,
+      "minimal"
+    );
+    await projector.handle(
+      {
+        type: "message_end",
+        message: { role: "assistant", content: [] }
+      } as unknown as MessageEndEvent,
+      "minimal"
+    );
+    await projector.handle(
+      {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "Group final" }] }
+      } as unknown as MessageEndEvent,
+      "minimal"
+    );
+    await projector.endTurn();
+
+    expect(sent.map((message) => message.event)).toEqual([
+      "typing.update",
+      "message.reply",
+      "typing.update"
+    ]);
+    expect(sent[1]).toMatchObject({
+      event: "message.reply",
+      payload: {
+        message_mode: "normal",
+        message: {
+          body: { fragments: [{ kind: "text", text: "Group final" }] },
+          context: {
+            reply: {
+              reply_to_msg_id: "message-1",
+              reply_preview: {
+                id: "user-1",
+                nick_name: "Alice",
+                fragments: [{ kind: "text", text: "hello pi" }]
+              }
+            }
+          }
+        }
+      }
+    });
+  });
+
+  it("sends every non-empty assistant text and excludes thinking and tools in normal mode", async () => {
+    const sent: ClawchatOutboundMessage[] = [];
+    const projector = new ClawchatOutputProjector({
+      transport: { send: async (message) => { sent.push(message); } }
+    });
 
     await projector.beginTurn(outputTurnFromInbound(inboundMessage()));
     await projector.handle(
       { type: "tool_execution_start", toolCallId: "call-1", toolName: "bash", args: { command: "pwd" } } as ToolExecutionStartEvent,
-      { thinking: false, tools: false }
+      "normal"
     );
     await projector.handle(
       {
@@ -151,22 +306,84 @@ describe("ClawchatOutputProjector", () => {
         result: "ok",
         isError: false
       } as ToolExecutionEndEvent,
-      { thinking: false, tools: false }
+      "normal"
     );
     await projector.handle(
       {
         type: "message_end",
-        message: { role: "assistant", content: [{ type: "thinking", thinking: "hidden" }] }
+        message: {
+          role: "assistant",
+          content: [
+            { type: "thinking", thinking: "hidden" },
+            { type: "text", text: "First answer" }
+          ]
+        }
       } as unknown as MessageEndEvent,
-      { thinking: false, tools: false }
+      "normal"
+    );
+    await projector.handle(
+      {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "" }] }
+      } as unknown as MessageEndEvent,
+      "normal"
+    );
+    await projector.handle(
+      {
+        type: "message_end",
+        message: { role: "assistant", content: [{ type: "text", text: "Final answer" }] }
+      } as unknown as MessageEndEvent,
+      "normal"
     );
     await projector.endTurn();
 
-    expect(vi.mocked(transport.send).mock.calls.map(([message]) => message.event)).toEqual([
+    expect(sent.map((message) => message.event)).toEqual([
       "typing.update",
+      "message.send",
+      "message.send",
       "typing.update"
     ]);
+    const replies = sent.filter((message) => message.event === "message.send");
+    expect(replies.map((message) => ({
+      mode: message.payload.message_mode,
+      fragments: message.payload.message.body.fragments
+    }))).toEqual([
+      { mode: "normal", fragments: [{ kind: "text", text: "First answer" }] },
+      { mode: "normal", fragments: [{ kind: "text", text: "Final answer" }] }
+    ]);
   });
+
+  it.each(["minimal", "normal", "full"] as const)(
+    "does not materialize empty assistant blocks in %s mode",
+    async (mode) => {
+      const sent: ClawchatOutboundMessage[] = [];
+      const projector = new ClawchatOutputProjector({
+        transport: { send: async (message) => { sent.push(message); } }
+      });
+
+      await projector.beginTurn(outputTurnFromInbound(inboundMessage()));
+      await projector.handle(
+        {
+          type: "message_end",
+          message: {
+            role: "assistant",
+            content: [
+              { type: "thinking", thinking: "   " },
+              { type: "text", text: "   " }
+            ]
+          }
+        } as unknown as MessageEndEvent,
+        mode
+      );
+      await projector.endTurn();
+
+      expect(sent.map((message) => message.event)).toEqual([
+        "typing.update",
+        "typing.update"
+      ]);
+    }
+  );
+
   it("uploads MEDIA directives and can force images into document fragments", async () => {
     const sent: ClawchatOutboundMessage[] = [];
     const uploadMedia = vi.fn(async (path: string) => ({
@@ -191,7 +408,7 @@ describe("ClawchatOutputProjector", () => {
           }]
         }
       } as unknown as MessageEndEvent,
-      { thinking: false, tools: false }
+      "normal"
     );
     await projector.endTurn();
 

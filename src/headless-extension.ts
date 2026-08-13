@@ -8,9 +8,9 @@ import {
   ClawchatOutputProjector,
   outputTurnFromInbound,
   type OutputTurn,
-  type OutputVisibility,
   type PiOutputEvent
 } from "./output-projector.js";
+import type { ClawchatOutputMode } from "./output-settings.js";
 import type { ClawchatInboundMessage, ClawchatTransport } from "./types.js";
 import {
   appendClawchatMemoryPrompt,
@@ -23,7 +23,7 @@ import {
 
 export interface HeadlessClawchatPiExtensionOptions {
   transport: ClawchatTransport;
-  toolsVisible: (message: ClawchatInboundMessage) => boolean;
+  outputMode: (message: ClawchatInboundMessage) => ClawchatOutputMode;
   now?: () => number;
   idFactory?: () => string;
   tools?: ClawchatToolEnvironment;
@@ -32,7 +32,7 @@ export interface HeadlessClawchatPiExtensionOptions {
 export interface HostedSessionBinding {
   target: OutputTurn;
   auditSource?: string;
-  outputVisibility: OutputVisibility;
+  outputMode: ClawchatOutputMode;
   toolContext: ActiveClawchatTurn;
 }
 
@@ -77,16 +77,24 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
     }
   };
 
+  const deactivate = async (discardPendingAssistantText: boolean): Promise<void> => {
+    if (!active) return;
+    if (discardPendingAssistantText) projector.discardPendingAssistantText();
+    try {
+      await projector.endTurn();
+    } finally {
+      active = undefined;
+      terminalReplySent = false;
+    }
+  };
+
   const controller: HeadlessExtensionController = {
     beginTurn: async (message) => {
       if (!piApi) throw new Error("Headless Extension is not initialized");
       await activate({
         target: outputTurnFromInbound(message),
         auditSource: message.payload.message_id,
-        outputVisibility: {
-          thinking: piApi.getThinkingLevel() !== "off",
-          tools: options.toolsVisible(message)
-        },
+        outputMode: options.outputMode(message),
         toolContext: {
           chatId: message.chat_id,
           chatType: message.chat_type,
@@ -105,13 +113,7 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
       await activate(binding);
     },
     abortTurn: async () => {
-      if (!active) return;
-      try {
-        await projector.endTurn();
-      } finally {
-        active = undefined;
-        terminalReplySent = false;
-      }
+      await deactivate(true);
     },
     isActive: () => active !== undefined
   };
@@ -122,7 +124,7 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
     if (!active || !piApi) return;
     if (terminalReplySent && (event.type === "message_end" || event.type === "tool_execution_end")) return;
     try {
-      await projector.handle(event as PiOutputEvent, active.outputVisibility);
+      await projector.handle(event as PiOutputEvent, active.outputMode);
     } catch (error: unknown) {
       try {
         await controller.abortTurn();
@@ -154,6 +156,7 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
           }),
         onTerminalSend: () => {
           terminalReplySent = true;
+          projector.discardPendingAssistantText();
         }
       });
     }
@@ -172,7 +175,7 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
     pi.on("tool_execution_start", handleOutput);
     pi.on("tool_execution_end", handleOutput);
     pi.on("agent_settled", async () => {
-      await controller.abortTurn();
+      await deactivate(false);
     });
     pi.on("session_shutdown", async () => {
       await controller.abortTurn();

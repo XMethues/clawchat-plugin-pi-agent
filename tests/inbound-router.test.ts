@@ -108,6 +108,61 @@ describe("ClawchatInboundRouter", () => {
     expect(replies).toEqual(["ClawChat group dispatch: all."]);
     store.close();
   });
+  it("accepts the documented output modes and rejects the retired tools toggle", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-router-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const router = new ClawchatInboundRouter({
+      store,
+      agentUserId: "agent-user-1",
+      reply: async () => undefined
+    });
+
+    for (const mode of ["minimal", "normal", "full", "inherit"] as const) {
+      expect(router.classify(groupMessage(`/clawchat-output ${mode}`, []))).toEqual({
+        dispatch: false,
+        control: { type: "output", value: mode }
+      });
+    }
+    expect(router.classify(groupMessage("/clawchat-output tools on", []))).toEqual({
+      dispatch: false
+    });
+    expect(router.classify(groupMessage("/clawchat-output verbose", []))).toEqual({
+      dispatch: false
+    });
+    const retiredDirect = groupMessage("/clawchat-output tools on", []);
+    retiredDirect.chat_type = "direct";
+    expect(router.classify(retiredDirect)).toEqual({ dispatch: false });
+    const missingDirect = groupMessage("/clawchat-output", []);
+    missingDirect.chat_type = "direct";
+    expect(router.classify(missingDirect)).toEqual({ dispatch: false });
+    store.close();
+  });
+
+  it("reports the effective output mode, profile default, and chat override", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-router-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const replies: string[] = [];
+    const router = new ClawchatInboundRouter({
+      store,
+      agentUserId: "agent-user-1",
+      modeDefault: "normal",
+      reply: async (_message, text) => {
+        replies.push(text);
+      }
+    });
+    const full = groupMessage("/clawchat-output full", []);
+    const inherit = groupMessage("/clawchat-output inherit", []);
+
+    await router.applyAcceptedControl(full, router.classify(full));
+    await router.applyAcceptedControl(inherit, router.classify(inherit));
+
+    expect(replies).toEqual([
+      "ClawChat output mode: effective full; profile default normal; override full.",
+      "ClawChat output mode: effective normal; profile default normal; override inherit."
+    ]);
+    store.close();
+  });
+
 });
 
 function groupMessage(text: string, mentions: unknown): ClawchatInboundMessage {

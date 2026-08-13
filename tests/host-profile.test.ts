@@ -44,7 +44,7 @@ describe("HostProfileRepository", () => {
       ownerChatId: "owner-chat-1",
       refreshToken: "opaque refresh token",
       agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" },
-      output: { toolCallsDefault: "off" }
+      output: { modeDefault: "normal" }
     });
     expect(prepared.deviceId).toBe("clawchat-pi-device-1");
     expect((await stat(profiles.profilePath("default"))).mode & 0o777).toBe(0o600);
@@ -118,7 +118,7 @@ describe("HostProfileRepository", () => {
       deviceId: "clawchat-pi-device-1",
       accessToken: "access-2",
       agent: { userId: "user-2", ownerId: "owner-2" },
-      output: { toolCallsDefault: "off" }
+      output: { modeDefault: "normal" }
     });
   });
 
@@ -153,7 +153,7 @@ describe("HostProfileRepository", () => {
         accessToken: "opaque-not-jwt",
         refreshToken: "opaque-refresh",
         agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" },
-        output: { toolCallsDefault: "off" }
+        output: { toolCallsDefault: "on" }
       })
     );
 
@@ -164,12 +164,71 @@ describe("HostProfileRepository", () => {
       mediaUrl: "https://app.clawling.com",
       accessToken: "opaque-not-jwt",
       refreshToken: "opaque-refresh",
-      agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" }
+      agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" },
+      output: { modeDefault: "full" }
     });
     expect(JSON.parse(await readFile(profiles.profilePath("default"), "utf8"))).toMatchObject({
       schemaVersion: 2,
-      mediaUrl: "https://app.clawling.com"
+      mediaUrl: "https://app.clawling.com",
+      output: { modeDefault: "full" }
     });
+  });
+
+  it("migrates current-schema tool-output defaults to output modes", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-profile-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const profiles = new HostProfileRepository({ agentDir });
+    await mkdir(profiles.profileDirectory("default"), { recursive: true });
+    await writeFile(
+      profiles.profilePath("default"),
+      JSON.stringify({
+        schemaVersion: 2,
+        name: "default",
+        workspace: await realpath(workspace),
+        deviceId: "device-1",
+        restUrl: "https://app.clawling.com",
+        websocketUrl: "wss://app.clawling.com/ws",
+        mediaUrl: "https://app.clawling.com",
+        accessToken: "access",
+        agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" },
+        output: { toolCallsDefault: "off" }
+      })
+    );
+
+    await expect(profiles.load("default")).resolves.toMatchObject({
+      output: { modeDefault: "normal" }
+    });
+    expect(JSON.parse(await readFile(profiles.profilePath("default"), "utf8"))).toMatchObject({
+      output: { modeDefault: "normal" }
+    });
+  });
+
+  it("rejects invalid profile output modes explicitly", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-profile-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const profiles = new HostProfileRepository({ agentDir });
+    await mkdir(profiles.profileDirectory("default"), { recursive: true });
+    await writeFile(
+      profiles.profilePath("default"),
+      JSON.stringify({
+        schemaVersion: 2,
+        name: "default",
+        workspace: await realpath(workspace),
+        deviceId: "device-1",
+        restUrl: "https://app.clawling.com",
+        websocketUrl: "wss://app.clawling.com/ws",
+        mediaUrl: "https://app.clawling.com",
+        accessToken: "access",
+        agent: { id: "agent-1", userId: "user-1", ownerId: "owner-1" },
+        output: { modeDefault: "verbose" }
+      })
+    );
+
+    await expect(profiles.load("default")).rejects.toThrow(
+      "Invalid Host Profile output.modeDefault"
+    );
   });
 
   it("requires explicit Media configuration to migrate custom legacy endpoints", async () => {

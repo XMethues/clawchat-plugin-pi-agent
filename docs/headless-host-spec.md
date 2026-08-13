@@ -80,7 +80,7 @@ State lives below Pi's agent directory:
 - opaque access and refresh credentials, never decoded for claims;
 - required structured ClawChat agent ID, agent-user ID, and owner ID from
   Activation;
-- default Tool Output Visibility, initially `off`.
+- default ClawChat Output Mode, initially `normal`.
 
 `gateway.sqlite` is mode `0600` and is the Gateway Store described in ADR 0011. It stores protocol and routing state, not model context or secrets duplicated from the profile file.
 
@@ -234,10 +234,15 @@ Integration control commands are recognized before group dispatch policy, never 
 
 ```text
 /clawchat-group mention|all|muted
-/clawchat-output tools on|off|inherit
+/clawchat-output minimal|normal|full|inherit
 ```
 
-`/clawchat-group` is valid only in a group. `/clawchat-output` persists a per-Chat-Session Tool Output Visibility override. Consistent with Execution Authority, the integration does not add an owner-only command gate; any participant whose message reaches the ClawChat agent can issue these integration commands.
+`/clawchat-group` is valid only in a group. `/clawchat-output` persists a
+per-Chat-Session Output Mode override. Its status reply reports the effective
+mode, the Host Profile default, and the chat override; `inherit` deletes the
+override and follows the profile default. Consistent with Execution Authority,
+the integration does not add an owner-only command gate; any participant whose
+message reaches the ClawChat agent can issue these integration commands.
 
 Unsupported ClawChat content is durably acknowledged and marked skipped. It is not rendered into synthetic prompt text.
 
@@ -290,15 +295,34 @@ The inbound prompt contains the accepted materialized text and the minimum sende
 
 Output follows these rules:
 
-- emit `typing.update(active=true)` when a Pi turn starts and best-effort `typing.update(active=false)` when it settles or aborts;
-- send final assistant text exactly as complete Pi output, without adapter-authored rewriting;
-- when the Pi session's native thinking level is not `off`, send completed thinking as a separate materialized reply with `message_mode: "thinking"`;
-- send completed tool calls only when the effective Tool Output Visibility is `on`, with `message_mode: "tool"`;
-- default Tool Output Visibility is `off`; per-chat `on`, `off`, and `inherit` overrides persist in the Gateway Store;
-- emit no `message.created`, `message.add`, `message.done`, or `message.failed` frames;
+- emit `typing.update(active=true)` when a Pi turn starts and best-effort
+  `typing.update(active=false)` when it settles or aborts;
+- resolve the effective Output Mode from the per-chat override or the Host
+  Profile default, which is initially `normal`;
+- `minimal`: buffer assistant text for the turn and, when the turn settles, send
+  only the last non-empty assistant text block;
+- `normal`: send every completed assistant text block and exclude thinking and
+  tool events;
+- `full`: send every completed assistant text block, completed thinking, and
+  completed tool output;
+- send thinking under a Markdown heading with its content in a fenced code
+  block and `message_mode: "thinking"`;
+- send completed tool arguments and results or errors under an emoji-labelled
+  Markdown heading with fenced code blocks and `message_mode: "tool"`;
+- persist per-chat `minimal`, `normal`, and `full` overrides in the Gateway
+  Store; `inherit` removes the override;
+- emit no `message.created`, `message.add`, `message.done`, or `message.failed`
+  frames;
 - emit no synthetic assistant failure or busy message.
 
-The Gateway sends what Pi produces subject only to the explicit thinking and tool-visibility policies above. It does not summarize, redact, or reinterpret assistant output.
+For example, if a weather request produces “I’ll check the weather,” a completed
+weather-tool result, and a final forecast, `minimal` sends only the forecast;
+`normal` sends both assistant text blocks but neither thinking nor the tool
+result; and `full` additionally sends completed thinking and the tool result.
+The mode changes projection only, never tool execution.
+
+The Gateway sends what Pi produces subject only to the effective Output Mode. It
+does not summarize, redact, or reinterpret assistant output.
 
 ## Execution authority
 
@@ -351,7 +375,8 @@ Structured logs include profile name, connection generation, `chat_id`, turn ID,
 - An unacknowledged outbound reply retains one durable canonical `message_id`
   through ACK-timeout/backoff/replay reconciliation and process restart;
   `trace_id` remains only its ACK/error correlation key.
-- Thinking output follows the Pi thinking level; tool output follows profile default plus the per-chat override.
+- Output projection follows the effective `minimal`, `normal`, or `full` mode;
+  `inherit` resumes the Host Profile default.
 - No streaming lifecycle frame or synthetic busy/failure reply is emitted.
 - A stopped Host session opens through `pi --session <path>` and is subsequently reusable by the Host.
 - A second Host process for the same profile fails fast, while another profile with another Workspace can run concurrently.

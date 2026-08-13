@@ -43,15 +43,19 @@ export type {
 } from "./inbound-router.js";
 export { extractInboundText, renderInboundPrompt } from "./inbound.js";
 export { ClawchatOutputProjector, outputTurnFromInbound } from "./output-projector.js";
-export type { OutputProjectorOptions, OutputTurn, OutputVisibility, PiOutputEvent } from "./output-projector.js";
+export type { OutputProjectorOptions, OutputTurn, PiOutputEvent } from "./output-projector.js";
 export {
   defaultClawchatOutputSettings,
   normalizeClawchatOutputSettings,
-  parseToolOutputCommand,
-  resolveToolOutput,
-  withToolOutputOverride
+  parseOutputModeCommand,
+  resolveOutputMode,
+  withOutputModeOverride
 } from "./output-settings.js";
-export type { ClawchatOutputSettings, ToolOutputOverride, ToolOutputValue } from "./output-settings.js";
+export type {
+  ClawchatOutputMode,
+  ClawchatOutputModeOverride,
+  ClawchatOutputSettings
+} from "./output-settings.js";
 export { PiChatSessionFactory } from "./pi-session-factory.js";
 export type { PiChatSessionFactoryOptions } from "./pi-session-factory.js";
 export { ChatSessionRegistry } from "./session-registry.js";

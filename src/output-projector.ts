@@ -3,6 +3,7 @@ import type {
   ToolExecutionEndEvent,
   ToolExecutionStartEvent
 } from "@earendil-works/pi-coding-agent";
+import type { ClawchatOutputMode } from "./output-settings.js";
 import type {
   ClawchatInboundMessage,
   ClawchatMessageMode,
@@ -15,10 +16,6 @@ import type {
 
 export type PiOutputEvent = MessageEndEvent | ToolExecutionStartEvent | ToolExecutionEndEvent;
 
-export interface OutputVisibility {
-  thinking: boolean;
-  tools: boolean;
-}
 
 export type OutputTurn =
   | {
@@ -47,6 +44,7 @@ export class ClawchatOutputProjector {
   private readonly uploadMedia: ((filePath: string) => Promise<Record<string, unknown>>) | undefined;
   private readonly toolArguments = new Map<string, unknown>();
   private activeTurn: OutputTurn | undefined;
+  private minimalAssistantText: string | undefined;
 
   constructor(options: OutputProjectorOptions) {
     this.transport = options.transport;
@@ -57,17 +55,19 @@ export class ClawchatOutputProjector {
 
   async beginTurn(turn: OutputTurn): Promise<void> {
     if (this.activeTurn) throw new Error("A ClawChat output turn is already active");
+    this.minimalAssistantText = undefined;
     this.activeTurn = turn;
     try {
       await this.sendTyping(turn, true);
     } catch (error: unknown) {
       this.activeTurn = undefined;
       this.toolArguments.clear();
+      this.minimalAssistantText = undefined;
       throw error;
     }
   }
 
-  async handle(event: PiOutputEvent, visibility: OutputVisibility): Promise<void> {
+  async handle(event: PiOutputEvent, mode: ClawchatOutputMode): Promise<void> {
     const turn = this.activeTurn;
     if (!turn) return;
 
@@ -79,7 +79,7 @@ export class ClawchatOutputProjector {
     if (event.type === "tool_execution_end") {
       const args = this.toolArguments.get(event.toolCallId);
       this.toolArguments.delete(event.toolCallId);
-      if (visibility.tools) {
+      if (mode === "full") {
         await this.sendMaterialized(turn, formatToolOutput(event, args), "tool");
       }
       return;
@@ -87,29 +87,47 @@ export class ClawchatOutputProjector {
 
     if (event.message.role !== "assistant") return;
 
-    if (visibility.thinking) {
+    if (mode === "full") {
       const thinking = event.message.content
         .flatMap((part) =>
           part.type === "thinking" && !part.redacted && part.thinking ? [part.thinking] : []
         )
         .join("\n\n");
-      if (thinking) await this.sendMaterialized(turn, thinking, "thinking");
+      if (thinking.trim()) {
+        await this.sendMaterialized(turn, `### Thinking\n\n${formatCodeBlock(thinking)}`, "thinking");
+      }
     }
 
     const text = event.message.content
       .flatMap((part) => (part.type === "text" && part.text ? [part.text] : []))
       .join("\n\n");
-    if (text) await this.sendMaterialized(turn, text, "normal");
+    if (!text.trim()) return;
+    if (mode === "minimal") {
+      this.minimalAssistantText = text;
+      return;
+    }
+    await this.sendMaterialized(turn, text, "normal");
+  }
+
+  discardPendingAssistantText(): void {
+    this.minimalAssistantText = undefined;
   }
 
   async endTurn(): Promise<void> {
     const turn = this.activeTurn;
     if (!turn) return;
     try {
-      await this.sendTyping(turn, false);
+      if (this.minimalAssistantText !== undefined) {
+        await this.sendMaterialized(turn, this.minimalAssistantText, "normal");
+      }
     } finally {
-      this.activeTurn = undefined;
-      this.toolArguments.clear();
+      try {
+        await this.sendTyping(turn, false);
+      } finally {
+        this.activeTurn = undefined;
+        this.minimalAssistantText = undefined;
+        this.toolArguments.clear();
+      }
     }
   }
 
@@ -250,10 +268,27 @@ function mediaFragment(value: Record<string, unknown>): Extract<ClawchatFragment
 }
 
 function formatToolOutput(event: ToolExecutionEndEvent, args: unknown): string {
-  const sections = [`Tool: ${event.toolName}`];
-  if (args !== undefined) sections.push(`Arguments:\n${formatValue(args)}`);
-  sections.push(`${event.isError ? "Error" : "Result"}:\n${formatValue(event.result)}`);
+  const sections = [`### 🔧 Tool: \`${event.toolName}\``];
+  if (args !== undefined) sections.push(`**Arguments**\n${formatCodeBlock(args)}`);
+  sections.push(`**${event.isError ? "❌ Error" : "✅ Result"}**\n${formatCodeBlock(event.result)}`);
   return sections.join("\n\n");
+}
+
+function formatCodeBlock(value: unknown): string {
+  const rendered = formatValue(value);
+  let longestRun = 0;
+  let currentRun = 0;
+  for (const character of rendered) {
+    if (character === "`") {
+      currentRun += 1;
+      if (currentRun > longestRun) longestRun = currentRun;
+    } else {
+      currentRun = 0;
+    }
+  }
+  const fence = "`".repeat(Math.max(3, longestRun + 1));
+  const language = typeof value === "object" && value !== null ? "json" : "text";
+  return `${fence}${language}\n${rendered}\n${fence}`;
 }
 
 function formatValue(value: unknown): string {

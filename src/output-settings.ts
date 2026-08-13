@@ -1,14 +1,14 @@
-export type ToolOutputValue = "on" | "off";
-export type ToolOutputOverride = ToolOutputValue | "inherit";
+export type ClawchatOutputMode = "minimal" | "normal" | "full";
+export type ClawchatOutputModeOverride = ClawchatOutputMode | "inherit";
 
 export interface ClawchatOutputSettings {
-  toolCallsDefault: ToolOutputValue;
-  chatOverrides: Record<string, ToolOutputValue>;
+  modeDefault: ClawchatOutputMode;
+  chatOverrides: Record<string, ClawchatOutputMode>;
 }
 
 export function defaultClawchatOutputSettings(): ClawchatOutputSettings {
   return {
-    toolCallsDefault: "off",
+    modeDefault: "normal",
     chatOverrides: {}
   };
 }
@@ -16,26 +16,29 @@ export function defaultClawchatOutputSettings(): ClawchatOutputSettings {
 export function normalizeClawchatOutputSettings(value: unknown): ClawchatOutputSettings {
   if (!value || typeof value !== "object") return defaultClawchatOutputSettings();
 
-  const candidate = value as Partial<ClawchatOutputSettings>;
-  const toolCallsDefault = candidate.toolCallsDefault === "on" ? "on" : "off";
-  const chatOverrides: Record<string, ToolOutputValue> = {};
+  const candidate = value as Record<string, unknown>;
+  const modeDefault = normalizeMode(candidate.modeDefault) ??
+    normalizeLegacyToolVisibility(candidate.toolCallsDefault) ??
+    "normal";
+  const chatOverrides: Record<string, ClawchatOutputMode> = {};
   if (candidate.chatOverrides && typeof candidate.chatOverrides === "object") {
     for (const [chatId, override] of Object.entries(candidate.chatOverrides)) {
-      if (override === "on" || override === "off") chatOverrides[chatId] = override;
+      const mode = normalizeMode(override) ?? normalizeLegacyToolVisibility(override);
+      if (mode) chatOverrides[chatId] = mode;
     }
   }
 
-  return { toolCallsDefault, chatOverrides };
+  return { modeDefault, chatOverrides };
 }
 
-export function resolveToolOutput(settings: ClawchatOutputSettings, chatId: string): ToolOutputValue {
-  return settings.chatOverrides[chatId] ?? settings.toolCallsDefault;
+export function resolveOutputMode(settings: ClawchatOutputSettings, chatId: string): ClawchatOutputMode {
+  return settings.chatOverrides[chatId] ?? settings.modeDefault;
 }
 
-export function withToolOutputOverride(
+export function withOutputModeOverride(
   settings: ClawchatOutputSettings,
   chatId: string,
-  override: ToolOutputOverride
+  override: ClawchatOutputModeOverride
 ): ClawchatOutputSettings {
   const chatOverrides = { ...settings.chatOverrides };
   if (override === "inherit") {
@@ -46,8 +49,21 @@ export function withToolOutputOverride(
   return { ...settings, chatOverrides };
 }
 
-export function parseToolOutputCommand(args: string): ToolOutputOverride | undefined {
-  const [subject, value, ...rest] = args.trim().toLowerCase().split(/\s+/);
-  if (subject !== "tools" || rest.length > 0) return undefined;
-  return value === "on" || value === "off" || value === "inherit" ? value : undefined;
+export function parseOutputModeCommand(args: string): ClawchatOutputModeOverride | undefined {
+  const value = args.trim().toLowerCase();
+  return isOutputMode(value) || value === "inherit" ? value : undefined;
+}
+
+function normalizeMode(value: unknown): ClawchatOutputMode | undefined {
+  return typeof value === "string" && isOutputMode(value) ? value : undefined;
+}
+
+function normalizeLegacyToolVisibility(value: unknown): ClawchatOutputMode | undefined {
+  if (value === "on") return "full";
+  if (value === "off") return "normal";
+  return undefined;
+}
+
+function isOutputMode(value: string): value is ClawchatOutputMode {
+  return value === "minimal" || value === "normal" || value === "full";
 }
