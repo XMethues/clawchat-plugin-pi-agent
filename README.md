@@ -4,7 +4,8 @@ Pi package for ClawChat Protocol v2.
 
 This project connects ClawChat to Pi through one shared Protocol v2 core. It
 ships both a standard Pi extension and a long-lived, non-interactive SDK Host.
-It requires Node.js 22.19 or newer and Pi 0.81.1 or newer.
+It requires Node.js 22.19 or newer and Pi 0.84.1 or newer; the Headless Host
+embeds Pi 0.84.1.
 
 ## Status
 
@@ -179,6 +180,44 @@ The package also declares `skills/clawchat-core` and
 runtimes discover them with the extension. Owner memory is injected on every
 ClawChat turn, current-group memory is added for group turns, and user memory
 is available only through explicit memory tools.
+
+### Inbound media
+
+The Headless Pi Host materializes incoming ClawChat media only when its admitted
+Chat Turn begins:
+
+- images use Pi 0.84.1's native conversion and resizing and are passed to a
+  vision-capable current model. A non-vision model still receives numbered
+  placeholders and metadata, but cannot inspect pixels unless it chooses normal
+  tools on a leased local path where one is available; the integration does not
+  add OCR or switch models;
+- recognized text candidates enter the Turn in full only after strict UTF-8 or
+  BOM-marked UTF-16LE/BE and binary-content validation, as complete Pi-style
+  `<file name="private-local-path">...</file>` blocks without truncation or
+  summarization. Invalid or misleading text falls back to generic handoff; and
+- PDF, Office, audio, video, and other generic attachments become numbered
+  descriptors with safe names, metadata, byte size, and a private local path.
+  Pi's normal tools and configured Agent Directory Packages or skills may use
+  that path; the integration does not automatically parse or interpret it.
+
+Download defaults are 100 MiB per attachment and 256 MiB per Turn, with 30
+seconds each for connection and no progress, two minutes per attachment, and
+five minutes per Turn. Network failures and HTTP 408, 429, or 5xx responses
+retry at most once after 250 ms; downloads follow at most five redirects.
+
+Only HTTPS URLs on `clawling.com`, `clawling.chat`, or their subdomains are
+accepted, and every redirect is checked against the same boundary. The remote
+URL remains only in private Gateway Store state: it is never placed in Pi or
+provider-facing prompt text, Reply Delivery, status output, or logs.
+
+Original names are sanitized, made collision-safe, and capped at 120 UTF-8
+bytes. Originals stay outside the Workspace in a private Turn lease and are
+removed after success, failure, cancellation, or Host stop; the next startup
+clears stale leases only after acquiring exclusive Host Profile ownership.
+A Host restart is required after Package installation or any other Agent
+Directory resource change; resources are not hot-reloaded.
+
+### Outbound media
 
 To attach local media, include one or more `MEDIA:<absolute_path>` markers in a
 completed assistant reply. Other text becomes the caption. Images, audio,

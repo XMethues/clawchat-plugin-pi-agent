@@ -104,6 +104,10 @@ _Avoid_: token streaming, synthetic assistant reply, adapter-authored rewriting,
 The conversion of one completed ClawChat streaming-message lifecycle into one accepted message and one possible Pi turn after `message.done`. Partial additions never create turns, failed streams create none, and a later materialized reply with the same message identity never creates a duplicate turn.
 _Avoid_: token-per-turn dispatch, partial-message turn, duplicate polished reply
 
+**Inbound Media Materialization**:
+The bounded conversion or Turn-scoped local handoff of ordered ClawChat image, audio, video, and file fragments without exposing remote media URLs. Original media exists only under a private lease until that Turn settles; native inputs, extracted text, or other derived content may remain in Pi conversation context.
+_Avoid_: URL forwarding, permanent attachment storage, Workspace upload
+
 **Output Mode**:
 The effective `minimal`, `normal`, or `full` policy for projecting Pi output into ClawChat. A Host Profile defaults to `normal`, and each Chat Session may persist a mode override through `/clawchat-output minimal|normal|full|inherit`; `inherit` removes the session override and follows the profile default. A command in one chat never changes another chat's override, and no mode changes Pi tool execution.
 _Avoid_: tool-execution policy, global-only toggle, model instruction, independent thinking switch

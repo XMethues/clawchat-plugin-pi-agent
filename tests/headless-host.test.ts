@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type WebSocket from "ws";
@@ -236,7 +236,10 @@ describe("HeadlessPiHost", () => {
             dseq: 2,
             payload: {}
           }));
-        } else if (frame.event === "message.sync_ack") {
+        } else if (
+          frame.event === "message.sync_ack" &&
+          Number(frame.payload?.dseq ?? 0) >= 2
+        ) {
           acked.resolve(frame);
         }
       });
@@ -519,6 +522,290 @@ describe("HeadlessPiHost", () => {
     await host.stop();
   });
 
+  it("clears stale inbound media after leasing the profile and before recovered queued work", async () => {
+    const server = await listen();
+    const gatewayReady = Promise.withResolvers<void>();
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({
+        version: "2",
+        event: "connect.challenge",
+        trace_id: "challenge-media-recovery",
+        emitted_at: 1,
+        payload: { nonce: "media-recovery-nonce" }
+      }));
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, any>;
+        if (frame.event !== "connect") return;
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "hello-ok",
+          trace_id: frame.trace_id,
+          emitted_at: 2,
+          payload: {
+            device_id: "clawchat-pi-device-media-recovery",
+            delivery_mode: "device_replay"
+          }
+        }));
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "replay.done",
+          trace_id: "replay-media-recovery",
+          emitted_at: 3,
+          payload: {}
+        }));
+        gatewayReady.resolve();
+      });
+    });
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-host-media-recovery-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const profiles = new HostProfileRepository({
+      agentDir,
+      createDeviceId: () => "clawchat-pi-device-media-recovery"
+    });
+    await profiles.prepareActivation("default", workspace);
+    await profiles.completeActivation(
+      "default",
+      {
+        restUrl: websocketUrl(server).replace(/^ws/, "http"),
+        accessToken: "media-recovery-access",
+        ownerChatId: "owner-chat-media-recovery",
+        agent: {
+          id: "agent-media-recovery",
+          userId: "agent-user-media-recovery",
+          ownerId: "owner-media-recovery"
+        }
+      },
+      {
+        websocketUrl: websocketUrl(server),
+        mediaUrl: websocketUrl(server).replace(/^ws/, "http")
+      }
+    );
+    const profileDirectory = profiles.profileDirectory("default");
+    const mediaRoot = join(profileDirectory, "inbound-media");
+    const staleLease = join(mediaRoot, "turn-stale");
+    await mkdir(staleLease, { recursive: true });
+    await writeFile(join(staleLease, "original.bin"), "stale original");
+    const store = GatewayStore.open(join(profileDirectory, "gateway.sqlite"));
+    const queuedFrame = mediaRecoveryFrame();
+    store.admitInbound({
+      dedupeKey: `message:${queuedFrame.payload.message_id}`,
+      messageId: queuedFrame.payload.message_id,
+      chatId: queuedFrame.chat_id,
+      frame: queuedFrame,
+      dispatch: true
+    });
+    store.close();
+    const recoveredWorkObserved = Promise.withResolvers<void>();
+    let operationLeaseExcluded = false;
+    let residueAtRecoveredTurn: string[] | undefined;
+    vi.spyOn(PiChatSessionFactory.prototype, "createSession").mockImplementation(() => ({
+      sessionId: "session-media-recovery",
+      sessionPath: join(agentDir, "session-media-recovery.jsonl")
+    }));
+    vi.spyOn(PiChatSessionFactory.prototype, "openSession").mockImplementation(async () => ({
+      runTurn: async () => {
+        try {
+          const unexpectedLease = await profiles.acquireOperationLease("default");
+          await unexpectedLease.release();
+        } catch (error: unknown) {
+          operationLeaseExcluded =
+            error instanceof Error && error.message.includes("active operation");
+        }
+        residueAtRecoveredTurn = await inboundMediaEntries(mediaRoot);
+        recoveredWorkObserved.resolve();
+      },
+      abort: async () => undefined,
+      dispose: async () => undefined
+    }));
+    const host = new HeadlessPiHost({ agentDir, profiles });
+
+    try {
+      await host.start();
+      await gatewayReady.promise;
+      await recoveredWorkObserved.promise;
+      expect(operationLeaseExcluded).toBe(true);
+      expect(residueAtRecoveredTurn).toEqual([]);
+    } finally {
+      await host.stop();
+    }
+    expect(await inboundMediaEntries(mediaRoot)).toEqual([]);
+    await expect(profiles.getLockStatus("default")).resolves.toEqual({ running: false });
+  });
+
+  it("interrupts an active media Pi Turn immediately and disposes only after its lease settles", async () => {
+    const server = await listen();
+    server.on("connection", (socket) => {
+      socket.send(JSON.stringify({
+        version: "2",
+        event: "connect.challenge",
+        trace_id: "challenge-stop-active-turn",
+        emitted_at: 1,
+        payload: { nonce: "stop-active-turn-nonce" }
+      }));
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, any>;
+        if (frame.event !== "connect") return;
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "hello-ok",
+          trace_id: frame.trace_id,
+          emitted_at: 2,
+          payload: {
+            device_id: "clawchat-pi-device-stop-active-turn",
+            delivery_mode: "device_replay"
+          }
+        }));
+        socket.send(JSON.stringify({
+          version: "2",
+          event: "replay.done",
+          trace_id: "replay-stop-active-turn",
+          emitted_at: 3,
+          payload: {}
+        }));
+      });
+    });
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-host-stop-active-turn-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const profiles = new HostProfileRepository({
+      agentDir,
+      createDeviceId: () => "clawchat-pi-device-stop-active-turn"
+    });
+    await profiles.prepareActivation("default", workspace);
+    await profiles.completeActivation(
+      "default",
+      {
+        restUrl: websocketUrl(server).replace(/^ws/, "http"),
+        accessToken: "stop-active-turn-access",
+        ownerChatId: "owner-chat-stop-active-turn",
+        agent: {
+          id: "agent-stop-active-turn",
+          userId: "agent-user-stop-active-turn",
+          ownerId: "owner-stop-active-turn"
+        }
+      },
+      {
+        websocketUrl: websocketUrl(server),
+        mediaUrl: websocketUrl(server).replace(/^ws/, "http")
+      }
+    );
+    const profileDirectory = profiles.profileDirectory("default");
+    const mediaRoot = join(profileDirectory, "inbound-media");
+    const store = GatewayStore.open(join(profileDirectory, "gateway.sqlite"));
+    const queuedFrame = mediaRecoveryFrame();
+    store.admitInbound({
+      dedupeKey: `message:${queuedFrame.payload.message_id}`,
+      messageId: queuedFrame.payload.message_id,
+      chatId: queuedFrame.chat_id,
+      frame: queuedFrame,
+      dispatch: true
+    });
+    store.close();
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+      if (url !== queuedFrame.payload.message.body.fragments[0]!.url) {
+        throw new Error(`Unexpected external fetch: ${url}`);
+      }
+      return new Response(Uint8Array.from([0, 1, 2, 3]), {
+        headers: { "content-type": "application/octet-stream" }
+      });
+    });
+
+    const order: string[] = [];
+    const promptStarted = Promise.withResolvers<void>();
+    const finishPrompt = Promise.withResolvers<void>();
+    const abortInspectionFinished = Promise.withResolvers<void>();
+    let entriesAtAbort: string[] | undefined;
+    let turnSettledAtAbort: boolean | undefined;
+    let turnSettled = false;
+    let entriesAtDispose: string[] | undefined;
+    const acquireOperationLease =
+      profiles.acquireOperationLease.bind(profiles);
+    vi.spyOn(profiles, "acquireOperationLease").mockImplementation(async (name) => {
+      const lease = await acquireOperationLease(name);
+      return {
+        release: async () => {
+          order.push("profile-release");
+          await lease.release();
+        }
+      };
+    });
+    const host = new HeadlessPiHost({
+      agentDir,
+      profiles,
+      createAgentSessionFn: async () => ({
+        session: {
+          prompt: async () => {
+            order.push("prompt-start");
+            promptStarted.resolve();
+            await finishPrompt.promise;
+            order.push("turn-settled");
+            turnSettled = true;
+          },
+          sendCustomMessage: async () => undefined,
+          abort: async () => {
+            order.push("abort");
+            turnSettledAtAbort = turnSettled;
+            try {
+              entriesAtAbort = await inboundMediaEntries(mediaRoot);
+            } finally {
+              abortInspectionFinished.resolve();
+              finishPrompt.resolve();
+            }
+          },
+          dispose: async () => {
+            entriesAtDispose = await inboundMediaEntries(mediaRoot);
+            order.push("dispose");
+          }
+        }
+      })
+    });
+    let usingFakeTimers = false;
+    let stopping: Promise<void> | undefined;
+
+    try {
+      await host.start();
+      await promptStarted.promise;
+      expect(await inboundMediaEntries(mediaRoot)).not.toEqual([]);
+
+      vi.useFakeTimers();
+      usingFakeTimers = true;
+      stopping = host.stop();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(turnSettledAtAbort).toBe(false);
+      await abortInspectionFinished.promise;
+      expect(entriesAtAbort).not.toEqual([]);
+
+      vi.useRealTimers();
+      usingFakeTimers = false;
+      await stopping;
+
+      expect(await inboundMediaEntries(mediaRoot)).toEqual([]);
+      expect(entriesAtDispose).toEqual([]);
+      expect(order).toEqual([
+        "prompt-start",
+        "abort",
+        "turn-settled",
+        "dispose",
+        "profile-release"
+      ]);
+    } finally {
+      finishPrompt.resolve();
+      if (usingFakeTimers) {
+        await vi.runAllTimersAsync();
+        vi.useRealTimers();
+      }
+      await (stopping ?? host.stop());
+    }
+  });
+
 });
 
 async function listen(): Promise<WebSocketServer> {
@@ -532,6 +819,42 @@ function websocketUrl(server: WebSocketServer): string {
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Expected TCP WebSocket address");
   return `ws://127.0.0.1:${address.port}`;
+}
+
+function mediaRecoveryFrame() {
+  return {
+    version: "2",
+    event: "message.send",
+    trace_id: "trace-media-recovery",
+    emitted_at: 1,
+    chat_id: "chat-media-recovery",
+    chat_type: "direct",
+    sender: { id: "human-media-recovery", type: "direct", nick_name: "Alice" },
+    payload: {
+      message_id: "message-media-recovery",
+      message: {
+        body: {
+          fragments: [
+            {
+              kind: "file",
+              url: "https://media.clawling.com/private/recovered-original",
+              name: "recovered-original.bin",
+              mime: "application/octet-stream"
+            }
+          ]
+        }
+      }
+    }
+  };
+}
+
+async function inboundMediaEntries(rootDir: string): Promise<string[]> {
+  try {
+    return await readdir(rootDir, { recursive: true });
+  } catch (error: unknown) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
 }
 
 function groupCommandFrame(): Record<string, unknown> {

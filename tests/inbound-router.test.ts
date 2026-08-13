@@ -85,6 +85,38 @@ describe("ClawchatInboundRouter", () => {
     store.close();
   });
 
+  it("admits media-only messages through direct and configured group dispatch", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-router-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const router = new ClawchatInboundRouter({
+      store,
+      agentUserId: "agent-user-1",
+      reply: async () => undefined
+    });
+    const direct = imageOnlyMessage(null);
+    direct.chat_type = "direct";
+
+    const invalidDirect = imageOnlyMessage(null, " \t");
+    invalidDirect.chat_type = "direct";
+
+    expect(router.classify(invalidDirect)).toEqual({ dispatch: true });
+    expect(router.classify(imageOnlyMessage(null, ""))).toEqual({ dispatch: false });
+    expect(router.classify(imageOnlyMessage([{ user_id: "agent-user-1" }], " "))).toEqual({
+      dispatch: true
+    });
+    expect(router.classify(direct)).toEqual({ dispatch: true });
+    expect(router.classify(imageOnlyMessage([{ user_id: "agent-user-1" }]))).toEqual({
+      dispatch: true
+    });
+    store.setGroupDispatchMode("group-1", "all");
+    expect(router.classify(imageOnlyMessage(null, "\t"))).toEqual({ dispatch: true });
+    store.setGroupDispatchMode("group-1", "muted");
+    expect(router.classify(imageOnlyMessage([{ user_id: "all" }], ""))).toEqual({
+      dispatch: false
+    });
+    store.close();
+  });
+
   it("accepts an integration command while muted and can unmute the group", async () => {
     const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-router-"));
     const store = GatewayStore.open(join(directory, "gateway.sqlite"));
@@ -182,4 +214,20 @@ function groupMessage(text: string, mentions: unknown): ClawchatInboundMessage {
       }
     }
   };
+}
+
+function imageOnlyMessage(
+  mentions: unknown,
+  url = "https://media.clawling.com/capabilities/image-secret"
+): ClawchatInboundMessage {
+  const message = groupMessage("", mentions);
+  message.payload.message.body.fragments = [
+    {
+      kind: "image",
+      url,
+      name: "pixel.png",
+      mime: "image/png"
+    }
+  ];
+  return message;
 }

@@ -1,7 +1,7 @@
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type WebSocket, WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ClawChatGateway } from "../src/gateway.js";
 import { GatewayStore } from "../src/gateway-store.js";
@@ -89,12 +89,11 @@ describe("ClawChatGateway", () => {
     store.close();
   });
 
-  it("acks a dense v2 delivery only after durable admission", async () => {
+  it("waits for the dense ACK write after durable admission before accepted follow-up", async () => {
     const server = await listen();
-    let resolveAck!: (frame: Record<string, any>) => void;
-    const acked = new Promise<Record<string, any>>((resolve) => {
-      resolveAck = resolve;
-    });
+    const acked = Promise.withResolvers<Record<string, any>>();
+    const acknowledgementWrite = holdAcknowledgementSendCallback("message.sync_ack");
+    const followedUp = Promise.withResolvers<void>();
     server.on("connection", (socket) => {
       socket.send(
         JSON.stringify({
@@ -124,7 +123,7 @@ describe("ClawChatGateway", () => {
           );
           socket.send(JSON.stringify(inboundFrame({ dseq: 1 })));
         } else if (frame.event === "message.sync_ack") {
-          resolveAck(frame);
+          acked.resolve(frame);
         }
       });
     });
@@ -139,17 +138,341 @@ describe("ClawChatGateway", () => {
       store,
       onInboundMessage: async (message) => {
         received.push(message.payload.message_id);
+        followedUp.resolve();
       },
+      createWebSocket: acknowledgementWrite.createWebSocket,
       ackDebounceMs: 0,
       reconnect: false
     });
 
     await gateway.start();
-    const ack = await acked;
+    await acknowledgementWrite.callbackHeld.promise;
+    const ack = await acked.promise;
     expect(ack.payload).toEqual({ dseq: 1, epoch: "01JXYZ8K3MNPQRSTVWXYZ0AB" });
+    expect(store.getReliableHighWater("01JXYZ8K3MNPQRSTVWXYZ0AB")).toBe(1);
+    expect(store.claimNextTurn("chat-1")).toMatchObject({
+      messageId: "msg-01HVB6S7K8L9M0N1P2Q3R4S5T6"
+    });
+    expect(received).toEqual([]);
+
+    acknowledgementWrite.releaseCallback();
+    await followedUp.promise;
     expect(received).toEqual(["msg-01HVB6S7K8L9M0N1P2Q3R4S5T6"]);
-    expect(store.claimNextTurn("chat-1")).toMatchObject({ messageId: "msg-01HVB6S7K8L9M0N1P2Q3R4S5T6" });
     await gateway.stop();
+    store.close();
+  });
+
+  it("wakes an accepted cursor queue only after its ACK write callback completes", async () => {
+    const server = await listen();
+    const acked = Promise.withResolvers<Record<string, any>>();
+    const acknowledgementWrite = holdAcknowledgementSendCallback("message.cursor_ack");
+    const followUpFailed = Promise.withResolvers<void>();
+    const statuses: string[] = [];
+    const received: string[] = [];
+    server.on("connection", (socket) => {
+      socket.send(
+        JSON.stringify({
+          version: "2",
+          event: "connect.challenge",
+          trace_id: "challenge",
+          emitted_at: 1,
+          payload: { nonce: "challenge-nonce" }
+        })
+      );
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, any>;
+        if (frame.event === "connect") {
+          socket.send(
+            JSON.stringify({
+              version: "2",
+              event: "hello-ok",
+              trace_id: frame.trace_id,
+              emitted_at: 2,
+              payload: {
+                device_id: "clawchat-pi-device-1",
+                delivery_mode: "device_replay"
+              }
+            })
+          );
+          socket.send(JSON.stringify(inboundFrame({ seq: 7 })));
+        } else if (frame.event === "message.cursor_ack") {
+          acked.resolve(frame);
+        }
+      });
+    });
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const gateway = new ClawChatGateway({
+      websocketUrl: websocketUrl(server),
+      accessToken: "access-1",
+      deviceId: "clawchat-pi-device-1",
+      userId: "agent-user-1",
+      store,
+      onInboundMessage: async (message) => {
+        received.push(message.payload.message_id);
+        throw new Error("headless wake failed");
+      },
+      onStatus: (status) => {
+        statuses.push(status);
+        if (status === "accepted inbound follow-up failed: headless wake failed") {
+          followUpFailed.resolve();
+        }
+      },
+      createWebSocket: acknowledgementWrite.createWebSocket,
+      ackDebounceMs: 0,
+      reconnect: false
+    });
+
+    await gateway.start();
+    await acknowledgementWrite.callbackHeld.promise;
+    await expect(acked.promise).resolves.toMatchObject({ payload: { seq: 7 } });
+    expect(store.claimNextTurn("chat-1")).toMatchObject({
+      messageId: "msg-01HVB6S7K8L9M0N1P2Q3R4S5T6"
+    });
+    expect(received).toEqual([]);
+
+    acknowledgementWrite.releaseCallback();
+    await followUpFailed.promise;
+    expect(received).toEqual(["msg-01HVB6S7K8L9M0N1P2Q3R4S5T6"]);
+    expect(statuses).toContain("accepted inbound follow-up failed: headless wake failed");
+    expect(store.listQuarantinedFrames()).toEqual([]);
+    await gateway.stop();
+    store.close();
+  });
+
+  it.each([
+    {
+      acknowledgementEvent: "message.sync_ack",
+      delivery: { dseq: 1 },
+      hello: {
+        ack_mode: "dseq",
+        ack_epoch: "follow-up-recovery-epoch"
+      },
+      mode: "dseq"
+    },
+    {
+      acknowledgementEvent: "message.cursor_ack",
+      delivery: { seq: 7 },
+      hello: {},
+      mode: "cursor"
+    }
+  ])(
+    "retains an accepted $mode follow-up across an ACK callback error until reconnect succeeds",
+    async ({ acknowledgementEvent, delivery, hello }) => {
+      const server = await listen();
+      const successfulAcknowledgement = Promise.withResolvers<Record<string, any>>();
+      const followedUp = Promise.withResolvers<void>();
+      const secondConnected = Promise.withResolvers<void>();
+      const releaseSecondDelivery = Promise.withResolvers<void>();
+      const createWebSocket = failFirstAcknowledgementSendCallback(acknowledgementEvent);
+      let connections = 0;
+      server.on("connection", (socket) => {
+        connections += 1;
+        const connection = connections;
+        if (connection === 2) secondConnected.resolve();
+        socket.send(
+          JSON.stringify({
+            version: "2",
+            event: "connect.challenge",
+            trace_id: `challenge-${connection}`,
+            emitted_at: 1,
+            payload: { nonce: `challenge-nonce-${connection}` }
+          })
+        );
+        socket.on("message", (raw) => {
+          const frame = JSON.parse(raw.toString()) as Record<string, any>;
+          if (frame.event === "connect") {
+            socket.send(
+              JSON.stringify({
+                version: "2",
+                event: "hello-ok",
+                trace_id: frame.trace_id,
+                emitted_at: 2,
+                payload: {
+                  device_id: "clawchat-pi-device-1",
+                  delivery_mode: "device_replay",
+                  ...hello
+                }
+              })
+            );
+            if (connection === 1) {
+              socket.send(JSON.stringify(inboundFrame(delivery)));
+            } else {
+              void releaseSecondDelivery.promise.then(() => {
+                socket.send(JSON.stringify(inboundFrame(delivery)));
+              });
+            }
+          } else if (frame.event === acknowledgementEvent && connection === 2) {
+            successfulAcknowledgement.resolve(frame);
+          }
+        });
+      });
+      const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+      const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+      const onInboundMessage = vi.fn(async () => followedUp.resolve());
+      const statuses: string[] = [];
+      const gateway = new ClawChatGateway({
+        websocketUrl: websocketUrl(server),
+        accessToken: "access-1",
+        deviceId: "clawchat-pi-device-1",
+        userId: "agent-user-1",
+        store,
+        onInboundMessage,
+        createWebSocket,
+        ackDebounceMs: 0,
+        reconnect: true,
+        reconnectDelay: () => 0,
+        onStatus: (status) => statuses.push(status)
+      });
+
+      await gateway.start();
+      await secondConnected.promise;
+      expect(onInboundMessage).not.toHaveBeenCalled();
+      releaseSecondDelivery.resolve();
+      await successfulAcknowledgement.promise;
+      await followedUp.promise;
+      expect(connections).toBe(2);
+      expect(onInboundMessage).toHaveBeenCalledTimes(1);
+      expect(statuses).toContain("protocol error: simulated acknowledgement callback failure");
+      await gateway.stop();
+      expect(onInboundMessage).toHaveBeenCalledTimes(1);
+      store.close();
+    }
+  );
+
+  it("bounds an accepted ACK callback already blocking the frame queue during stop", async () => {
+    const server = await listen();
+    const acknowledgementWrite = holdAcknowledgementSendCallback("message.sync_ack");
+    const acknowledgement = Promise.withResolvers<Record<string, any>>();
+    const closed = Promise.withResolvers<void>();
+    server.on("connection", (socket) => {
+      socket.send(
+        JSON.stringify({
+          version: "2",
+          event: "connect.challenge",
+          trace_id: "challenge",
+          emitted_at: 1,
+          payload: { nonce: "challenge-nonce" }
+        })
+      );
+      socket.on("close", () => closed.resolve());
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, any>;
+        if (frame.event === "connect") {
+          socket.send(
+            JSON.stringify({
+              version: "2",
+              event: "hello-ok",
+              trace_id: frame.trace_id,
+              emitted_at: 2,
+              payload: {
+                ack_mode: "dseq",
+                ack_epoch: "shutdown-ack-epoch",
+                device_id: "clawchat-pi-device-1",
+                delivery_mode: "device_replay"
+              }
+            })
+          );
+          socket.send(JSON.stringify(inboundFrame({ dseq: 1 })));
+        } else if (frame.event === "message.sync_ack") {
+          acknowledgement.resolve(frame);
+        }
+      });
+    });
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const clock = createManualGatewayClock(0);
+    const onInboundMessage = vi.fn(async () => undefined);
+    const gateway = new ClawChatGateway({
+      websocketUrl: websocketUrl(server),
+      accessToken: "access-1",
+      deviceId: "clawchat-pi-device-1",
+      userId: "agent-user-1",
+      store,
+      onInboundMessage,
+      createWebSocket: acknowledgementWrite.createWebSocket,
+      shutdownAckTimeoutMs: 1_000,
+      timer: clock.timer,
+      reconnect: false
+    });
+
+    await gateway.start();
+    await acknowledgementWrite.callbackHeld.promise;
+    await expect(acknowledgement.promise).resolves.toMatchObject({
+      payload: { dseq: 1, epoch: "shutdown-ack-epoch" }
+    });
+    const stopping = gateway.stop();
+    let settled = false;
+    void stopping.then(() => {
+      settled = true;
+    });
+    clock.advance(999);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    clock.advance(1);
+    await stopping;
+    await closed.promise;
+    expect(clock.pendingTimers()).toBe(0);
+    expect(onInboundMessage).not.toHaveBeenCalled();
+    store.close();
+  });
+
+  it("acknowledges skipped and duplicate cursor deliveries without follow-up", async () => {
+    const server = await listen();
+    const acked = Promise.withResolvers<Record<string, any>>();
+    server.on("connection", (socket) => {
+      socket.send(
+        JSON.stringify({
+          version: "2",
+          event: "connect.challenge",
+          trace_id: "challenge",
+          emitted_at: 1,
+          payload: { nonce: "challenge-nonce" }
+        })
+      );
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, any>;
+        if (frame.event === "connect") {
+          socket.send(
+            JSON.stringify({
+              version: "2",
+              event: "hello-ok",
+              trace_id: frame.trace_id,
+              emitted_at: 2,
+              payload: {
+                device_id: "clawchat-pi-device-1",
+                delivery_mode: "device_replay"
+              }
+            })
+          );
+          socket.send(JSON.stringify(inboundFrame({ seq: 7 })));
+          socket.send(JSON.stringify(inboundFrame({ seq: 8, trace_id: "duplicate-trace" })));
+        } else if (frame.event === "message.cursor_ack" && frame.payload.seq === 8) {
+          acked.resolve(frame);
+        }
+      });
+    });
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const onInboundMessage = vi.fn(async () => undefined);
+    const gateway = new ClawChatGateway({
+      websocketUrl: websocketUrl(server),
+      accessToken: "access-1",
+      deviceId: "clawchat-pi-device-1",
+      userId: "agent-user-1",
+      store,
+      classifyInbound: () => ({ dispatch: false }),
+      onInboundMessage,
+      ackDebounceMs: 0,
+      reconnect: false
+    });
+
+    await gateway.start();
+    await expect(acked.promise).resolves.toMatchObject({ payload: { seq: 8 } });
+    await gateway.stop();
+    expect(store.claimNextTurn("chat-1")).toBeNull();
+    expect(onInboundMessage).not.toHaveBeenCalled();
+    expect(store.listQuarantinedFrames()).toEqual([]);
     store.close();
   });
 
@@ -2844,6 +3167,66 @@ function outboundReply(): Record<string, unknown> {
         context: { mentions: [], reply: null }
       }
     }
+  };
+}
+
+function holdAcknowledgementSendCallback(event: string) {
+  const callbackHeld = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  return {
+    callbackHeld,
+    releaseCallback: () => release.resolve(),
+    createWebSocket: (url: string): WebSocket => {
+      const socket = new WebSocket(url);
+      const send = socket.send.bind(socket);
+      socket.send = ((
+        data: Parameters<WebSocket["send"]>[0],
+        callback?: (error?: Error) => void
+      ) => {
+        if (!callback || JSON.parse(data.toString()).event !== event) {
+          if (callback) send(data, callback);
+          else send(data);
+          return;
+        }
+        send(data, (error) => {
+          if (error) {
+            callbackHeld.reject(error);
+            callback(error);
+            return;
+          }
+          callbackHeld.resolve();
+          void release.promise.then(() => callback());
+        });
+      }) as WebSocket["send"];
+      return socket;
+    }
+  };
+}
+
+function failFirstAcknowledgementSendCallback(event: string): (url: string) => WebSocket {
+  let failurePending = true;
+  return (url: string): WebSocket => {
+    const socket = new WebSocket(url);
+    const send = socket.send.bind(socket);
+    socket.send = ((
+      data: Parameters<WebSocket["send"]>[0],
+      callback?: (error?: Error) => void
+    ) => {
+      if (
+        !callback ||
+        JSON.parse(data.toString()).event !== event ||
+        !failurePending
+      ) {
+        if (callback) send(data, callback);
+        else send(data);
+        return;
+      }
+      failurePending = false;
+      send(data, (error) => {
+        callback(error ?? new Error("simulated acknowledgement callback failure"));
+      });
+    }) as WebSocket["send"];
+    return socket;
   };
 }
 

@@ -32,7 +32,7 @@
     "smoke:gateway": "node scripts/smoke-built-gateway.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.81.1",
+    "@earendil-works/pi-coding-agent": "0.84.1",
     "typebox": "^1.1.38",
     "ws": "^8.18.0"
   },

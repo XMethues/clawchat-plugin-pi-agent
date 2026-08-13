@@ -3,16 +3,35 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   SessionManager,
-  SettingsManager
+  SettingsManager,
+  type AgentSession,
+  type CreateAgentSessionOptions
 } from "@earendil-works/pi-coding-agent";
 import { isClawchatAwarenessFrame, renderAwarenessPrompt } from "./clawchat-awareness.js";
 import type { ChatSessionRecord, ChatTurn, GatewayStore } from "./gateway-store.js";
 import { createHeadlessClawchatPiExtension } from "./headless-extension.js";
 import { renderInboundPrompt } from "./inbound.js";
+import {
+  InboundMediaMaterializer,
+  type InboundMediaOptions,
+  type MaterializedInboundTurn,
+  type PiPromptImage
+} from "./inbound-media.js";
 import type { ChatSessionDriver, ChatSessionFactory } from "./session-registry.js";
 import type { ClawchatInboundMessage, ClawchatTransport } from "./types.js";
 import type { ClawchatOutputMode } from "./output-settings.js";
 import type { ClawchatToolEnvironment } from "./clawchat-tools.js";
+
+type PiSessionSurface = {
+  prompt(text: string, options?: { images?: PiPromptImage[] }): Promise<void>;
+  sendCustomMessage: AgentSession["sendCustomMessage"];
+  abort: AgentSession["abort"];
+  dispose: AgentSession["dispose"];
+};
+
+type CreateAgentSessionFn = (
+  options: CreateAgentSessionOptions
+) => Promise<{ session: PiSessionSurface }>;
 
 export interface PiChatSessionFactoryOptions {
   workspace: string;
@@ -22,6 +41,8 @@ export interface PiChatSessionFactoryOptions {
   sessionDir?: string;
   outputModeDefault?: ClawchatOutputMode;
   tools?: ClawchatToolEnvironment;
+  media?: InboundMediaOptions;
+  createAgentSessionFn?: CreateAgentSessionFn;
 }
 
 export class PiChatSessionFactory implements ChatSessionFactory {
@@ -33,6 +54,8 @@ export class PiChatSessionFactory implements ChatSessionFactory {
   private readonly sessionDir: string | undefined;
   private readonly outputModeDefault: ClawchatOutputMode;
   private readonly tools: ClawchatToolEnvironment | undefined;
+  private readonly mediaMaterializer: InboundMediaMaterializer | undefined;
+  private readonly createAgentSessionFn: CreateAgentSessionFn;
 
   constructor(options: PiChatSessionFactoryOptions) {
     this.workspace = realpathSync(options.workspace);
@@ -42,6 +65,14 @@ export class PiChatSessionFactory implements ChatSessionFactory {
     this.sessionDir = options.sessionDir;
     this.outputModeDefault = options.outputModeDefault ?? "normal";
     this.tools = options.tools;
+    this.mediaMaterializer = options.media
+      ? new InboundMediaMaterializer(options.media)
+      : undefined;
+    this.createAgentSessionFn = options.createAgentSessionFn ?? createAgentSession;
+  }
+
+  async cleanupStaleInboundMedia(): Promise<void> {
+    await this.mediaMaterializer?.cleanupStaleLeases();
   }
 
   createSession(_chatId: string): { sessionId: string; sessionPath: string } {
@@ -92,7 +123,7 @@ export class PiChatSessionFactory implements ChatSessionFactory {
       })
     });
     await resourceLoader.reload();
-    const { session } = await createAgentSession({
+    const { session } = await this.createAgentSessionFn({
       cwd: this.workspace,
       agentDir: this.agentDir,
       sessionManager,
@@ -100,54 +131,121 @@ export class PiChatSessionFactory implements ChatSessionFactory {
       resourceLoader,
       sessionStartEvent: { type: "session_start", reason: "startup" }
     });
+    let activeTurn: {
+      materializationAbort: AbortController | undefined;
+      completion: Promise<void>;
+    } | undefined;
+    const runTrackedTurn = async (
+      materializationAbort: AbortController | undefined,
+      operation: () => Promise<void>
+    ): Promise<void> => {
+      const { promise: completion, resolve: complete } = Promise.withResolvers<void>();
+      const trackedTurn = { materializationAbort, completion };
+      activeTurn = trackedTurn;
+      try {
+        await operation();
+      } finally {
+        complete();
+        if (activeTurn === trackedTurn) activeTurn = undefined;
+      }
+    };
+    const abortCurrentTurn = async (abortPiWhenIdle: boolean): Promise<void> => {
+      const trackedTurn = activeTurn;
+      trackedTurn?.materializationAbort?.abort();
+      let abortFailed = false;
+      let abortFailure: unknown;
+      const piAbort =
+        trackedTurn || abortPiWhenIdle
+          ? Promise.resolve()
+              .then(() => session.abort())
+              .catch((error: unknown) => {
+                abortFailed = true;
+                abortFailure = error;
+              })
+          : Promise.resolve();
+      await Promise.all([piAbort, trackedTurn?.completion ?? Promise.resolve()]);
+      if (!trackedTurn) {
+        try {
+          await headless.controller.abortTurn();
+        } catch (error: unknown) {
+          if (!abortFailed) {
+            abortFailed = true;
+            abortFailure = error;
+          }
+        }
+      }
+      if (abortFailed) throw abortFailure;
+    };
 
     return {
       runTurn: async (turn: ChatTurn) => {
         if (isClawchatAwarenessFrame(turn.frame)) {
-          await headless.controller.beginAwarenessTurn({
-            target: { chatId: mapping.chatId, chatType: "direct" },
-            auditSource: turn.messageId,
-            outputMode:
-              this.store.getOutputModeOverrides()[mapping.chatId] ?? this.outputModeDefault,
-            toolContext: { chatId: mapping.chatId, chatType: "direct" }
+          const awarenessFrame = turn.frame;
+          await runTrackedTurn(undefined, async () => {
+            await headless.controller.beginAwarenessTurn({
+              target: { chatId: mapping.chatId, chatType: "direct" },
+              auditSource: turn.messageId,
+              outputMode:
+                this.store.getOutputModeOverrides()[mapping.chatId] ?? this.outputModeDefault,
+              toolContext: { chatId: mapping.chatId, chatType: "direct" }
+            });
+            try {
+              await session.sendCustomMessage(
+                {
+                  customType: "clawchat.awareness",
+                  content: renderAwarenessPrompt(awarenessFrame),
+                  display: false,
+                  details: awarenessFrame
+                },
+                { triggerTurn: true }
+              );
+            } finally {
+              await headless.controller.abortTurn();
+            }
           });
-          try {
-            await session.sendCustomMessage(
-              {
-                customType: "clawchat.awareness",
-                content: renderAwarenessPrompt(turn.frame),
-                display: false,
-                details: turn.frame
-              },
-              { triggerTurn: true }
-            );
-          } finally {
-            await headless.controller.abortTurn();
-          }
           return;
         }
+
         const message = requireInboundMessage(turn.frame);
-        const prompt = renderInboundPrompt(message);
-        if (!prompt) throw new Error(`Turn '${turn.id}' has no supported text content`);
-        await headless.controller.beginTurn(message);
-        try {
-          await session.prompt(prompt);
-        } finally {
-          await headless.controller.abortTurn();
-        }
+        const materializationAbort = new AbortController();
+        await runTrackedTurn(materializationAbort, async () => {
+          let materialized: MaterializedInboundTurn | undefined;
+          await headless.controller.beginTurn(message);
+          try {
+            materialized = this.mediaMaterializer
+              ? await this.mediaMaterializer.materialize(message, materializationAbort.signal)
+              : {
+                  prompt: renderInboundPrompt(message),
+                  images: [],
+                  release: async () => undefined
+                };
+            if (materializationAbort.signal.aborted) {
+              throw new Error("Inbound media materialization was aborted");
+            }
+            if (!materialized.prompt) {
+              throw new Error(`Turn '${turn.id}' has no supported text or image content`);
+            }
+            await session.prompt(
+              materialized.prompt,
+              materialized.images.length > 0 ? { images: materialized.images } : undefined
+            );
+          } finally {
+            try {
+              await materialized?.release();
+            } finally {
+              await headless.controller.abortTurn();
+            }
+          }
+        });
       },
       abort: async () => {
-        try {
-          await session.abort();
-        } finally {
-          await headless.controller.abortTurn();
-        }
+        await abortCurrentTurn(true);
       },
       dispose: async () => {
         try {
-          await headless.controller.abortTurn();
+          await abortCurrentTurn(false);
         } finally {
-          session.dispose();
+          await session.dispose();
         }
       }
     };

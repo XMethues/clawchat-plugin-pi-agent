@@ -8,10 +8,14 @@ export function extractInboundText(message: ClawchatInboundMessage): string {
     .trim();
 }
 
+export function renderInboundPromptHeader(message: ClawchatInboundMessage): string {
+  const senderName = message.sender.nick_name?.trim() || message.sender.id;
+  return `ClawChat ${message.chat_type} message from ${senderName}:`;
+}
+
 export function renderInboundPrompt(message: ClawchatInboundMessage): string {
   const text = extractInboundText(message);
   if (!text) return "";
 
-  const senderName = message.sender.nick_name?.trim() || message.sender.id;
-  return [`ClawChat ${message.chat_type} message from ${senderName}:`, text].join("\n");
+  return [renderInboundPromptHeader(message), text].join("\n");
 }

@@ -41,7 +41,14 @@ export class ClawchatInboundRouter {
 
   classify(message: ClawchatInboundMessage): InboundDecision {
     const text = extractInboundText(message);
-    if (!text) return { dispatch: false };
+    const hasMedia = message.payload.message.body.fragments.some(
+      (fragment) =>
+        fragment.kind === "image" ||
+        fragment.kind === "file" ||
+        fragment.kind === "audio" ||
+        fragment.kind === "video"
+    );
+    if (!text && !hasMedia) return { dispatch: false };
 
     const groupCommand = /^\/clawchat-group\s+(mention|all|muted)\s*$/i.exec(text);
     if (groupCommand) {

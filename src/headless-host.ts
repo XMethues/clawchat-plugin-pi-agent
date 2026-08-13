@@ -14,7 +14,10 @@ import {
 } from "./host-profile.js";
 import { ClawchatInboundRouter } from "./inbound-router.js";
 import { ClawchatOutputProjector } from "./output-projector.js";
-import { PiChatSessionFactory } from "./pi-session-factory.js";
+import {
+  PiChatSessionFactory,
+  type PiChatSessionFactoryOptions
+} from "./pi-session-factory.js";
 import { ChatSessionRegistry } from "./session-registry.js";
 import type { ClawchatTransport } from "./types.js";
 import { createClawchatToolRuntime } from "./clawchat-runtime.js";
@@ -29,6 +32,7 @@ export interface HeadlessPiHostOptions {
   onDeliveryReceipt?: (event: ClawchatGatewayEvent) => Promise<void> | void;
   recoveryRetryDelay?: (attempt: number) => number;
   gatewayReconnectDelay?: (attempt: number) => number;
+  createAgentSessionFn?: PiChatSessionFactoryOptions["createAgentSessionFn"];
 }
 
 export class HeadlessPiHost {
@@ -41,6 +45,7 @@ export class HeadlessPiHost {
   private readonly onDeliveryReceipt: ((event: ClawchatGatewayEvent) => Promise<void> | void) | undefined;
   private readonly recoveryRetryDelay: ((attempt: number) => number) | undefined;
   private readonly gatewayReconnectDelay: ((attempt: number) => number) | undefined;
+  private readonly createAgentSessionFn: PiChatSessionFactoryOptions["createAgentSessionFn"];
   private operationLease: HostProfileOperationLease | undefined;
   private store: GatewayStore | undefined;
   private gateway: ClawChatGateway | undefined;
@@ -70,6 +75,7 @@ export class HeadlessPiHost {
     this.onDeliveryReceipt = options.onDeliveryReceipt;
     this.recoveryRetryDelay = options.recoveryRetryDelay;
     this.gatewayReconnectDelay = options.gatewayReconnectDelay;
+    this.createAgentSessionFn = options.createAgentSessionFn;
   }
 
   async start(): Promise<void> {
@@ -86,7 +92,8 @@ export class HeadlessPiHost {
         profiles: this.profiles,
         profileName: this.profileName
       });
-      const store = GatewayStore.open(join(this.profiles.profileDirectory(this.profileName), "gateway.sqlite"));
+      const profileDirectory = this.profiles.profileDirectory(this.profileName);
+      const store = GatewayStore.open(join(profileDirectory, "gateway.sqlite"));
       this.store = store;
       let gateway: ClawChatGateway | undefined;
       const transport: ClawchatTransport = {
@@ -110,6 +117,10 @@ export class HeadlessPiHost {
         store,
         transport,
         outputModeDefault: profile.output.modeDefault,
+        media: { rootDir: join(profileDirectory, "inbound-media") },
+        ...(this.createAgentSessionFn
+          ? { createAgentSessionFn: this.createAgentSessionFn }
+          : {}),
         tools: {
           ...toolRuntime.environment,
           sendFrame: async (frame) => {
@@ -119,6 +130,7 @@ export class HeadlessPiHost {
           recordToolCall: (record) => store.recordToolCall(record)
         }
       });
+      await factory.cleanupStaleInboundMedia();
       const registry = new ChatSessionRegistry({
         store,
         factory,
@@ -349,13 +361,15 @@ export class HeadlessPiHost {
     clearTimeout(this.recoveryRetryTimer);
     this.recoveryRetryTimer = undefined;
     this.recoveryRequested = false;
+
+    const registry = this.registry;
+    this.registry = undefined;
+    const registryShutdown = registry?.shutdown({ graceMs: 0 });
     const recovery = this.recoveryInFlight;
     await recovery;
     if (this.recoveryInFlight === recovery) this.recoveryInFlight = undefined;
 
-    const registry = this.registry;
-    this.registry = undefined;
-    await registry?.shutdown();
+    await registryShutdown;
 
     const gateway = this.gateway;
     this.gateway = undefined;
