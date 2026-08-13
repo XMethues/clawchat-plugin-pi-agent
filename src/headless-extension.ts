@@ -36,9 +36,12 @@ export interface HostedSessionBinding {
   toolContext: ActiveClawchatTurn;
 }
 
-export interface AwarenessTurnBinding extends Omit<HostedSessionBinding, "target"> {
+export interface AwarenessTurnBinding extends Omit<HostedSessionBinding, "outputMode" | "target"> {
   target: Extract<OutputTurn, { chatType: "direct" }>;
 }
+type ActiveHostedSessionBinding =
+  | (HostedSessionBinding & { projectOutput: true })
+  | (AwarenessTurnBinding & { projectOutput: false });
 
 export interface HeadlessExtensionController {
   beginTurn(message: ClawchatInboundMessage): Promise<void>;
@@ -59,16 +62,17 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
     ...(options.now ? { now: options.now } : {}),
     ...(options.idFactory ? { idFactory: options.idFactory } : {})
   });
-  let active: HostedSessionBinding | undefined;
+  let active: ActiveHostedSessionBinding | undefined;
   let piApi: ExtensionAPI | undefined;
   let terminalReplySent = false;
 
-  const activate = async (binding: HostedSessionBinding): Promise<void> => {
+  const activate = async (binding: ActiveHostedSessionBinding): Promise<void> => {
     if (active) {
       throw new Error(`A Hosted Session Binding is already active for ${active.target.chatId}`);
     }
     active = binding;
     terminalReplySent = false;
+    if (!binding.projectOutput) return;
     try {
       await projector.beginTurn(binding.target);
     } catch (error: unknown) {
@@ -79,9 +83,11 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
 
   const deactivate = async (discardPendingAssistantText: boolean): Promise<void> => {
     if (!active) return;
-    if (discardPendingAssistantText) projector.discardPendingAssistantText();
+    if (active.projectOutput && discardPendingAssistantText) {
+      projector.discardPendingAssistantText();
+    }
     try {
-      await projector.endTurn();
+      if (active.projectOutput) await projector.endTurn();
     } finally {
       active = undefined;
       terminalReplySent = false;
@@ -99,7 +105,8 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
           chatId: message.chat_id,
           chatType: message.chat_type,
           messageId: message.payload.message_id
-        }
+        },
+        projectOutput: true
       });
     },
     beginAwarenessTurn: async (binding) => {
@@ -110,7 +117,7 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
       if (binding.toolContext.chatType !== "direct") {
         throw new Error("Awareness tool context must be direct");
       }
-      await activate(binding);
+      await activate({ ...binding, projectOutput: false });
     },
     abortTurn: async () => {
       await deactivate(true);
@@ -121,7 +128,7 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
   const handleOutput = async (
     event: MessageEndEvent | ToolExecutionStartEvent | ToolExecutionEndEvent
   ): Promise<void> => {
-    if (!active || !piApi) return;
+    if (!active || !active.projectOutput || !piApi) return;
     if (terminalReplySent && (event.type === "message_end" || event.type === "tool_execution_end")) return;
     try {
       await projector.handle(event as PiOutputEvent, active.outputMode);

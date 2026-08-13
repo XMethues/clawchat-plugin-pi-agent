@@ -117,7 +117,7 @@ describe("Headless ClawChat Pi Extension", () => {
     expect(sent.filter((message) => message.event === "message.send")).toHaveLength(0);
   });
 
-  it("binds an Awareness Turn to owner memory, tools, direct output, and cleanup", async () => {
+  it("binds an Awareness Turn to owner memory and tools without projecting model text", async () => {
     const handlers = new Map<string, Function>();
     const registeredTools = new Map<string, { execute: (id: string, args: unknown) => Promise<unknown> }>();
     const sent: ClawchatOutboundMessage[] = [];
@@ -153,7 +153,6 @@ describe("Headless ClawChat Pi Extension", () => {
     await controller.beginAwarenessTurn({
       target: { chatId: "owner-chat-1", chatType: "direct" },
       auditSource: "notify-1",
-      outputMode: "normal",
       toolContext: { chatId: "owner-chat-1", chatType: "direct" }
     });
     const prompt = await handlers.get("before_agent_start")!({ systemPrompt: "base" });
@@ -190,27 +189,17 @@ describe("Headless ClawChat Pi Extension", () => {
       expect.objectContaining({ chatId: "owner-chat-1", auditSource: "notify-1" })
     );
     expect(recordToolCall.mock.calls[0]![0]).not.toHaveProperty("messageId");
-    const visible = sent.find((message) => message.event === "message.send");
-    expect(visible).toMatchObject({
-      chat_id: "owner-chat-1",
-      to: { id: "owner-chat-1", type: "direct" },
-      payload: {
-        message_mode: "normal",
-        message: { context: { mentions: [], reply: null } }
-      }
-    });
-    expect(sent.filter((message) => message.event === "message.send")).toHaveLength(1);
+    expect(sent).toEqual([]);
     expect(controller.isActive()).toBe(false);
   });
 
-  it("clears an Awareness Turn binding when output projection fails", async () => {
+  it("ignores Awareness model text even when output transport would fail", async () => {
     const handlers = new Map<string, Function>();
+    const send = vi.fn(async () => {
+      throw new Error("transport failed");
+    });
     const { extension, controller } = createHeadlessClawchatPiExtension({
-      transport: {
-        send: async (message) => {
-          if (message.event === "message.send") throw new Error("transport failed");
-        }
-      },
+      transport: { send },
       outputMode: () => "normal"
     });
     extension({
@@ -219,16 +208,18 @@ describe("Headless ClawChat Pi Extension", () => {
     } as never);
     await controller.beginAwarenessTurn({
       target: { chatId: "owner-chat-1", chatType: "direct" },
-      outputMode: "normal",
       toolContext: { chatId: "owner-chat-1", chatType: "direct" }
     });
 
     await expect(
       handlers.get("message_end")!({
         type: "message_end",
-        message: { role: "assistant", content: [{ type: "text", text: "visible" }] }
+        message: { role: "assistant", content: [{ type: "text", text: "State refreshed." }] }
       })
-    ).rejects.toThrow("transport failed");
+    ).resolves.toBeUndefined();
+    await handlers.get("agent_settled")!({ type: "agent_settled" });
+
+    expect(send).not.toHaveBeenCalled();
     expect(controller.isActive()).toBe(false);
   });
 
@@ -249,7 +240,6 @@ describe("Headless ClawChat Pi Extension", () => {
     } as never);
     await controller.beginAwarenessTurn({
       target: { chatId: "owner-chat-1", chatType: "direct" },
-      outputMode: "minimal",
       toolContext: { chatId: "owner-chat-1", chatType: "direct" }
     });
     await handlers.get("message_end")!({
@@ -259,7 +249,7 @@ describe("Headless ClawChat Pi Extension", () => {
 
     await controller.abortTurn();
 
-    expect(sent.map((message) => message.event)).toEqual(["typing.update", "typing.update"]);
+    expect(sent).toEqual([]);
     expect(controller.isActive()).toBe(false);
   });
 });

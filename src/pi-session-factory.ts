@@ -185,8 +185,6 @@ export class PiChatSessionFactory implements ChatSessionFactory {
             await headless.controller.beginAwarenessTurn({
               target: { chatId: mapping.chatId, chatType: "direct" },
               auditSource: turn.messageId,
-              outputMode:
-                this.store.getOutputModeOverrides()[mapping.chatId] ?? this.outputModeDefault,
               toolContext: { chatId: mapping.chatId, chatType: "direct" }
             });
             try {

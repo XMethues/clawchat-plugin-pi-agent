@@ -251,9 +251,10 @@ Unsupported ClawChat content is durably acknowledged and marked skipped. It is n
 A ClawChat Awareness Turn targets only the owner's direct Chat Session through
 an explicit Hosted Session Binding; it does not fabricate an inbound user
 message or require an inbound `message_id`. The binding supplies Owner Turn
-Memory, optional audit source, output visibility, and Active ClawChat Turn tool
-context. Binding state is cleared on success, failure, and abort. Visible
-awareness output is an unquoted direct `message.send`; ordinary user turns keep
+Memory, an optional audit source, and Active ClawChat Turn tool context. Binding
+state is cleared on success, failure, and abort. Model-generated Awareness text
+and output-projection events are never delivered to ClawChat; external effects
+require an explicit registered ClawChat tool call. Ordinary user turns keep
 their inbound quote context and Group Dispatch behavior.
 
 Every successful `hello-ok` starts one non-blocking, single-flight

@@ -133,11 +133,11 @@ cycle, while failures retry with bounded backoff.
 
 An Awareness Turn uses an explicit Hosted Session Binding for the owner's
 direct Chat Session, not a fabricated inbound message. The binding supplies
-Owner Turn Memory, Active ClawChat Turn tool context, optional audit source, and
-output visibility, and is cleared on success, failure, or abort. Visible
-awareness output preserves the established direct-output contract: an unquoted
-`message.send`; ordinary group user replies remain quoted `message.reply`
-messages.
+Owner Turn Memory, Active ClawChat Turn tool context, and an optional audit
+source, and is cleared on success, failure, or abort. Model-generated Awareness
+text and output-projection events remain internal; an Awareness Turn can affect
+ClawChat only through an explicit registered ClawChat tool call. Ordinary group
+user replies remain quoted `message.reply` messages.
 
 ### Activation, identity, and endpoints
 
