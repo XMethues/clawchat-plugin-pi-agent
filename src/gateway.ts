@@ -939,8 +939,7 @@ function isReliableDeliveryEvent(event: string): boolean {
     event === "history.transit" ||
     event === "notify.signal" ||
     event === "sync.mark" ||
-    event === "replay.done" ||
-    event === "history.truncated"
+    event === "replay.done"
   );
 }
 

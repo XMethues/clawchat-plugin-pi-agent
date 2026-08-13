@@ -2628,6 +2628,86 @@ describe("ClawChatGateway", () => {
     store.close();
   });
 
+  it("accepts a non-dseq truncation boundary before v2 replay", async () => {
+    const server = await listen();
+    const replayAck = Promise.withResolvers<Record<string, any>>();
+    let connections = 0;
+    server.on("connection", (socket) => {
+      connections += 1;
+      socket.send(
+        JSON.stringify({
+          version: "2",
+          event: "connect.challenge",
+          trace_id: "challenge",
+          emitted_at: 1,
+          payload: { nonce: "nonce" }
+        })
+      );
+      socket.on("message", (raw) => {
+        const frame = JSON.parse(raw.toString()) as Record<string, any>;
+        if (frame.event === "connect") {
+          socket.send(
+            JSON.stringify({
+              version: "2",
+              event: "hello-ok",
+              trace_id: frame.trace_id,
+              emitted_at: 2,
+              payload: {
+                ack_mode: "dseq",
+                ack_epoch: "truncation-control-epoch",
+                device_id: "clawchat-pi-device-1",
+                delivery_mode: "device_replay"
+              }
+            })
+          );
+          socket.send(
+            JSON.stringify({
+              version: "2",
+              event: "history.truncated",
+              trace_id: "truncation-control",
+              emitted_at: 3,
+              payload: { oldest_seq: 40 }
+            })
+          );
+          socket.send(
+            JSON.stringify({
+              version: "2",
+              event: "replay.done",
+              trace_id: "replay-done",
+              emitted_at: 4,
+              dseq: 1,
+              payload: {}
+            })
+          );
+        } else if (frame.event === "message.sync_ack" && frame.payload.dseq === 1) {
+          replayAck.resolve(frame);
+        }
+      });
+    });
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-truncation-control-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const gateway = new ClawChatGateway({
+      websocketUrl: websocketUrl(server),
+      accessToken: "access-1",
+      deviceId: "clawchat-pi-device-1",
+      userId: "agent-user-1",
+      store,
+      onInboundMessage: async () => undefined,
+      ackDebounceMs: 0,
+      reconnect: false
+    });
+
+    await gateway.start();
+    await expect(replayAck.promise).resolves.toMatchObject({
+      payload: { dseq: 1, epoch: "truncation-control-epoch" }
+    });
+    expect(connections).toBe(1);
+    expect(store.getInboxHistoryBoundary()).toMatchObject({ oldestSeq: 40 });
+    expect(store.listQuarantinedFrames()).toEqual([]);
+    await gateway.stop();
+    store.close();
+  });
+
   it("diagnoses an invalid non-dseq truncation without moving the v1 boundary", async () => {
     const server = await listen();
     const cursorAck = Promise.withResolvers<Record<string, any>>();
