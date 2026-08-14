@@ -1,6 +1,6 @@
 # PRD: Headless Pi Host with durable multi-chat sessions
 
-Tracker: <https://github.com/XMethues/clawchat-plugin-pi-agent/issues/1>
+Tracker: <https://github.com/XMethues/clawchat-pi-agent/issues/1>
 
 ## Summary
 

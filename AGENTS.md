@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues and PRDs are tracked in GitHub Issues for `XMethues/clawchat-plugin-pi-agent`. See `docs/agents/issue-tracker.md`.
+Issues and PRDs are tracked in GitHub Issues for `XMethues/clawchat-pi-agent`. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

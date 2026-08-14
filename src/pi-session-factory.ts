@@ -1,4 +1,5 @@
 import { existsSync, realpathSync, rmSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -423,11 +424,12 @@ function requireInboundMessage(frame: unknown): ClawchatInboundMessage {
   return message as ClawchatInboundMessage;
 }
 
-function isInteractiveClawchatExtension(extension: { path: string; resolvedPath: string }): boolean {
-  const paths = [extension.path, extension.resolvedPath].map((path) => path.replaceAll("\\", "/"));
-  return paths.some(
-    (path) =>
-      path.endsWith("/clawchat-plugin-pi-agent/dist/src/extension.js") ||
-      (path.includes("/@newbase-clawchat/clawchat-pi/") && path.endsWith("/dist/src/extension.js"))
-  );
+const INTERACTIVE_CLAWCHAT_EXTENSION_PATH = fileURLToPath(
+  new URL("./extension.js", import.meta.url)
+).replaceAll("\\", "/");
+
+export function isInteractiveClawchatExtension(extension: { path: string; resolvedPath: string }): boolean {
+  return [extension.path, extension.resolvedPath]
+    .map((path) => path.replaceAll("\\", "/"))
+    .includes(INTERACTIVE_CLAWCHAT_EXTENSION_PATH);
 }

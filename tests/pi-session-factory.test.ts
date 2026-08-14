@@ -1,13 +1,27 @@
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi, type Mock } from "vitest";
 import { ClawchatMemoryStore, clawchatMemoryTarget } from "../src/clawchat-memory.js";
 import type { ClawchatToolEnvironment } from "../src/clawchat-tools.js";
 import { GatewayStore } from "../src/gateway-store.js";
-import { PiChatSessionFactory } from "../src/pi-session-factory.js";
+import { isInteractiveClawchatExtension, PiChatSessionFactory } from "../src/pi-session-factory.js";
 
 describe("PiChatSessionFactory", () => {
+  it("identifies its interactive extension without depending on the repository directory name", () => {
+    const extensionPath = fileURLToPath(new URL("../src/extension.js", import.meta.url));
+
+    expect(isInteractiveClawchatExtension({
+      path: "./dist/src/extension.js",
+      resolvedPath: extensionPath
+    })).toBe(true);
+    expect(isInteractiveClawchatExtension({
+      path: "./dist/src/extension.js",
+      resolvedPath: "/tmp/unrelated-package/dist/src/extension.js"
+    })).toBe(false);
+  });
+
   it("creates isolated native Pi session paths in the Host Profile Workspace", async () => {
     const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-sdk-"));
     const workspace = join(agentDir, "project");

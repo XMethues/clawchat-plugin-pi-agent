@@ -6,7 +6,7 @@ owns the ClawChat Protocol v2 Gateway; both entry points share profile state,
 REST/local tools, memory, packaged skills, and the output projection code used
 by Hosted Session Bindings. The complete runtime contract is specified in
 `docs/headless-host-spec.md`; delivery is tracked in
-<https://github.com/XMethues/clawchat-plugin-pi-agent/issues/1>.
+<https://github.com/XMethues/clawchat-pi-agent/issues/1>.
 
 ## Components
 
