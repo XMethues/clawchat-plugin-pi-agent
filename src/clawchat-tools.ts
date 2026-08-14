@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import { Type, type TSchema } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ClawchatApiClient, ClawchatApiError } from "./clawchat-api.js";
+import { materializeClawchatGroupMemory } from "./clawchat-awareness.js";
 import {
   ClawchatMemoryStore,
   clawchatMemoryTarget,
@@ -39,6 +40,7 @@ export interface ClawchatToolEnvironment {
   sendFrame?: (frame: Record<string, unknown>) => Promise<void>;
   recordToolCall?: (record: ClawchatToolCallRecord) => void;
   onTerminalSend?: () => void;
+  onConversationLeft?: (chatId: string) => Promise<void>;
   livewareExecutable?: string;
   now?: () => number;
   idFactory?: () => string;
@@ -326,6 +328,7 @@ const TOOL_SPECS: ToolSpec[] = [
       const conversationId = requiredString(args.conversationId, "conversationId");
       const result = await env.api.post(`/v1/conversations/${encodeURIComponent(conversationId)}/leave`);
       await env.memory.delete(clawchatMemoryTarget("group", conversationId));
+      await env.onConversationLeft?.(conversationId);
       return result;
     }
   },
@@ -641,28 +644,26 @@ async function pullGroupMetadata(
   env: ClawchatToolEnvironment,
   target: ClawchatMemoryTarget
 ): Promise<Record<string, unknown>> {
+  const refreshGeneration = env.memory.beginMetadataRefresh(target);
   const result = await env.api.get(
     `/v1/conversations/${encodeURIComponent(target.targetId)}`
   );
   const conversation = unwrapDetail(result, "conversation");
-  const group = isUnknownRecord(conversation.group) ? conversation.group : {};
   const participants = Array.isArray(conversation.participants)
     ? conversation.participants.filter(isUnknownRecord)
-    : [];
-  const participantIds = participants
+    : undefined;
+  const participantIds = (participants ?? [])
     .map((participant) => firstValue(participant, ["id", "user_id", "userId"]))
     .filter((value): value is string => typeof value === "string" && value.length > 0);
-  const metadata: Record<string, unknown> = {
-    group_id: target.targetId,
-    group_type: firstValue(conversation, ["type", "conversation_type", "conversationType"]),
-    group_title: firstValue(conversation, ["title"]) ?? group.title,
-    group_description: firstValue(conversation, ["description"]) ?? group.description,
-    group_owner_id: firstValue(conversation, ["creator_id", "creatorId"]),
-    group_created_at: firstValue(conversation, ["created_at", "createdAt"]),
-    updated_at: firstValue(conversation, ["updated_at", "updatedAt"]),
-    participant_ids: participantIds.join(",")
-  };
-  await env.memory.writeMetadata(target, metadata);
+  await materializeClawchatGroupMemory({
+    api: env.api,
+    memory: env.memory,
+    chatId: target.targetId,
+    conversationState: result,
+    requireGroup: true,
+    refreshGeneration
+  });
+  const current = await env.memory.read(target);
   const failures: Array<Record<string, string>> = [];
   for (const userId of participantIds) {
     const userTarget = clawchatMemoryTarget("user", userId);
@@ -681,7 +682,7 @@ async function pullGroupMetadata(
   return {
     ok: failures.length === 0,
     ...target,
-    metadata,
+    metadata: current.metadata,
     partialFailures: failures
   };
 }
@@ -928,6 +929,7 @@ function firstValue(source: Record<string, unknown>, keys: string[]): unknown {
   }
   return undefined;
 }
+
 
 function inferMime(path: string): string {
   const extension = extname(path).toLowerCase();

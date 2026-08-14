@@ -375,6 +375,7 @@ describe("HeadlessPiHost", () => {
         dispatchedTraceIds.push(String(frame.trace_id));
         if (dispatchedTraceIds.length === 3) dispatched.resolve();
       },
+      getInfo: async () => emptySessionInfo("session-mentions"),
       abort: async () => undefined,
       dispose: async () => undefined
     }));
@@ -615,6 +616,7 @@ describe("HeadlessPiHost", () => {
         residueAtRecoveredTurn = await inboundMediaEntries(mediaRoot);
         recoveredWorkObserved.resolve();
       },
+      getInfo: async () => emptySessionInfo("session-media-recovery"),
       abort: async () => undefined,
       dispose: async () => undefined
     }));
@@ -897,5 +899,18 @@ function groupMentionFrame(
         context: { mentions, reply: null }
       }
     }
+  };
+}
+
+function emptySessionInfo(sessionId: string) {
+  return {
+    sessionId,
+    userMessages: 0,
+    assistantMessages: 0,
+    toolCalls: 0,
+    toolResults: 0,
+    totalMessages: 0,
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    cost: 0
   };
 }

@@ -17,11 +17,11 @@ Pi-native operating guidance packaged with the ClawChat Pi Package and automatic
 _Avoid_: extension source-code behavior, runtime-downloaded prompt
 
 **Headless Pi Host**:
-The long-lived, non-interactive Node.js process that runs one Host Profile, embeds Pi through the SDK, exclusively owns its ClawChat Gateway and Chat Session Registry, and creates a Hosted Session Binding for each loaded Chat Session.
+The long-lived, non-interactive Node.js process that runs one Host Profile, embeds Pi through the SDK, exclusively owns its ClawChat Gateway and Chat Session Registry, and creates a Hosted Session Binding for each loaded Active Chat Session.
 _Avoid_: hidden Pi process, TUI, standalone extension, shared Gateway owner
 
 **Hosted Session Binding**:
-The Host-minted binding that gives one Headless Chat Session its Active ClawChat Turn, ClawChat tools, and Reply Delivery through the Host-owned integration core. It cannot create, start, stop, or reconnect a ClawChat Gateway.
+The Host-minted binding that gives one loaded Active Chat Session its Active ClawChat Turn, ClawChat tools, and Reply Delivery through the Host-owned integration core. It cannot create, start, stop, or reconnect a ClawChat Gateway.
 _Avoid_: per-session Gateway, public runtime client, standalone session extension
 
 **Host Profile**:
@@ -45,8 +45,8 @@ The second explicit Activation of an existing Host Profile. It preserves only th
 _Avoid_: token refresh, `--new-account` mode, device rotation, Workspace reset
 
 **ClawChat Control Command**:
-A `/clawchat-*` command intercepted by the ClawChat Pi Package instead of dispatched to Pi. Each command declares Chat Session, Group, or Host Profile scope; Host Profile commands require the current owner, while narrower commands remain available to admitted chat participants.
-_Avoid_: Pi slash command, model prompt, unrestricted remote command
+A reserved Slash Command intercepted by the ClawChat Pi Package instead of dispatched to Pi. Commands that manage a Host Profile or Conversation Session Set require the current owner, while Group Dispatch and Output Mode commands remain available to admitted chat participants.
+_Avoid_: model prompt, unrestricted remote command, implicit Pi turn
 
 **Workspace**:
 The locally configured Pi `cwd` and its project resources, tools, and context files. Every Chat Session in a Host Profile uses the same Workspace.
@@ -68,17 +68,25 @@ _Avoid_: Pi session database, in-memory queue, global state database
 A started Headless Pi Host that continuously maintains or reconnects its ClawChat Gateway until the process is stopped. A temporary network interruption does not end the profile's online lifetime.
 _Avoid_: request-scoped connection, disconnect-driven shutdown
 
+**Conversation Session Set**:
+The persistent aggregate owned by one ClawChat conversation identified by `chat_id`. It contains that conversation's Chat Sessions, exactly one Active Chat Session, and one Conversation Work Queue; no Chat Session can move between sets.
+_Avoid_: shared session pool, global session list, cross-chat history
+
 **Chat Session**:
-An isolated, persistent Pi session identified by one ClawChat `chat_id`. Direct and group chats use the same isolation rule, and different chats never share model context.
-_Avoid_: shared agent session, sender session, global conversation
+An isolated, persistent Pi session identified by `session_id` and owned by exactly one Conversation Session Set. A non-empty historical Chat Session can be resumed only within its owning conversation.
+_Avoid_: conversation, sender session, global session
+
+**Active Chat Session**:
+The one Chat Session in a Conversation Session Set that receives the next Chat Turn after all earlier Conversation Work has settled. Replacing it never moves history across ClawChat conversations.
+_Avoid_: latest session, global current session, Active Session Owner
 
 **Chat Session Registry**:
-The Headless Pi Host component that automatically resolves each inbound `chat_id` to exactly one Chat Session in the Host Profile's Workspace and owns creation and restoration of its `AgentSessionRuntime`. Once loaded, that runtime remains resident for the Online Host Profile's lifetime and is disposed during Host shutdown rather than by an idle timeout or LRU policy.
+The Headless Pi Host component that creates or restores Conversation Session Sets, loads the Active Chat Session required by queued work, and keeps each loaded runtime resident for the Online Host Profile's lifetime unless an explicit Session Transition or conversation deletion disposes it.
 _Avoid_: message router, global session
 
-**Chat Turn Queue**:
-The durable FIFO queue owned by one Chat Session for accepted ClawChat messages and ClawChat Awareness Turns while that session is busy. A session dispatches only one Pi turn at a time and starts the next item after the current turn settles; different Chat Sessions may run concurrently. Queued work neither interrupts nor steers the active turn, and admission does not produce a separate busy acknowledgement in chat.
-_Avoid_: global queue, interrupt-on-message, steer, concurrent turns
+**Conversation Work Queue**:
+The durable FIFO owned by one Conversation Session Set for accepted Chat Turns and ordered Session Commands. Work before a Session Transition uses the former Active Chat Session and later work uses the replacement; `/stop` alone interrupts outside the FIFO and cancels earlier queued work.
+_Avoid_: global queue, Chat Turn Queue, interrupt-on-message, steer
 
 **ClawChat Awareness Turn**:
 A Pi turn created from an actionable, content-free ClawChat signal after authoritative state is refreshed, rather than from a user's chat message. It is routed only to the owner's direct Chat Session; moment-comment signals remain distinct, while lower-priority contact and conversation changes may be consolidated.
@@ -89,8 +97,8 @@ The non-encrypted transfer of retained ClawChat message pages between two device
 _Avoid_: server replay, Pi session import, encrypted history sync
 
 **Group Dispatch Mode**:
-The per-group policy `mention`, `all`, or `muted` that controls whether an accepted ClawChat message enters its Chat Session. `muted` still consumes, deduplicates, and acknowledges frames but never dispatches them to Pi; direct chats always dispatch, while groups default to `mention`.
-_Avoid_: subscription state, WebSocket mute, replay pause
+The per-group policy `mention`, `all`, or `muted` that controls whether an accepted ClawChat message becomes a Chat Turn. It never controls whether the group's Conversation Session Set exists; `muted` still consumes, deduplicates, and acknowledges frames without invoking Pi, direct chats always dispatch, and groups default to `mention`.
+_Avoid_: subscription state, Session creation policy, WebSocket mute, replay pause
 
 **Execution Authority**:
 The native tool and operating-system authority of the Pi process. Every message admitted by Group Dispatch Mode runs with the same Pi configuration and process permissions; this equality does not grant Host Profile administration, whose ClawChat Control Commands require the current owner.
@@ -109,7 +117,7 @@ The bounded conversion or Turn-scoped local handoff of ordered ClawChat image, a
 _Avoid_: URL forwarding, permanent attachment storage, Workspace upload
 
 **Output Mode**:
-The effective `minimal`, `normal`, or `full` policy for projecting Pi output into ClawChat. A Host Profile defaults to `normal`, and each Chat Session may persist a mode override through `/clawchat-output minimal|normal|full|inherit`; `inherit` removes the session override and follows the profile default. A command in one chat never changes another chat's override, and no mode changes Pi tool execution.
+The effective `minimal`, `normal`, or `full` policy for projecting Pi output into ClawChat. A Host Profile defaults to `normal`, and each ClawChat conversation may persist an override through `/clawchat-output minimal|normal|full|inherit`; `inherit` removes the conversation override and follows the profile default. Session Transitions never change it, and no mode changes Pi tool execution.
 _Avoid_: tool-execution policy, global-only toggle, model instruction, independent thinking switch
 
 **Active Session Owner**:

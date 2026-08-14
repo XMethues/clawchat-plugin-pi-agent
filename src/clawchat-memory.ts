@@ -55,6 +55,7 @@ const METADATA_FIELDS: Record<ClawchatMemoryTargetType, Record<string, true>> = 
   },
   group: {
     updated_at: true,
+    group_authoritative_updated_at: true,
     group_id: true,
     group_type: true,
     group_title: true,
@@ -71,7 +72,18 @@ const METADATA_FIELDS: Record<ClawchatMemoryTargetType, Record<string, true>> = 
 };
 
 export class ClawchatMemoryStore {
+  private readonly targetMutations = new Map<string, Promise<void>>();
+  private readonly metadataRefreshGenerations = new Map<string, number>();
+
   constructor(readonly root: string) {}
+
+  beginMetadataRefresh(target: ClawchatMemoryTarget): number {
+    validateTarget(target);
+    const key = `${target.targetType}:${target.targetId}`;
+    const generation = (this.metadataRefreshGenerations.get(key) ?? 0) + 1;
+    this.metadataRefreshGenerations.set(key, generation);
+    return generation;
+  }
 
   async read(target: ClawchatMemoryTarget): Promise<ClawchatMemoryFile> {
     const path = await this.safePath(target);
@@ -135,20 +147,22 @@ export class ClawchatMemoryStore {
     mode: "append" | "replace",
     content: string
   ): Promise<void> {
-    const current = await this.read(target);
-    const normalized = normalizeLines(content);
-    let body: string;
-    if (mode === "append") {
-      if (!normalized) throw new Error("append content must be non-empty");
-      body = current.body
-        ? `${current.body}${current.body.endsWith("\n") || normalized.startsWith("\n") ? "" : "\n"}${normalized}`
-        : normalized;
-    } else if (mode === "replace") {
-      body = normalized;
-    } else {
-      throw new Error("mode must be append or replace");
-    }
-    await this.atomicWrite(current.path, renderContent(current.metadata, body));
+    await this.mutateTarget(target, async () => {
+      const current = await this.read(target);
+      const normalized = normalizeLines(content);
+      let body: string;
+      if (mode === "append") {
+        if (!normalized) throw new Error("append content must be non-empty");
+        body = current.body
+          ? `${current.body}${current.body.endsWith("\n") || normalized.startsWith("\n") ? "" : "\n"}${normalized}`
+          : normalized;
+      } else if (mode === "replace") {
+        body = normalized;
+      } else {
+        throw new Error("mode must be append or replace");
+      }
+      await this.atomicWrite(current.path, renderContent(current.metadata, body));
+    });
   }
 
   async editBody(
@@ -157,39 +171,89 @@ export class ClawchatMemoryStore {
     newText: string
   ): Promise<void> {
     if (!oldText) throw new Error("oldText must be non-empty");
-    const current = await this.read(target);
-    const oldValue = normalizeLines(oldText);
-    const occurrences = current.body.split(oldValue).length - 1;
-    if (occurrences !== 1) throw new Error("oldText must match exactly one body occurrence");
-    await this.atomicWrite(
-      current.path,
-      renderContent(current.metadata, current.body.replace(oldValue, normalizeLines(newText)))
-    );
+    await this.mutateTarget(target, async () => {
+      const current = await this.read(target);
+      const oldValue = normalizeLines(oldText);
+      const occurrences = current.body.split(oldValue).length - 1;
+      if (occurrences !== 1) throw new Error("oldText must match exactly one body occurrence");
+      await this.atomicWrite(
+        current.path,
+        renderContent(current.metadata, current.body.replace(oldValue, normalizeLines(newText)))
+      );
+    });
   }
 
   async writeMetadata(
     target: ClawchatMemoryTarget,
     metadata: Record<string, unknown>
   ): Promise<void> {
-    const current = await this.read(target);
-    const filtered = filterMetadata(target, metadata);
-    if (!filtered.updated_at) filtered.updated_at = String(Date.now());
-    await this.atomicWrite(current.path, renderContent(filtered, current.body));
+    await this.mutateTarget(target, async () => {
+      const current = await this.read(target);
+      const filtered = filterMetadata(target, metadata);
+      if (!filtered.updated_at) filtered.updated_at = String(Date.now());
+      await this.atomicWrite(current.path, renderContent(filtered, current.body));
+    });
   }
 
   async writeMetadataIfChanged(
     target: ClawchatMemoryTarget,
     metadata: Record<string, unknown>
   ): Promise<boolean> {
-    const current = await this.read(target);
-    const filtered = filterMetadata(target, metadata);
-    if (!filtered.updated_at && current.metadata.updated_at) {
-      filtered.updated_at = current.metadata.updated_at;
-    }
-    if (metadataEquals(current.metadata, filtered)) return false;
-    if (!filtered.updated_at) filtered.updated_at = String(Date.now());
-    await this.atomicWrite(current.path, renderContent(filtered, current.body));
-    return true;
+    return this.mutateTarget(target, async () => {
+      const current = await this.read(target);
+      const filtered = filterMetadata(target, metadata);
+      if (!filtered.updated_at && current.metadata.updated_at) {
+        filtered.updated_at = current.metadata.updated_at;
+      }
+      if (metadataEquals(current.metadata, filtered)) return false;
+      if (!filtered.updated_at) filtered.updated_at = String(Date.now());
+      await this.atomicWrite(current.path, renderContent(filtered, current.body));
+      return true;
+    });
+  }
+  async mergeMetadataIfChanged(
+    target: ClawchatMemoryTarget,
+    metadata: Record<string, unknown>,
+    signal?: AbortSignal,
+    refreshGeneration?: number
+  ): Promise<boolean> {
+    return this.mutateTarget(target, async () => {
+      if (signal?.aborted) throw new Error("ClawChat memory metadata merge was aborted");
+      const current = await this.read(target);
+      if (
+        refreshGeneration !== undefined &&
+        this.metadataRefreshGenerations.get(`${target.targetType}:${target.targetId}`) !==
+          refreshGeneration
+      ) {
+        return false;
+      }
+      const currentAuthoritativeVersion = target.targetType === "group"
+        ? current.metadata.group_authoritative_updated_at
+        : current.metadata.updated_at;
+      if (isOlderMetadataVersion(metadata.updated_at, currentAuthoritativeVersion)) return false;
+      const patch = filterMetadata(target, metadata);
+      const candidate: Record<string, unknown> = { ...current.metadata, ...patch };
+      if (target.targetType === "group" && metadata.updated_at !== undefined) {
+        candidate.group_authoritative_updated_at = metadata.updated_at;
+      }
+      for (const [key, value] of Object.entries(metadata)) {
+        if (value === null && METADATA_FIELDS[target.targetType][key]) delete candidate[key];
+      }
+      const merged = filterMetadata(target, candidate);
+      if (metadataEquals(current.metadata, merged)) return false;
+      if (signal?.aborted) throw new Error("ClawChat memory metadata merge was aborted");
+      const committed = await this.atomicWrite(
+        current.path,
+        renderContent(merged, current.body),
+        () =>
+          !signal?.aborted &&
+          (refreshGeneration === undefined ||
+            this.metadataRefreshGenerations.get(`${target.targetType}:${target.targetId}`) ===
+              refreshGeneration)
+      );
+      if (signal?.aborted) throw new Error("ClawChat memory metadata merge was aborted");
+      return committed;
+    });
   }
 
   async writeRecoverySnapshotIfChanged(snapshot: unknown): Promise<boolean> {
@@ -213,12 +277,14 @@ export class ClawchatMemoryStore {
   }
 
   async delete(target: ClawchatMemoryTarget): Promise<void> {
-    const path = await this.safePath(target);
-    try {
-      await unlink(path);
-    } catch (error: unknown) {
-      if (!isFileSystemError(error, "ENOENT")) throw error;
-    }
+    await this.mutateTarget(target, async () => {
+      const path = await this.safePath(target);
+      try {
+        await unlink(path);
+      } catch (error: unknown) {
+        if (!isFileSystemError(error, "ENOENT")) throw error;
+      }
+    });
   }
 
   async renderTurnContext(input: TurnMemoryInput): Promise<string> {
@@ -259,6 +325,28 @@ export class ClawchatMemoryStore {
       .sort();
   }
 
+  private async mutateTarget<T>(
+    target: ClawchatMemoryTarget,
+    operation: () => Promise<T>
+  ): Promise<T> {
+    validateTarget(target);
+    const key = `${target.targetType}:${target.targetId}`;
+    const previous = this.targetMutations.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.catch(() => undefined).then(() => gate);
+    this.targetMutations.set(key, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.targetMutations.get(key) === tail) this.targetMutations.delete(key);
+    }
+  }
+
   private async safePath(target: ClawchatMemoryTarget): Promise<string> {
     validateTarget(target);
     const parent =
@@ -280,13 +368,22 @@ export class ClawchatMemoryStore {
     return path;
   }
 
-  private async atomicWrite(path: string, content: string): Promise<void> {
+  private async atomicWrite(
+    path: string,
+    content: string,
+    shouldCommit: () => boolean = () => true
+  ): Promise<boolean> {
     await mkdir(dirname(path), { recursive: true, mode: 0o700 });
     const temp = `${path}.${process.pid}.${crypto.randomUUID()}.tmp`;
     await writeFile(temp, content, { encoding: "utf8", mode: 0o600 });
     await chmod(temp, 0o600);
+    if (!shouldCommit()) {
+      await unlink(temp);
+      return false;
+    }
     await rename(temp, path);
     await chmod(path, 0o600);
+    return true;
   }
 }
 
@@ -374,6 +471,24 @@ function metadataEquals(
     leftKeys.length === rightKeys.length &&
     leftKeys.every((key) => left[key] === right[key])
   );
+}
+
+function isOlderMetadataVersion(incoming: unknown, current: unknown): boolean {
+  const incomingValue = typeof incoming === "string" || typeof incoming === "number"
+    ? String(incoming).trim()
+    : "";
+  const currentValue = typeof current === "string" || typeof current === "number"
+    ? String(current).trim()
+    : "";
+  if (!incomingValue || !currentValue) return false;
+  if (/^\d+$/.test(incomingValue) && /^\d+$/.test(currentValue)) {
+    return BigInt(incomingValue) < BigInt(currentValue);
+  }
+  const incomingTime = Date.parse(incomingValue);
+  const currentTime = Date.parse(currentValue);
+  return Number.isFinite(incomingTime) &&
+    Number.isFinite(currentTime) &&
+    incomingTime < currentTime;
 }
 
 export function serializeClawchatSnapshot(value: unknown): string {

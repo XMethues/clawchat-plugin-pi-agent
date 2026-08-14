@@ -1,4 +1,4 @@
-import { access, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
 import { tmpdir } from "node:os";
@@ -57,8 +57,9 @@ afterEach(async () => {
 });
 
 describe("real Headless Host inbound media conformance", () => {
-  it("acknowledges durable admission before fetch and keeps dispatched media private and isolated", async () => {
+  it("durably admits a dispatched media frame before its fetch and keeps dispatched media private and isolated", async () => {
     const server = await listen();
+    const restOrigin = websocketUrl(server).replace(/^ws/, "http");
     const agentDir = await temporaryDirectory();
     const workspace = join(agentDir, "workspace");
     await mkdir(workspace);
@@ -67,7 +68,7 @@ describe("real Headless Host inbound media conformance", () => {
     await profiles.completeActivation(
       "default",
       {
-        restUrl: websocketUrl(server).replace(/^ws/, "http"),
+        restUrl: restOrigin,
         accessToken: "media-conformance-access",
         agent: {
           id: "agent-media-conformance",
@@ -77,7 +78,7 @@ describe("real Headless Host inbound media conformance", () => {
       },
       {
         websocketUrl: websocketUrl(server),
-        mediaUrl: websocketUrl(server).replace(/^ws/, "http")
+        mediaUrl: restOrigin
       }
     );
 
@@ -112,9 +113,8 @@ describe("real Headless Host inbound media conformance", () => {
     const disposedSessionPaths: string[] = [];
     const fetchUrls: string[] = [];
     let acknowledgedDseq = 0;
-    let firstReliableAckWriteCompleted = false;
     let firstFetchBoundary:
-      | { ackWriteCompleted: boolean; persistedFrame: Record<string, unknown> | undefined }
+      | { persistedFrame: Record<string, unknown> | undefined }
       | undefined;
     let secondPromptHasStarted = false;
 
@@ -128,9 +128,21 @@ describe("real Headless Host inbound media conformance", () => {
           .get(DIRECT_FIRST_ID) as { frame_json: string } | undefined;
         database.close();
         firstFetchBoundary = {
-          ackWriteCompleted: firstReliableAckWriteCompleted,
           persistedFrame: row ? (JSON.parse(row.frame_json) as Record<string, unknown>) : undefined
         };
+      }
+      if (url === `${restOrigin}/v1/conversations/${GROUP_CHAT_ID}`) {
+        return Response.json({
+          conversation: {
+            id: GROUP_CHAT_ID,
+            type: "group",
+            title: "Media Conformance",
+            participants: [
+              { user_id: "owner-media-conformance" },
+              { user_id: AGENT_USER_ID }
+            ]
+          }
+        });
       }
       if (url === URLS.directImage) {
         return new Response(SMALL_PNG, { headers: { "content-type": "image/png" } });
@@ -203,44 +215,6 @@ describe("real Headless Host inbound media conformance", () => {
         }
       };
     };
-
-    const originalWebSocketSend = WebSocket.prototype.send;
-    vi.spyOn(WebSocket.prototype, "send").mockImplementation(
-      function (
-        this: WebSocket,
-        data: Parameters<typeof originalWebSocketSend>[0],
-        optionsOrCallback?:
-          | Parameters<typeof originalWebSocketSend>[1]
-          | ((error?: Error) => void),
-        callback?: (error?: Error) => void
-      ) {
-        let isFirstReliableAck = false;
-        if (typeof data === "string") {
-          const frame = JSON.parse(data) as Record<string, any>;
-          isFirstReliableAck =
-            frame.event === "message.sync_ack" && Number(frame.payload?.dseq) === 1;
-        }
-
-        const sendCallback =
-          typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
-        const completionCallback =
-          isFirstReliableAck && sendCallback
-            ? (error?: Error) => {
-                if (!error) firstReliableAckWriteCompleted = true;
-                sendCallback(error);
-              }
-            : sendCallback;
-
-        if (typeof optionsOrCallback === "object") {
-          return originalWebSocketSend.call(this, data, optionsOrCallback, completionCallback);
-        }
-        return Reflect.apply(
-          originalWebSocketSend as unknown as (...args: unknown[]) => void,
-          this,
-          completionCallback ? [data, completionCallback] : [data]
-        );
-      } as typeof WebSocket.prototype.send
-    );
 
     let connectionNumber = 0;
     server.on("connection", (socket) => {
@@ -325,7 +299,6 @@ describe("real Headless Host inbound media conformance", () => {
       await starting;
 
       expect(firstFetchBoundary).toMatchObject({
-        ackWriteCompleted: true,
         persistedFrame: {
           event: "message.send",
           dseq: 1,
@@ -348,6 +321,14 @@ describe("real Headless Host inbound media conformance", () => {
       ]);
       expect(groupPrompt.text).toContain("GROUP-DISPATCH");
       expect(groupPrompt.text).toMatch(/\[Attachment 2: .*name=group\.bin;.*path=/);
+      const groupMemory = await readFile(
+        join(profileDirectory, "memory", "groups", `${GROUP_CHAT_ID}.md`),
+        "utf8"
+      );
+      expect(groupMemory).toContain(`group_id: ${GROUP_CHAT_ID}`);
+      expect(groupMemory).toContain(
+        `participant_ids: owner-media-conformance,${AGENT_USER_ID}`
+      );
       expect(firstPrompt.sessionPath).not.toBe(groupPrompt.sessionPath);
 
       const groupAttachmentPath = attachmentPath(groupPrompt.text);
@@ -383,6 +364,7 @@ describe("real Headless Host inbound media conformance", () => {
 
       expect(fetchUrls).toEqual([
         URLS.directImage,
+        `${restOrigin}/v1/conversations/${GROUP_CHAT_ID}`,
         URLS.groupGeneric,
         URLS.directGeneric
       ]);
@@ -427,12 +409,12 @@ describe("real Headless Host inbound media conformance", () => {
       ).toContain(URLS.directImage);
 
       const persisted = GatewayStore.open(gatewayPath);
-      const directMapping = persisted.getChatSession(DIRECT_CHAT_ID);
-      const groupMapping = persisted.getChatSession(GROUP_CHAT_ID);
+      const directMapping = persisted.getActiveChatSession(DIRECT_CHAT_ID);
+      const groupMapping = persisted.getActiveChatSession(GROUP_CHAT_ID);
       expect(directMapping?.sessionPath).toBe(firstPrompt.sessionPath);
       expect(groupMapping?.sessionPath).toBe(groupPrompt.sessionPath);
       expect(directMapping?.sessionPath).not.toBe(groupMapping?.sessionPath);
-      expect(persisted.listQueuedChatIds()).toEqual([]);
+      expect(persisted.listQueuedConversationIds()).toEqual([]);
       persisted.close();
 
       const staleLease = join(mediaRoot, "turn-stale-after-stop");

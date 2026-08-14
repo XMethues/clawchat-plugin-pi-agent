@@ -1,4 +1,4 @@
-import type { ClawchatInboundMessage } from "./types.js";
+import type { ClawchatFragment, ClawchatInboundMessage } from "./types.js";
 
 export function extractInboundText(message: ClawchatInboundMessage): string {
   return message.payload.message.body.fragments
@@ -6,6 +6,16 @@ export function extractInboundText(message: ClawchatInboundMessage): string {
     .map((fragment) => fragment.text)
     .join("")
     .trim();
+}
+
+export function hasMediaFragments(fragments: readonly ClawchatFragment[]): boolean {
+  return fragments.some(
+    (fragment) =>
+      fragment.kind === "image" ||
+      fragment.kind === "file" ||
+      fragment.kind === "audio" ||
+      fragment.kind === "video"
+  );
 }
 
 export function renderInboundPromptHeader(message: ClawchatInboundMessage): string {

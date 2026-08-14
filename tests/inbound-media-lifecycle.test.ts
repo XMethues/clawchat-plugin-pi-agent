@@ -45,6 +45,7 @@ describe("inbound media Turn lifecycle", () => {
     const registry = new ChatSessionRegistry({
       store: fixture.store,
       factory: fixture.factory,
+      reply: async () => undefined,
       onError: (error) => errors.push(error instanceof Error ? error.message : String(error))
     });
 
@@ -54,14 +55,14 @@ describe("inbound media Turn lifecycle", () => {
     expect(await leaseEntries(fixture.mediaRoot)).toEqual([]);
     expect(errors).toEqual(modelError ? [modelError] : []);
     expect(fixture.store.getStatus().sessions).toEqual([
-      expect.objectContaining({ queuedTurns: 0, runningTurns: 0 })
+      expect.objectContaining({ queuedWork: 0, runningWork: 0 })
     ]);
     await registry.shutdown();
     fixture.store.close();
 
     const reopened = GatewayStore.open(fixture.storePath);
-    expect(reopened.recoverAfterRestart()).toEqual({ interruptedTurnIds: [] });
-    expect(reopened.claimNextTurn(message.chat_id)).toBeNull();
+    expect(reopened.recoverAfterRestart()).toEqual({ interruptedWorkIds: [] });
+    expect(reopened.claimNextWork(message.chat_id)).toBeNull();
     reopened.close();
   });
 

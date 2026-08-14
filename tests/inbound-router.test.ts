@@ -13,6 +13,7 @@ describe("ClawchatInboundRouter", () => {
     const router = new ClawchatInboundRouter({
       store,
       agentUserId: "agent-user-1",
+      agentOwnerId: "owner-1",
       reply: async () => undefined
     });
 
@@ -35,6 +36,7 @@ describe("ClawchatInboundRouter", () => {
     const router = new ClawchatInboundRouter({
       store,
       agentUserId: "agent-user-1",
+      agentOwnerId: "owner-1",
       reply: async () => undefined
     });
     const missingContext = groupMessage("missing context", []);
@@ -70,6 +72,7 @@ describe("ClawchatInboundRouter", () => {
     const router = new ClawchatInboundRouter({
       store,
       agentUserId: "agent-user-1",
+      agentOwnerId: "owner-1",
       reply: async () => undefined
     });
     const direct = groupMessage("direct", null);
@@ -91,6 +94,7 @@ describe("ClawchatInboundRouter", () => {
     const router = new ClawchatInboundRouter({
       store,
       agentUserId: "agent-user-1",
+      agentOwnerId: "owner-1",
       reply: async () => undefined
     });
     const direct = imageOnlyMessage(null);
@@ -125,6 +129,7 @@ describe("ClawchatInboundRouter", () => {
     const router = new ClawchatInboundRouter({
       store,
       agentUserId: "agent-user-1",
+      agentOwnerId: "owner-1",
       reply: async (_message, text) => {
         replies.push(text);
       }
@@ -146,6 +151,7 @@ describe("ClawchatInboundRouter", () => {
     const router = new ClawchatInboundRouter({
       store,
       agentUserId: "agent-user-1",
+      agentOwnerId: "owner-1",
       reply: async () => undefined
     });
 
@@ -177,6 +183,7 @@ describe("ClawchatInboundRouter", () => {
     const router = new ClawchatInboundRouter({
       store,
       agentUserId: "agent-user-1",
+      agentOwnerId: "owner-1",
       modeDefault: "normal",
       reply: async (_message, text) => {
         replies.push(text);
@@ -195,6 +202,69 @@ describe("ClawchatInboundRouter", () => {
     store.close();
   });
 
+
+  it("reserves owner-only Pi session commands before muted group dispatch", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-router-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    store.setGroupDispatchMode("group-1", "muted");
+    const replies: string[] = [];
+    const router = new ClawchatInboundRouter({
+      store,
+      agentUserId: "agent-user-1",
+      agentOwnerId: "owner-1",
+      reply: async (_message, text) => {
+        replies.push(text);
+      }
+    });
+    const ownerCommand = (text: string) => {
+      const message = groupMessage(text, []);
+      message.sender.id = "owner-1";
+      return message;
+    };
+
+    expect(router.classify(ownerCommand("/new"))).toEqual({
+      dispatch: false,
+      sessionCommand: { type: "new" }
+    });
+    expect(router.classify(ownerCommand("/session"))).toEqual({
+      dispatch: false,
+      sessionCommand: { type: "session" }
+    });
+    expect(router.classify(ownerCommand("/resume"))).toEqual({
+      dispatch: false,
+      sessionCommand: { type: "resume-list", page: 1 }
+    });
+    expect(router.classify(ownerCommand("/resume list 2"))).toEqual({
+      dispatch: false,
+      sessionCommand: { type: "resume-list", page: 2 }
+    });
+    expect(router.classify(ownerCommand("/resume session-1"))).toEqual({
+      dispatch: false,
+      sessionCommand: { type: "resume", sessionId: "session-1" }
+    });
+    expect(router.classify(ownerCommand("/stop"))).toEqual({ dispatch: false, stop: true });
+
+    const denied = groupMessage("/new", []);
+    const deniedDecision = router.classify(denied);
+    expect(deniedDecision).toEqual({
+      dispatch: false,
+      control: { type: "denied", command: "/new" }
+    });
+    await router.applyAcceptedControl(denied, deniedDecision);
+    expect(replies).toEqual(["/new is available only to the Agent owner."]);
+    const invalid = ownerCommand("/stop now");
+    const invalidDecision = router.classify(invalid);
+    expect(invalidDecision).toEqual({
+      dispatch: false,
+      control: { type: "invalid", usage: "Usage: /stop" }
+    });
+    await router.applyAcceptedControl(invalid, invalidDecision);
+    expect(replies).toEqual([
+      "/new is available only to the Agent owner.",
+      "Usage: /stop"
+    ]);
+    store.close();
+  });
 });
 
 function groupMessage(text: string, mentions: unknown): ClawchatInboundMessage {

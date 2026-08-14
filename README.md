@@ -110,6 +110,27 @@ It preserves the profile's device ID and Workspace but deletes the prior
 Gateway state, tool memory/audit state, profile-local skills, chat mappings,
 queues, and mapped Pi session history before saving the new credentials.
 
+Each ClawChat conversation owns an isolated set of Pi sessions with one active
+session. The Agent owner can manage that set from the conversation:
+
+```text
+/new
+/session
+/resume
+/resume list <page>
+/resume <session-id>
+/stop
+```
+
+`/new` starts a fresh active session while retaining any used session as local
+history. `/session` reports metadata and usage statistics without message
+content. `/resume` lists only history owned by the current conversation, and a
+session ID from another conversation is rejected. These transitions are ordered
+with ordinary messages in the conversation's durable FIFO. `/stop` instead
+mirrors Pi's Escape behavior: it aborts the active turn and cancels work queued
+before the command without undoing completed tool effects; later messages remain
+eligible. Empty sessions replaced by `/new` or `/resume` are deleted.
+
 ClawChat output defaults to `normal`. From the current ClawChat conversation
 handled by the Headless Pi Host, set a per-chat override with:
 
@@ -178,8 +199,10 @@ backoff and reuse the current opaque token.
 The package also declares `skills/clawchat-core` and
 `skills/clawchat-liveware` as Pi skill resources. Both ordinary and Headless Pi
 runtimes discover them with the extension. Owner memory is injected on every
-ClawChat turn, current-group memory is added for group turns, and user memory
-is available only through explicit memory tools.
+ClawChat turn. A first Group Chat Turn durably creates current-group memory from
+its WebSocket identity before Pi runs and enriches it with authoritative group
+details and member IDs; reconnect recovery also materializes newly listed
+groups. User memory is available only through explicit memory tools.
 
 ### Inbound media
 

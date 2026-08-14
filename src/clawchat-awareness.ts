@@ -20,6 +20,8 @@ export interface ClawchatAwarenessCoordinatorOptions {
   agentOwnerId?: string;
   memory?: ClawchatMemoryStore;
   wake(chatId: string): void;
+  observeConversation?: (chatId: string) => Promise<void> | void;
+  deleteConversation?: (chatId: string) => Promise<void> | void;
 }
 
 export interface ClawchatAwarenessFrame {
@@ -32,6 +34,129 @@ export interface ClawchatRecoveryResult {
   changed: boolean;
   admission: AwarenessAdmission | null;
 }
+
+export async function materializeClawchatGroupIdentity(
+  memory: ClawchatMemoryStore,
+  chatId: string
+): Promise<boolean> {
+  const target = clawchatMemoryTarget("group", chatId);
+  return memory.mergeMetadataIfChanged(target, {
+    group_id: chatId,
+    group_type: "group"
+  });
+}
+
+export async function materializeClawchatGroupMemory(options: {
+  api: { get(path: string): Promise<unknown> };
+  memory: ClawchatMemoryStore;
+  chatId: string;
+  conversationState?: unknown;
+  announcements?: unknown;
+  requireGroup?: boolean;
+  signal?: AbortSignal;
+  refreshGeneration?: number;
+}): Promise<boolean> {
+  const target = clawchatMemoryTarget("group", options.chatId);
+  const refreshGeneration =
+    options.refreshGeneration ?? options.memory.beginMetadataRefresh(target);
+  const conversationState =
+    options.conversationState ??
+    await options.api.get(`/v1/conversations/${encodeURIComponent(options.chatId)}`);
+  const outerConversation = unwrapDetail(conversationState, "conversation");
+  const conversation = isUnknownRecord(outerConversation.conversation)
+    ? unwrapDetail(outerConversation, "conversation")
+    : outerConversation;
+  const group = isUnknownRecord(conversation.group) ? conversation.group : {};
+  const conversationType = firstValue(conversation, [
+    "type",
+    "conversation_type",
+    "conversationType"
+  ]);
+  if (conversationType !== "group" && !isUnknownRecord(conversation.group)) {
+    if (options.requireGroup) {
+      throw new Error(`Conversation '${options.chatId}' is not a group`);
+    }
+    return false;
+  }
+  const participants = Array.isArray(conversation.participants)
+    ? conversation.participants.filter(isUnknownRecord)
+    : undefined;
+  const groupOwner = isUnknownRecord(group.owner) ? group.owner : {};
+  const groupOwnerCleared = group.owner === null;
+  const update: Record<string, unknown> = {
+    group_id: options.chatId,
+    group_type: conversationType ?? group.type ?? "group"
+  };
+  const conversationTitle = firstDefinedValue(conversation, ["title"]);
+  setMetadataValue(
+    update,
+    "group_title",
+    conversationTitle === undefined ? firstDefinedValue(group, ["title"]) : conversationTitle
+  );
+  const conversationDescription = firstDefinedValue(conversation, ["description"]);
+  setMetadataValue(
+    update,
+    "group_description",
+    conversationDescription === undefined
+      ? firstDefinedValue(group, ["description"])
+      : conversationDescription
+  );
+  const conversationAvatar = firstDefinedValue(conversation, ["avatar_url", "avatarUrl"]);
+  setMetadataValue(
+    update,
+    "group_avatar_url",
+    conversationAvatar === undefined
+      ? firstDefinedValue(group, ["avatar_url", "avatarUrl"])
+      : conversationAvatar
+  );
+  setMetadataValue(
+    update,
+    "group_member_add_policy",
+    firstDefinedValue(conversation, ["member_add_policy", "memberAddPolicy"])
+  );
+  if (options.announcements !== undefined) {
+    update.group_announcements = serializeClawchatSnapshot(options.announcements);
+  }
+  const creatorId = firstDefinedValue(conversation, ["creator_id", "creatorId"]);
+  setMetadataValue(
+    update,
+    "group_owner_id",
+    creatorId === undefined ? (groupOwnerCleared ? null : groupOwner.id) : creatorId
+  );
+  setMetadataValue(
+    update,
+    "group_owner_nickname",
+    groupOwnerCleared ? null : firstDefinedValue(groupOwner, ["nickname", "name"])
+  );
+  setMetadataValue(
+    update,
+    "group_owner_profile_type",
+    groupOwnerCleared ? null : firstDefinedValue(groupOwner, ["profile_type", "type"])
+  );
+  setMetadataValue(
+    update,
+    "group_created_at",
+    firstDefinedValue(conversation, ["created_at", "createdAt"])
+  );
+  setMetadataValue(
+    update,
+    "updated_at",
+    firstDefinedValue(conversation, ["updated_at", "updatedAt"])
+  );
+  if (participants) {
+    update.participant_ids = participants
+      .map((participant) => firstValue(participant, ["id", "user_id", "userId"]))
+      .filter((value): value is string => typeof value === "string" && value.length > 0)
+      .join(",");
+  }
+  return options.memory.mergeMetadataIfChanged(
+    target,
+    update,
+    options.signal,
+    refreshGeneration
+  );
+}
+
 
 export function renderAwarenessPrompt(frame: ClawchatAwarenessFrame): string {
   return [
@@ -62,6 +187,10 @@ export class ClawchatAwarenessCoordinator {
   private readonly agentOwnerId: string | undefined;
   private readonly memory: ClawchatMemoryStore | undefined;
   private readonly wake: (chatId: string) => void;
+  private readonly observeConversation:
+    ((chatId: string) => Promise<void> | void) | undefined;
+  private readonly deleteConversation:
+    ((chatId: string) => Promise<void> | void) | undefined;
 
   constructor(options: ClawchatAwarenessCoordinatorOptions) {
     if (!options.ownerChatId.trim()) throw new Error("ownerChatId is required");
@@ -73,12 +202,73 @@ export class ClawchatAwarenessCoordinator {
     this.agentOwnerId = options.agentOwnerId?.trim() || undefined;
     this.memory = options.memory;
     this.wake = options.wake;
+    this.observeConversation = options.observeConversation;
+    this.deleteConversation = options.deleteConversation;
   }
 
   async handle(event: ClawchatGatewayEvent): Promise<AwarenessAdmission | null> {
     const sourceId = awarenessSourceId(event);
     if (this.store.getAwarenessSourceTurn(sourceId)) return null;
+    const lifecycleChatId =
+      event.event === "chat.metadata.invalidated"
+        ? requireString(event.chat_id, "chat_id")
+        : event.event === "notify.signal" &&
+            typeof event.payload?.type === "string" &&
+            event.payload.type.startsWith("conversation.")
+          ? requireString(event.payload.entity_id, "payload.entity_id")
+          : undefined;
+    if (lifecycleChatId) {
+      if (
+        event.event === "notify.signal" &&
+        event.payload?.type === "conversation.dissolved"
+      ) {
+        await this.deleteConversation?.(lifecycleChatId);
+      } else {
+        await this.observeConversation?.(lifecycleChatId);
+      }
+    }
+    if (
+      this.memory &&
+      event.event === "notify.signal" &&
+      event.payload?.type === "conversation.member_added"
+    ) {
+      await materializeClawchatGroupIdentity(
+        this.memory,
+        requireString(event.payload.entity_id, "payload.entity_id")
+      );
+    }
+    const refreshTargetId =
+      event.event === "chat.metadata.invalidated"
+        ? requireString(event.chat_id, "chat_id")
+        : event.event === "notify.signal" &&
+            typeof event.payload?.type === "string" &&
+            event.payload.type !== "conversation.dissolved" &&
+            event.payload.type.startsWith("conversation.")
+          ? requireString(event.payload.entity_id, "payload.entity_id")
+          : undefined;
+    const refreshGeneration =
+      this.memory && refreshTargetId
+        ? this.memory.beginMetadataRefresh(clawchatMemoryTarget("group", refreshTargetId))
+        : undefined;
     const source = await this.refresh(event);
+    if (
+      this.memory &&
+      source.signalType !== "conversation.dissolved" &&
+      (source.signalType.startsWith("conversation.") ||
+        source.signalType === "chat.metadata.invalidated")
+    ) {
+      const authoritativeState = isUnknownRecord(source.authoritativeState)
+        ? source.authoritativeState
+        : {};
+      await materializeClawchatGroupMemory({
+        api: this.api,
+        memory: this.memory,
+        chatId: source.entityId,
+        conversationState: source.authoritativeState,
+        announcements: authoritativeState.announcements,
+        ...(refreshGeneration === undefined ? {} : { refreshGeneration })
+      });
+    }
     const admission = this.store.enqueueAwareness({
       chatId: this.ownerChatId,
       coalesceKey: isDistinctMomentSignal(source.signalType) ? `moment:${source.sourceId}` : "general",
@@ -98,9 +288,17 @@ export class ClawchatAwarenessCoordinator {
     const knownConversationIds = [
       ...new Set([
         this.ownerChatId,
-        ...this.store.getStatus().sessions.map((session) => session.chatId)
+        ...listedConversationIds,
+        ...this.store.listConversationIds()
       ])
     ].sort();
+    await Promise.all(knownConversationIds.map((chatId) => this.observeConversation?.(chatId)));
+    const refreshGenerations = new Map(
+      knownConversationIds.map((chatId) => [
+        chatId,
+        memory.beginMetadataRefresh(clawchatMemoryTarget("group", chatId))
+      ])
+    );
     const [agentState, ownerState, ...conversationStates] = await Promise.all([
       this.api.get(`/v1/agents/${encodeURIComponent(agentId)}`),
       this.api.get("/v1/agents/me/owner"),
@@ -150,46 +348,15 @@ export class ClawchatAwarenessCoordinator {
       conversation_ids: listedConversationIds.join(",")
     });
 
-    for (const recovered of conversations) {
-      const { chatId, conversation: conversationState, announcements } = recovered;
-      const conversation = unwrapDetail(conversationState, "conversation");
-      const group = isUnknownRecord(conversation.group) ? conversation.group : {};
-      const conversationType = firstValue(conversation, [
-        "type",
-        "conversation_type",
-        "conversationType"
-      ]);
-      if (conversationType !== "group" && !isUnknownRecord(conversation.group)) continue;
-      const participants = Array.isArray(conversation.participants)
-        ? conversation.participants.filter(isUnknownRecord)
-        : [];
-      const participantIds = participants
-        .map((participant) => firstValue(participant, ["id", "user_id", "userId"]))
-        .filter((value): value is string => typeof value === "string" && value.length > 0);
-      const groupOwner = isUnknownRecord(group.owner) ? group.owner : {};
-      const groupChanged = await memory.writeMetadataIfChanged(
-        clawchatMemoryTarget("group", chatId),
-        {
-          group_id: chatId,
-          group_type: conversationType ?? group.type,
-          group_title: conversation.title ?? group.title,
-          group_description: conversation.description ?? group.description,
-          group_avatar_url:
-            firstValue(conversation, ["avatar_url", "avatarUrl"]) ??
-            firstValue(group, ["avatar_url", "avatarUrl"]),
-          group_member_add_policy: firstValue(conversation, [
-            "member_add_policy",
-            "memberAddPolicy"
-          ]),
-          group_announcements: serializeClawchatSnapshot(announcements),
-          group_owner_id: firstValue(conversation, ["creator_id", "creatorId"]) ?? groupOwner.id,
-          group_owner_nickname: firstValue(groupOwner, ["nickname", "name"]),
-          group_owner_profile_type: firstValue(groupOwner, ["profile_type", "type"]),
-          group_created_at: firstValue(conversation, ["created_at", "createdAt"]),
-          updated_at: firstValue(conversation, ["updated_at", "updatedAt"]),
-          participant_ids: participantIds.join(",")
-        }
-      );
+    for (const recovered of groupConversations) {
+      const groupChanged = await materializeClawchatGroupMemory({
+        api: this.api,
+        memory,
+        chatId: recovered.chatId,
+        conversationState: recovered.conversation,
+        announcements: recovered.announcements,
+        refreshGeneration: refreshGenerations.get(recovered.chatId)!
+      });
       changed = groupChanged || changed;
     }
 
@@ -340,6 +507,21 @@ function firstValue(source: Record<string, unknown>, keys: string[]): unknown {
     if (source[key] !== undefined && source[key] !== null) return source[key];
   }
   return undefined;
+}
+
+function firstDefinedValue(source: Record<string, unknown>, keys: string[]): unknown {
+  for (const key of keys) {
+    if (source[key] !== undefined) return source[key];
+  }
+  return undefined;
+}
+
+function setMetadataValue(
+  metadata: Record<string, unknown>,
+  key: string,
+  value: unknown
+): void {
+  if (value !== undefined) metadata[key] = value;
 }
 
 

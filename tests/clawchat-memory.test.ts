@@ -216,6 +216,170 @@ describe("ClawchatMemoryStore", () => {
     ).resolves.toBe(true);
   });
 
+  it("serializes concurrent metadata patches with agent-authored body writes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "clawchat-pi-memory-concurrency-"));
+    const memory = new ClawchatMemoryStore(root);
+    const group = clawchatMemoryTarget("group", "group-1");
+    await memory.writeBody(group, "replace", "Original group note.");
+
+    await Promise.all([
+      memory.mergeMetadataIfChanged(group, {
+        group_title: "ZPR8",
+        group_announcements: '[{"id":"announcement-1","text":"Current"}]'
+      }),
+      memory.mergeMetadataIfChanged(group, {
+        participant_ids: "owner-1,agent-user-1"
+      }),
+      memory.writeBody(group, "append", "Additional group note.")
+    ]);
+
+    await expect(memory.read(group)).resolves.toMatchObject({
+      metadata: {
+        group_id: "group-1",
+        group_title: "ZPR8",
+        group_announcements: '[{"id":"announcement-1","text":"Current"}]',
+        participant_ids: "owner-1,agent-user-1"
+      },
+      body: "Original group note.\nAdditional group note."
+    });
+  });
+
+  it("rejects stale metadata patches and applies authoritative clears", async () => {
+    const root = await mkdtemp(join(tmpdir(), "clawchat-pi-memory-version-"));
+    const memory = new ClawchatMemoryStore(root);
+    const group = clawchatMemoryTarget("group", "group-1");
+
+    await expect(
+      memory.mergeMetadataIfChanged(group, {
+        group_id: "group-1",
+        group_type: "group"
+      })
+    ).resolves.toBe(true);
+    expect((await memory.read(group)).metadata).not.toHaveProperty("updated_at");
+    await memory.mergeMetadataIfChanged(group, {
+      group_title: "Current",
+      group_description: "Remove me",
+      updated_at: "2026-08-12T10:00:00.000Z"
+    });
+    await expect(
+      memory.mergeMetadataIfChanged(group, {
+        group_title: "Stale",
+        group_description: null,
+        updated_at: "2026-08-12T09:00:00.000Z"
+      })
+    ).resolves.toBe(false);
+    await expect(memory.read(group)).resolves.toMatchObject({
+      metadata: {
+        group_title: "Current",
+        group_description: "Remove me",
+        updated_at: "2026-08-12T10:00:00.000Z"
+      }
+    });
+
+    await memory.mergeMetadataIfChanged(group, {
+      group_description: null,
+      updated_at: "2026-08-12T11:00:00.000Z"
+    });
+    const cleared = await memory.read(group);
+    expect(cleared.metadata).not.toHaveProperty("group_description");
+    expect(cleared.metadata.updated_at).toBe("2026-08-12T11:00:00.000Z");
+  });
+
+  it("accepts the first authoritative version over an unmarked legacy timestamp", async () => {
+    const root = await mkdtemp(join(tmpdir(), "clawchat-pi-memory-version-migration-"));
+    const memory = new ClawchatMemoryStore(root);
+    const group = clawchatMemoryTarget("group", "group-1");
+    await memory.writeMetadata(group, {
+      group_title: "Legacy",
+      updated_at: "9999999999999"
+    });
+
+    await expect(
+      memory.mergeMetadataIfChanged(group, {
+        group_title: "Current",
+        updated_at: "9"
+      })
+    ).resolves.toBe(true);
+    await expect(memory.read(group)).resolves.toMatchObject({
+      metadata: {
+        group_title: "Current",
+        updated_at: "9",
+        group_authoritative_updated_at: "9"
+      }
+    });
+    await expect(
+      memory.mergeMetadataIfChanged(group, {
+        group_title: "Stale",
+        updated_at: "8"
+      })
+    ).resolves.toBe(false);
+    expect((await memory.read(group)).metadata.group_title).toBe("Current");
+  });
+
+  it("rejects an unversioned response superseded by a newer refresh", async () => {
+    const root = await mkdtemp(join(tmpdir(), "clawchat-pi-memory-generation-"));
+    const memory = new ClawchatMemoryStore(root);
+    const group = clawchatMemoryTarget("group", "group-1");
+    const olderRefresh = memory.beginMetadataRefresh(group);
+    const newerRefresh = memory.beginMetadataRefresh(group);
+
+    await expect(
+      memory.mergeMetadataIfChanged(
+        group,
+        { group_title: "Current", participant_ids: "owner-1,agent-user-1" },
+        undefined,
+        newerRefresh
+      )
+    ).resolves.toBe(true);
+    await expect(
+      memory.mergeMetadataIfChanged(
+        group,
+        { group_title: "Stale", participant_ids: "owner-1" },
+        undefined,
+        olderRefresh
+      )
+    ).resolves.toBe(false);
+    await expect(memory.read(group)).resolves.toMatchObject({
+      metadata: {
+        group_title: "Current",
+        participant_ids: "owner-1,agent-user-1"
+      }
+    });
+  });
+
+  it("does not commit a metadata patch aborted while waiting to write", async () => {
+    const root = await mkdtemp(join(tmpdir(), "clawchat-pi-memory-abort-"));
+    const memory = new ClawchatMemoryStore(root);
+    const group = clawchatMemoryTarget("group", "group-1");
+    await memory.writeBody(group, "replace", "Keep this group note.");
+    const originalRead = memory.read.bind(memory);
+    const readStarted = Promise.withResolvers<void>();
+    const continueRead = Promise.withResolvers<void>();
+    vi.spyOn(memory, "read").mockImplementationOnce(async (target) => {
+      const current = await originalRead(target);
+      readStarted.resolve();
+      await continueRead.promise;
+      return current;
+    });
+    const controller = new AbortController();
+    const merging = memory.mergeMetadataIfChanged(
+      group,
+      { participant_ids: "owner-1,agent-user-1" },
+      controller.signal
+    );
+
+    await readStarted.promise;
+    controller.abort();
+    continueRead.resolve();
+
+    await expect(merging).rejects.toThrow("aborted");
+    await expect(originalRead(group)).resolves.toMatchObject({
+      metadata: {},
+      body: "Keep this group note."
+    });
+    expect((await originalRead(group)).metadata).not.toHaveProperty("participant_ids");
+  });
+
   it("rejects traversal-like explicit target ids", async () => {
     expect(() => clawchatMemoryTarget("user", "../owner")).toThrow("single safe file id");
   });

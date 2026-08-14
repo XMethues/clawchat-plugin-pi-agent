@@ -20,24 +20,26 @@ by Hosted Session Bindings. The complete runtime contract is specified in
   opaque credentials, structured agent/agent-user/owner identity, independent
   REST/WebSocket/Media endpoints, atomic profile writes, and the exclusive
   per-profile operation lease shared by Activation and Host ownership.
-- `gateway-store.ts` owns SQLite-backed durable admission, per-chat queues,
-  stable message deduplication, reliable quarantine and replay-truncation state,
-  output/group settings, session mappings, and the outbound Outbox.
+- `gateway-store.ts` owns SQLite-backed durable admission, per-conversation
+  work queues, stable message deduplication, reliable quarantine and
+  replay-truncation state, output/group settings, Conversation Session Sets,
+  and the outbound Outbox.
 - `gateway.ts` owns challenge/connect, capability negotiation, replay gating,
   reliable-delivery v1/v2 acknowledgements, repeatable token and nonce recovery,
   reconnect, self-echo filtering, and materialized outbound delivery with
   bounded ACK deadlines.
-- `session-registry.ts` owns one resident runtime per `chat_id`, cross-chat
-  concurrency, same-chat FIFO, restart recovery, and graceful shutdown.
-- `pi-session-factory.ts` creates isolated native Pi SDK sessions in the Host
-  Profile Workspace and restores their standard JSONL files.
+- `session-registry.ts` owns each conversation's active runtime, cross-chat
+  concurrency, same-conversation FIFO, Session Transitions, restart recovery,
+  conversation deletion, and graceful shutdown.
+- `pi-session-factory.ts` creates, inspects, deletes, and restores isolated
+  native Pi SDK sessions in the Host Profile Workspace using standard JSONL.
 - `headless-host.ts` composes the profile, Store, Gateway, router, Registry,
   Pi session factory, and shutdown lifecycle for `clawchat-pi run`.
 - `inbound.ts` extracts materialized ClawChat text and renders the Pi prompt.
 - `inbound-router.ts` applies direct/group dispatch and integration commands
   before a message reaches Pi.
-- `output-settings.ts` resolves the Host Profile tool-output default and
-  per-chat `on`, `off`, or `inherit` override.
+- `output-settings.ts` resolves the Host Profile Output Mode default and
+  per-conversation `minimal`, `normal`, `full`, or `inherit` override.
 - `output-projector.ts` maps completed Pi assistant, thinking, tool, and
   `MEDIA:` attachment output to complete, unquoted `message.send` messages in
   direct chats and quoted `message.reply` messages in group chats, and brackets

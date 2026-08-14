@@ -143,7 +143,7 @@ describe("clawchat-pi CLI", () => {
       }
     );
     const store = GatewayStore.open(join(profiles.profileDirectory("default"), "gateway.sqlite"));
-    store.getOrCreateChatSession("chat-1", () => ({
+    store.ensureConversationSessionSet("chat-1", () => ({
       sessionId: "session-1",
       sessionPath: "/sessions/session-1.jsonl"
     }));

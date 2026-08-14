@@ -106,6 +106,7 @@ export class HeadlessPiHost {
       const router = new ClawchatInboundRouter({
         store,
         agentUserId: profile.agent.userId,
+        agentOwnerId: profile.agent.ownerId,
         modeDefault: profile.output.modeDefault,
         reply: async (message, text) => {
           await replyProjector.replyTo(message, text);
@@ -127,16 +128,26 @@ export class HeadlessPiHost {
             if (!gateway) throw new Error("ClawChat Gateway is not started");
             await gateway.send(frame);
           },
-          recordToolCall: (record) => store.recordToolCall(record)
+          recordToolCall: (record) => store.recordToolCall(record),
+          onConversationLeft: async (chatId) => {
+            void this.registry?.deleteConversation(chatId).catch((error: unknown) => {
+              this.onStatus?.(
+                `conversation ${chatId} deletion failed: ${error instanceof Error ? error.message : String(error)}`
+              );
+            });
+          }
         }
       });
       await factory.cleanupStaleInboundMedia();
       const registry = new ChatSessionRegistry({
         store,
         factory,
-        onError: (error, turn) => {
+        reply: async (message, text) => {
+          await router.replyControl(message, text);
+        },
+        onError: (error, work) => {
           this.onStatus?.(
-            `turn ${turn.id} interrupted: ${error instanceof Error ? error.message : String(error)}`
+            `work ${work.id} interrupted: ${error instanceof Error ? error.message : String(error)}`
           );
         },
         onWorkerError: (error, chatId) => {
@@ -164,7 +175,13 @@ export class HeadlessPiHost {
                   `awareness turn for ${chatId} failed: ${error instanceof Error ? error.message : String(error)}`
                 );
               });
-            }
+            },
+            observeConversation: (chatId) => {
+              if (!this.stopping) registry.ensureConversation(chatId);
+            },
+            deleteConversation: async (chatId) => {
+              if (!this.stopping) await registry.deleteConversation(chatId);
+            },
           })
         : undefined;
       const historySync = new ClawchatPlaintextHistorySync({
@@ -186,8 +203,19 @@ export class HeadlessPiHost {
         userId: profile.agent.userId,
         store,
         classifyInbound: (message) => router.classify(message),
-        onAcceptedControl: async (message, decision) => {
+        onAcceptedControl: async (message, decision, result) => {
+          if (decision.stop) {
+            const stopped = await registry.stop(message.chat_id);
+            await router.replyControl(
+              message,
+              `Stopped: active turn ${stopped.interrupted ? "interrupted" : "not running"}; queued work cancelled ${result.cancelledWork}.`
+            );
+            return;
+          }
           await router.applyAcceptedControl(message, decision);
+        },
+        onConversationObserved: (message) => {
+          registry.ensureConversation(message.chat_id);
         },
         onInboundMessage: async (message) => {
           void registry.wake(message.chat_id).catch((error: unknown) => {
@@ -237,7 +265,7 @@ export class HeadlessPiHost {
         ...(this.onStatus ? { onStatus: this.onStatus } : {})
       });
       this.gateway = gateway;
-      await registry.start();
+      registry.start();
       await gateway.start();
       if (awareness) {
         for (const frame of store.listReliableFrames("notify.signal")) {

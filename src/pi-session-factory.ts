@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, rmSync } from "node:fs";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -7,12 +7,18 @@ import {
   type AgentSession,
   type CreateAgentSessionOptions
 } from "@earendil-works/pi-coding-agent";
-import { isClawchatAwarenessFrame, renderAwarenessPrompt } from "./clawchat-awareness.js";
-import type { ChatSessionRecord, ChatTurn, GatewayStore } from "./gateway-store.js";
+import {
+  isClawchatAwarenessFrame,
+  materializeClawchatGroupIdentity,
+  materializeClawchatGroupMemory,
+  renderAwarenessPrompt
+} from "./clawchat-awareness.js";
+import type { ChatSessionMapping, ChatTurn, GatewayStore } from "./gateway-store.js";
+import { clawchatMemoryTarget } from "./clawchat-memory.js";
 import { createHeadlessClawchatPiExtension } from "./headless-extension.js";
-import { renderInboundPrompt } from "./inbound.js";
 import {
   InboundMediaMaterializer,
+  plainInboundTurn,
   type InboundMediaOptions,
   type MaterializedInboundTurn,
   type PiPromptImage
@@ -22,9 +28,12 @@ import type { ClawchatInboundMessage, ClawchatTransport } from "./types.js";
 import type { ClawchatOutputMode } from "./output-settings.js";
 import type { ClawchatToolEnvironment } from "./clawchat-tools.js";
 
+const DEFAULT_GROUP_MEMORY_ENRICHMENT_TIMEOUT_MS = 2_000;
+
 type PiSessionSurface = {
   prompt(text: string, options?: { images?: PiPromptImage[] }): Promise<void>;
   sendCustomMessage: AgentSession["sendCustomMessage"];
+  getSessionStats?: AgentSession["getSessionStats"];
   abort: AgentSession["abort"];
   dispose: AgentSession["dispose"];
 };
@@ -41,6 +50,7 @@ export interface PiChatSessionFactoryOptions {
   sessionDir?: string;
   outputModeDefault?: ClawchatOutputMode;
   tools?: ClawchatToolEnvironment;
+  groupMemoryEnrichmentTimeoutMs?: number;
   media?: InboundMediaOptions;
   createAgentSessionFn?: CreateAgentSessionFn;
 }
@@ -54,6 +64,7 @@ export class PiChatSessionFactory implements ChatSessionFactory {
   private readonly sessionDir: string | undefined;
   private readonly outputModeDefault: ClawchatOutputMode;
   private readonly tools: ClawchatToolEnvironment | undefined;
+  private readonly groupMemoryEnrichmentTimeoutMs: number;
   private readonly mediaMaterializer: InboundMediaMaterializer | undefined;
   private readonly createAgentSessionFn: CreateAgentSessionFn;
 
@@ -65,6 +76,14 @@ export class PiChatSessionFactory implements ChatSessionFactory {
     this.sessionDir = options.sessionDir;
     this.outputModeDefault = options.outputModeDefault ?? "normal";
     this.tools = options.tools;
+    this.groupMemoryEnrichmentTimeoutMs =
+      options.groupMemoryEnrichmentTimeoutMs ?? DEFAULT_GROUP_MEMORY_ENRICHMENT_TIMEOUT_MS;
+    if (
+      !Number.isFinite(this.groupMemoryEnrichmentTimeoutMs) ||
+      this.groupMemoryEnrichmentTimeoutMs <= 0
+    ) {
+      throw new Error("groupMemoryEnrichmentTimeoutMs must be positive");
+    }
     this.mediaMaterializer = options.media
       ? new InboundMediaMaterializer(options.media)
       : undefined;
@@ -84,7 +103,30 @@ export class PiChatSessionFactory implements ChatSessionFactory {
     return { sessionId: sessionManager.getSessionId(), sessionPath };
   }
 
-  async openSession(mapping: ChatSessionRecord): Promise<ChatSessionDriver> {
+  async inspectSession(mapping: ChatSessionMapping): Promise<{
+    name?: string;
+    messageCount: number;
+  }> {
+    const prepared = this.newSessions.get(mapping.sessionPath);
+    const manager = prepared ??
+      (existsSync(mapping.sessionPath)
+        ? SessionManager.open(mapping.sessionPath, this.sessionDir)
+        : undefined);
+    if (!manager) return { messageCount: 0 };
+    const name = manager.getSessionName();
+    const messageCount = manager.getEntries().filter((entry) => entry.type === "message").length;
+    return {
+      ...(name ? { name } : {}),
+      messageCount
+    };
+  }
+
+  async deleteSession(mapping: ChatSessionMapping): Promise<void> {
+    this.newSessions.delete(mapping.sessionPath);
+    rmSync(mapping.sessionPath, { force: true });
+  }
+
+  async openSession(mapping: ChatSessionMapping): Promise<ChatSessionDriver> {
     const prepared = this.newSessions.get(mapping.sessionPath);
     this.newSessions.delete(mapping.sessionPath);
     let sessionManager: SessionManager;
@@ -135,6 +177,7 @@ export class PiChatSessionFactory implements ChatSessionFactory {
       materializationAbort: AbortController | undefined;
       completion: Promise<void>;
     } | undefined;
+    let groupMemoryEnriched = false;
     const runTrackedTurn = async (
       materializationAbort: AbortController | undefined,
       operation: () => Promise<void>
@@ -208,15 +251,60 @@ export class PiChatSessionFactory implements ChatSessionFactory {
         const materializationAbort = new AbortController();
         await runTrackedTurn(materializationAbort, async () => {
           let materialized: MaterializedInboundTurn | undefined;
+          if (message.chat_type === "group" && this.tools) {
+            await materializeClawchatGroupIdentity(this.tools.memory, message.chat_id);
+            if (materializationAbort.signal.aborted) {
+              throw new Error("Group memory enrichment was aborted");
+            }
+            if (!groupMemoryEnriched) {
+              const current = await this.tools.memory.read(
+                clawchatMemoryTarget("group", message.chat_id)
+              );
+              groupMemoryEnriched = hasParticipantIds(current.metadata);
+            }
+            if (!groupMemoryEnriched) {
+              try {
+                const refreshGeneration = this.tools.memory.beginMetadataRefresh(
+                  clawchatMemoryTarget("group", message.chat_id)
+                );
+                const conversationState = await waitForGroupMemoryEnrichment(
+                  this.tools.api.get(
+                    `/v1/conversations/${encodeURIComponent(message.chat_id)}`
+                  ),
+                  materializationAbort.signal,
+                  this.groupMemoryEnrichmentTimeoutMs
+                );
+                if (materializationAbort.signal.aborted) {
+                  throw new Error("Group memory enrichment was aborted");
+                }
+                await materializeClawchatGroupMemory({
+                  api: this.tools.api,
+                  memory: this.tools.memory,
+                  chatId: message.chat_id,
+                  conversationState,
+                  requireGroup: true,
+                  signal: materializationAbort.signal,
+                  refreshGeneration
+                });
+                const enriched = await this.tools.memory.read(
+                  clawchatMemoryTarget("group", message.chat_id)
+                );
+                groupMemoryEnriched = hasParticipantIds(enriched.metadata);
+              } catch (error: unknown) {
+                if (materializationAbort.signal.aborted) {
+                  throw new Error("Group memory enrichment was aborted", { cause: error });
+                }
+              }
+            }
+          }
+          if (materializationAbort.signal.aborted) {
+            throw new Error("Inbound Turn materialization was aborted");
+          }
           await headless.controller.beginTurn(message);
           try {
             materialized = this.mediaMaterializer
               ? await this.mediaMaterializer.materialize(message, materializationAbort.signal)
-              : {
-                  prompt: renderInboundPrompt(message),
-                  images: [],
-                  release: async () => undefined
-                };
+              : plainInboundTurn(message);
             if (materializationAbort.signal.aborted) {
               throw new Error("Inbound media materialization was aborted");
             }
@@ -236,6 +324,38 @@ export class PiChatSessionFactory implements ChatSessionFactory {
           }
         });
       },
+      getInfo: async () => {
+        const stats = session.getSessionStats?.();
+        const name = sessionManager.getSessionName();
+        if (stats) {
+          return {
+            ...(name ? { name } : {}),
+            sessionId: stats.sessionId,
+            userMessages: stats.userMessages,
+            assistantMessages: stats.assistantMessages,
+            toolCalls: stats.toolCalls,
+            toolResults: stats.toolResults,
+            totalMessages: stats.totalMessages,
+            tokens: stats.tokens,
+            cost: stats.cost
+          };
+        }
+        const messages = sessionManager
+          .getEntries()
+          .filter((entry) => entry.type === "message")
+          .map((entry) => entry.message);
+        return {
+          ...(name ? { name } : {}),
+          sessionId: mapping.sessionId,
+          userMessages: messages.filter((message) => message.role === "user").length,
+          assistantMessages: messages.filter((message) => message.role === "assistant").length,
+          toolCalls: 0,
+          toolResults: messages.filter((message) => message.role === "toolResult").length,
+          totalMessages: messages.length,
+          tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          cost: 0
+        };
+      },
       abort: async () => {
         await abortCurrentTurn(true);
       },
@@ -247,6 +367,39 @@ export class PiChatSessionFactory implements ChatSessionFactory {
         }
       }
     };
+  }
+
+}
+
+function hasParticipantIds(metadata: Record<string, string>): boolean {
+  return typeof metadata.participant_ids === "string" &&
+    metadata.participant_ids.split(",").some((id) => id.trim().length > 0);
+}
+
+async function waitForGroupMemoryEnrichment<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+  timeoutMs: number
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  const interrupted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(new Error("Group memory enrichment was aborted"));
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeout(
+      () => reject(new Error(`Group memory enrichment timed out after ${timeoutMs}ms`)),
+      timeoutMs
+    );
+  });
+  try {
+    return await Promise.race([operation, interrupted]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }
 

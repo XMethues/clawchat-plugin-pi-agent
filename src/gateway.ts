@@ -44,9 +44,14 @@ export interface ClawChatGatewayOptions {
   userId: string;
   store: GatewayStore;
   onInboundMessage: (message: ClawchatInboundMessage) => Promise<void>;
+  onConversationObserved?: (message: ClawchatInboundMessage) => Promise<void> | void;
   shouldDispatch?: (message: ClawchatInboundMessage) => boolean;
   classifyInbound?: (message: ClawchatInboundMessage) => InboundDecision;
-  onAcceptedControl?: (message: ClawchatInboundMessage, decision: InboundDecision) => Promise<void>;
+  onAcceptedControl?: (
+    message: ClawchatInboundMessage,
+    decision: InboundDecision,
+    result: { cancelledWork: number }
+  ) => Promise<void>;
   onAwarenessSignal?: (event: ClawchatGatewayEvent) => Promise<void>;
   onHistoryTransit?: (event: ClawchatGatewayEvent) => Promise<void>;
   onDeliveryReceipt?: (event: ClawchatGatewayEvent) => Promise<void>;
@@ -86,10 +91,7 @@ interface InboundStreamState {
 interface AcceptedInboundFollowUp {
   message: ClawchatInboundMessage;
   decision: InboundDecision;
-}
-interface QueuedAcceptedInboundFollowUp {
-  id: number;
-  followUp: AcceptedInboundFollowUp;
+  cancelledWork: number;
 }
 interface OutboundAckDeadline {
   handle: unknown;
@@ -123,9 +125,6 @@ export class ClawChatGateway {
   private readonly outboundAckDeadlines = new Map<string, OutboundAckDeadline>();
   private outboxReconciliationPending = false;
   private readonly inboundStreams = new Map<string, InboundStreamState>();
-  private readonly acceptedInboundFollowUps: QueuedAcceptedInboundFollowUp[] = [];
-  private acceptedInboundFollowUpDrain: Promise<void> = Promise.resolve();
-  private nextAcceptedInboundFollowUpId = 1;
 
   constructor(options: ClawChatGatewayOptions) {
     this.options = options;
@@ -244,25 +243,25 @@ export class ClawChatGateway {
       if (ready && !this.replayComplete) this.armReplayIdleFallback();
       this.frameQueue = this.frameQueue
         .then(() =>
-          this.handleRawFrame(
-            raw,
-            {
-              ready: () => {
-                if (ready) return;
-                ready = true;
-                clearTimeout(handshakeTimer);
-                socket.off("error", failBeforeReady);
-                this.options.onStatus?.("connected");
-                resolve();
-              },
-              reject
+          this.handleRawFrame(raw, {
+            ready: () => {
+              if (ready) return;
+              ready = true;
+              clearTimeout(handshakeTimer);
+              socket.off("error", failBeforeReady);
+              this.options.onStatus?.("connected");
+              resolve();
             },
-            socket
-          )
+            reject
+          })
         )
         .catch((error: unknown) => {
           const message = error instanceof Error ? error.message : String(error);
-          this.options.onStatus?.(`protocol error: ${message}`);
+          this.options.onStatus?.(
+            error instanceof InboundFollowUpError
+              ? `inbound follow-up failed: ${message}`
+              : `protocol error: ${message}`
+          );
           if (!ready) reject(error instanceof Error ? error : new Error(message));
           socket.close();
         });
@@ -286,8 +285,7 @@ export class ClawChatGateway {
 
   private async handleRawFrame(
     raw: WebSocket.RawData,
-    handshake: { ready: () => void; reject: (error: Error) => void },
-    socket: WebSocket
+    handshake: { ready: () => void; reject: (error: Error) => void }
   ): Promise<void> {
     const rawText = raw.toString();
     let decoded: unknown;
@@ -326,7 +324,7 @@ export class ClawChatGateway {
         this.options.onStatus?.("quarantined non-ackable frame with untrusted dseq");
         throw new ReconnectableProtocolError(reason);
       }
-      await this.handleDseqFrame(decoded, dseq, socket);
+      await this.handleDseqFrame(decoded, dseq);
       return;
     }
 
@@ -353,13 +351,12 @@ export class ClawChatGateway {
       this.options.onStatus?.("quarantined non-ackable reliable frame without dseq");
       throw new ReconnectableProtocolError(reason);
     }
-    await this.handleFrame(envelope, handshake, socket);
+    await this.handleFrame(envelope, handshake);
   }
 
   private async handleFrame(
     envelope: ProtocolEnvelope,
-    handshake: { ready: () => void; reject: (error: Error) => void },
-    socket: WebSocket
+    handshake: { ready: () => void; reject: (error: Error) => void }
   ): Promise<void> {
     if (envelope.event === "connect.challenge") {
       this.sendRaw({
@@ -529,11 +526,9 @@ export class ClawChatGateway {
       const followUp = await this.persistReliableInbound(envelope);
       this.ackHighWater = Math.max(this.ackHighWater, envelope.seq);
       if (followUp) {
-        this.queueAcceptedInboundFollowUp(followUp);
-        await this.flushAcknowledgement(socket, this.shutdownAckTimeoutMs);
-      } else {
-        this.scheduleAcknowledgement(envelope.event === "replay.done");
+        await this.runAcceptedInboundFollowUp(followUp);
       }
+      this.scheduleAcknowledgement(envelope.event === "replay.done");
       if (envelope.event === "replay.done") this.completeReplay();
       return;
     }
@@ -552,8 +547,7 @@ export class ClawChatGateway {
 
   private async handleDseqFrame(
     decoded: Record<string, unknown>,
-    dseq: number,
-    socket: WebSocket
+    dseq: number
   ): Promise<void> {
     if (dseq <= this.lastReadDseq) {
       this.ackHighWater = Math.max(this.ackHighWater, this.lastReadDseq);
@@ -583,13 +577,10 @@ export class ClawChatGateway {
     }
     this.ackHighWater = dseq;
     if (envelope?.event === "replay.done") this.completeReplay();
-    if (!followUp) {
-      this.scheduleAcknowledgement(envelope?.event === "replay.done");
-      return;
+    if (followUp) {
+      await this.runAcceptedInboundFollowUp(followUp);
     }
-
-    this.queueAcceptedInboundFollowUp(followUp);
-    await this.flushAcknowledgement(socket, this.shutdownAckTimeoutMs);
+    this.scheduleAcknowledgement(envelope?.event === "replay.done");
   }
 
   private async persistReliableInbound(
@@ -686,60 +677,34 @@ export class ClawChatGateway {
       chatId: envelope.chat_id,
       frame: envelope,
       dispatch: decision.dispatch,
-      queueTurn: this.options.queueTurns !== false
+      queueTurn: this.options.queueTurns !== false,
+      ...(decision.sessionCommand ? { sessionCommand: decision.sessionCommand } : {}),
+      ...(decision.stop ? { stop: true } : {})
     });
     if (!ownMessage && emitReceipt) this.sendDeliveryReceipt(envelope);
-    if (
-      admission.status !== "accepted" ||
-      (!decision.control && !decision.dispatch)
-    ) {
-      return undefined;
-    }
-    return { message: envelope, decision };
-  }
-
-  private queueAcceptedInboundFollowUp(followUp: AcceptedInboundFollowUp): void {
-    this.acceptedInboundFollowUps.push({
-      id: this.nextAcceptedInboundFollowUpId,
-      followUp
-    });
-    this.nextAcceptedInboundFollowUpId += 1;
-  }
-
-  private drainAcceptedInboundFollowUpsThrough(acknowledgedId: number): Promise<void> {
-    const drain = this.acceptedInboundFollowUpDrain.then(async () => {
-      while (true) {
-        const queued = this.acceptedInboundFollowUps[0];
-        if (!queued || queued.id > acknowledgedId) return;
-        this.acceptedInboundFollowUps.shift();
-        await this.runAcceptedInboundFollowUpSafely(queued.followUp);
-      }
-    });
-    this.acceptedInboundFollowUpDrain = drain;
-    return drain;
+    if (admission.status !== "accepted") return undefined;
+    return {
+      message: envelope,
+      decision,
+      cancelledWork: admission.cancelledWork
+    };
   }
 
   private async runAcceptedInboundFollowUp({
     message,
-    decision
+    decision,
+    cancelledWork
   }: AcceptedInboundFollowUp): Promise<void> {
-    if (decision.control) {
-      await this.options.onAcceptedControl?.(message, decision);
-    } else {
-      await this.options.onInboundMessage(message);
-    }
-  }
-
-  private async runAcceptedInboundFollowUpSafely(
-    followUp: AcceptedInboundFollowUp
-  ): Promise<void> {
     try {
-      await this.runAcceptedInboundFollowUp(followUp);
+      await this.options.onConversationObserved?.(message);
+      if (decision.control || decision.stop) {
+        await this.options.onAcceptedControl?.(message, decision, { cancelledWork });
+      } else if (decision.dispatch || decision.sessionCommand) {
+        await this.options.onInboundMessage(message);
+      }
     } catch (error: unknown) {
-      this.options.onStatus?.(
-        `accepted inbound follow-up failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`
+      throw new InboundFollowUpError(
+        error instanceof Error ? error.message : String(error)
       );
     }
   }
@@ -915,7 +880,6 @@ export class ClawChatGateway {
     writeTimeoutMs?: number
   ): Promise<void> {
     if (this.ackHighWater <= 0) return;
-    const acknowledgedFollowUpId = this.acceptedInboundFollowUps.at(-1)?.id ?? 0;
     let acknowledgement: ProtocolEnvelope;
     if (this.ackMode === "dseq" && this.ackEpoch) {
       acknowledgement = {
@@ -960,9 +924,7 @@ export class ClawChatGateway {
         this.timer.cancel(timeoutHandle);
       }
     }
-    await this.drainAcceptedInboundFollowUpsThrough(acknowledgedFollowUpId);
   }
-
 
   private reportAcknowledgementWriteFailure(error: unknown): void {
     this.options.onStatus?.(
@@ -1188,6 +1150,8 @@ class ReconnectableHandshakeError extends Error {}
 class TransientHandshakeError extends ReconnectableHandshakeError {}
 
 class ReconnectableProtocolError extends ReconnectableHandshakeError {}
+
+class InboundFollowUpError extends Error {}
 
 function delay(milliseconds: number): Promise<void> {
   const { promise, resolve } = Promise.withResolvers<void>();

@@ -151,7 +151,7 @@ describe("InboundMediaMaterializer download boundary", () => {
   });
 
   it.each(["maxAttachmentBytes", "maxTurnBytes"] as const)(
-    "counts bytes from a failed body against %s across its retry",
+    "does not count bytes from a failed body against the retry's %s budget",
     async (budgetKey) => {
       const failedBytes = 8;
       const combinedBudget = failedBytes + SMALL_PNG.byteLength - 1;
@@ -176,12 +176,33 @@ describe("InboundMediaMaterializer download boundary", () => {
 
       expect(fetchFn).toHaveBeenCalledTimes(2);
       expect(retryDelay).toHaveBeenCalledOnce();
-      expect(result.images).toEqual([]);
-      expect(result.prompt).toMatch(/\[Image \d+ unavailable:/);
+      expect(result.images).toHaveLength(1);
+      expect(result.prompt).toContain("[Image 1]");
       await result.release();
       expect(await leaseEntries(rootDir)).toEqual([]);
     }
   );
+
+  it("retries a late full-size partial transfer with a fresh attachment budget", async () => {
+    const retryDelay = vi.fn(async (_milliseconds: number, _signal?: AbortSignal) => undefined);
+    const first = failingAfterChunks(splitEvery(SMALL_PNG, 8));
+    const fetchFn = vi.fn().mockResolvedValueOnce(first.response).mockResolvedValueOnce(pngResponse());
+    const { materializer, rootDir } = await makeMaterializer(fetchFn, {
+      delayFn: retryDelay,
+      policy: { maxAttachmentBytes: SMALL_PNG.byteLength + 8 }
+    });
+
+    const result = await materializer.materialize(
+      imageMessage("late-partial-retry", [image("https://media.clawling.com/late-partial")])
+    );
+
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(retryDelay).toHaveBeenCalledOnce();
+    expect(result.images).toHaveLength(1);
+    expect(result.prompt).toContain("[Image 1]");
+    await result.release();
+    expect(await leaseEntries(rootDir)).toEqual([]);
+  });
 
   it("completes an unknown-length body streamed in multiple chunks", async () => {
     const streamed = chunkedResponse(splitEvery(SMALL_PNG, 7), { "content-type": "image/png" });
@@ -558,6 +579,29 @@ function partiallyFailingResponse(chunk: Uint8Array): Response {
     ),
     { headers: { "content-type": "image/png" } }
   );
+}
+
+function failingAfterChunks(chunks: Uint8Array[]): { response: Response; cancelled: Promise<unknown> } {
+  const cancelled = Promise.withResolvers<unknown>();
+  let index = 0;
+  const response = new Response(
+    new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          const chunk = chunks[index++];
+          if (!chunk) {
+            controller.error(new TypeError("socket reset"));
+            return;
+          }
+          controller.enqueue(chunk);
+        },
+        cancel: cancelled.resolve
+      },
+      { highWaterMark: 0 }
+    ),
+    { headers: { "content-type": "image/png" } }
+  );
+  return { response, cancelled: cancelled.promise };
 }
 
 function stalledResponse() {

@@ -89,7 +89,7 @@ describe("ClawChatGateway", () => {
     store.close();
   });
 
-  it("waits for the dense ACK write after durable admission before accepted follow-up", async () => {
+  it("dispatches an accepted dseq follow-up before writing its ACK", async () => {
     const server = await listen();
     const acked = Promise.withResolvers<Record<string, any>>();
     const acknowledgementWrite = holdAcknowledgementSendCallback("message.sync_ack");
@@ -146,29 +146,29 @@ describe("ClawChatGateway", () => {
     });
 
     await gateway.start();
+    await followedUp.promise;
+    expect(received).toEqual(["msg-01HVB6S7K8L9M0N1P2Q3R4S5T6"]);
     await acknowledgementWrite.callbackHeld.promise;
     const ack = await acked.promise;
     expect(ack.payload).toEqual({ dseq: 1, epoch: "01JXYZ8K3MNPQRSTVWXYZ0AB" });
     expect(store.getReliableHighWater("01JXYZ8K3MNPQRSTVWXYZ0AB")).toBe(1);
-    expect(store.claimNextTurn("chat-1")).toMatchObject({
+    expect(store.claimNextWork("chat-1")).toMatchObject({
       messageId: "msg-01HVB6S7K8L9M0N1P2Q3R4S5T6"
     });
-    expect(received).toEqual([]);
 
     acknowledgementWrite.releaseCallback();
-    await followedUp.promise;
-    expect(received).toEqual(["msg-01HVB6S7K8L9M0N1P2Q3R4S5T6"]);
     await gateway.stop();
     store.close();
   });
 
-  it("wakes an accepted cursor queue only after its ACK write callback completes", async () => {
+  it("propagates an accepted follow-up failure without acknowledging it", async () => {
     const server = await listen();
-    const acked = Promise.withResolvers<Record<string, any>>();
     const acknowledgementWrite = holdAcknowledgementSendCallback("message.cursor_ack");
-    const followUpFailed = Promise.withResolvers<void>();
+    const failureReported = Promise.withResolvers<void>();
+    const closed = Promise.withResolvers<void>();
     const statuses: string[] = [];
     const received: string[] = [];
+    let ackReceived = false;
     server.on("connection", (socket) => {
       socket.send(
         JSON.stringify({
@@ -179,6 +179,7 @@ describe("ClawChatGateway", () => {
           payload: { nonce: "challenge-nonce" }
         })
       );
+      socket.on("close", () => closed.resolve());
       socket.on("message", (raw) => {
         const frame = JSON.parse(raw.toString()) as Record<string, any>;
         if (frame.event === "connect") {
@@ -196,7 +197,7 @@ describe("ClawChatGateway", () => {
           );
           socket.send(JSON.stringify(inboundFrame({ seq: 7 })));
         } else if (frame.event === "message.cursor_ack") {
-          acked.resolve(frame);
+          ackReceived = true;
         }
       });
     });
@@ -214,8 +215,8 @@ describe("ClawChatGateway", () => {
       },
       onStatus: (status) => {
         statuses.push(status);
-        if (status === "accepted inbound follow-up failed: headless wake failed") {
-          followUpFailed.resolve();
+        if (status === "inbound follow-up failed: headless wake failed") {
+          failureReported.resolve();
         }
       },
       createWebSocket: acknowledgementWrite.createWebSocket,
@@ -224,17 +225,11 @@ describe("ClawChatGateway", () => {
     });
 
     await gateway.start();
-    await acknowledgementWrite.callbackHeld.promise;
-    await expect(acked.promise).resolves.toMatchObject({ payload: { seq: 7 } });
-    expect(store.claimNextTurn("chat-1")).toMatchObject({
-      messageId: "msg-01HVB6S7K8L9M0N1P2Q3R4S5T6"
-    });
-    expect(received).toEqual([]);
-
-    acknowledgementWrite.releaseCallback();
-    await followUpFailed.promise;
+    await failureReported.promise;
     expect(received).toEqual(["msg-01HVB6S7K8L9M0N1P2Q3R4S5T6"]);
-    expect(statuses).toContain("accepted inbound follow-up failed: headless wake failed");
+    await closed.promise;
+    expect(statuses).toContain("inbound follow-up failed: headless wake failed");
+    expect(ackReceived).toBe(false);
     expect(store.listQuarantinedFrames()).toEqual([]);
     await gateway.stop();
     store.close();
@@ -257,26 +252,21 @@ describe("ClawChatGateway", () => {
       mode: "cursor"
     }
   ])(
-    "retains an accepted $mode follow-up across an ACK callback error until reconnect succeeds",
+    "dispatches an accepted $mode follow-up even when its ACK write callback fails",
     async ({ acknowledgementEvent, delivery, hello }) => {
       const server = await listen();
-      const successfulAcknowledgement = Promise.withResolvers<Record<string, any>>();
       const followedUp = Promise.withResolvers<void>();
-      const secondConnected = Promise.withResolvers<void>();
-      const releaseSecondDelivery = Promise.withResolvers<void>();
       const createWebSocket = failFirstAcknowledgementSendCallback(acknowledgementEvent);
       let connections = 0;
       server.on("connection", (socket) => {
         connections += 1;
-        const connection = connections;
-        if (connection === 2) secondConnected.resolve();
         socket.send(
           JSON.stringify({
             version: "2",
             event: "connect.challenge",
-            trace_id: `challenge-${connection}`,
+            trace_id: "challenge",
             emitted_at: 1,
-            payload: { nonce: `challenge-nonce-${connection}` }
+            payload: { nonce: "challenge-nonce" }
           })
         );
         socket.on("message", (raw) => {
@@ -295,15 +285,7 @@ describe("ClawChatGateway", () => {
                 }
               })
             );
-            if (connection === 1) {
-              socket.send(JSON.stringify(inboundFrame(delivery)));
-            } else {
-              void releaseSecondDelivery.promise.then(() => {
-                socket.send(JSON.stringify(inboundFrame(delivery)));
-              });
-            }
-          } else if (frame.event === acknowledgementEvent && connection === 2) {
-            successfulAcknowledgement.resolve(frame);
+            socket.send(JSON.stringify(inboundFrame(delivery)));
           }
         });
       });
@@ -320,27 +302,26 @@ describe("ClawChatGateway", () => {
         onInboundMessage,
         createWebSocket,
         ackDebounceMs: 0,
-        reconnect: true,
-        reconnectDelay: () => 0,
+        reconnect: false,
         onStatus: (status) => statuses.push(status)
       });
 
       await gateway.start();
-      await secondConnected.promise;
-      expect(onInboundMessage).not.toHaveBeenCalled();
-      releaseSecondDelivery.resolve();
-      await successfulAcknowledgement.promise;
       await followedUp.promise;
-      expect(connections).toBe(2);
       expect(onInboundMessage).toHaveBeenCalledTimes(1);
-      expect(statuses).toContain("protocol error: simulated acknowledgement callback failure");
+      expect(connections).toBe(1);
+      await waitFor(() =>
+        statuses.includes(
+          "acknowledgement write failed: simulated acknowledgement callback failure"
+        )
+      );
       await gateway.stop();
       expect(onInboundMessage).toHaveBeenCalledTimes(1);
       store.close();
     }
   );
 
-  it("bounds an accepted ACK callback already blocking the frame queue during stop", async () => {
+  it("bounds a pending ACK write already blocking shutdown", async () => {
     const server = await listen();
     const acknowledgementWrite = holdAcknowledgementSendCallback("message.sync_ack");
     const acknowledgement = Promise.withResolvers<Record<string, any>>();
@@ -392,6 +373,7 @@ describe("ClawChatGateway", () => {
       onInboundMessage,
       createWebSocket: acknowledgementWrite.createWebSocket,
       shutdownAckTimeoutMs: 1_000,
+      ackDebounceMs: 0,
       timer: clock.timer,
       reconnect: false
     });
@@ -401,6 +383,7 @@ describe("ClawChatGateway", () => {
     await expect(acknowledgement.promise).resolves.toMatchObject({
       payload: { dseq: 1, epoch: "shutdown-ack-epoch" }
     });
+    expect(onInboundMessage).toHaveBeenCalledOnce();
     const stopping = gateway.stop();
     let settled = false;
     void stopping.then(() => {
@@ -413,7 +396,6 @@ describe("ClawChatGateway", () => {
     await stopping;
     await closed.promise;
     expect(clock.pendingTimers()).toBe(0);
-    expect(onInboundMessage).not.toHaveBeenCalled();
     store.close();
   });
 
@@ -470,7 +452,7 @@ describe("ClawChatGateway", () => {
     await gateway.start();
     await expect(acked.promise).resolves.toMatchObject({ payload: { seq: 8 } });
     await gateway.stop();
-    expect(store.claimNextTurn("chat-1")).toBeNull();
+    expect(store.claimNextWork("chat-1")).toBeNull();
     expect(onInboundMessage).not.toHaveBeenCalled();
     expect(store.listQuarantinedFrames()).toEqual([]);
     store.close();
@@ -1444,10 +1426,10 @@ describe("ClawChatGateway", () => {
 
     await gateway.start();
     await expect(acked).resolves.toMatchObject({ payload: { seq: 42 } });
-    const first = store.claimNextTurn("chat-1");
+    const first = store.claimNextWork("chat-1");
     expect(first).toMatchObject({ messageId: "msg-01HVB6S7K8L9M0N1P2Q3R4S5T6" });
-    store.completeTurn(first!.id);
-    expect(store.claimNextTurn("chat-1")).toMatchObject({
+    store.completeWork(first!.id);
+    expect(store.claimNextWork("chat-1")).toMatchObject({
       messageId: "msg-01HVB6S7K8L9M0N1P2Q3R4S5T7"
     });
     await gateway.stop();
@@ -1508,7 +1490,7 @@ describe("ClawChatGateway", () => {
     await gateway.start();
     await closed;
     expect(statuses).toContain("protocol error: expected dseq 1, received 2");
-    expect(store.listQueuedChatIds()).toEqual([]);
+    expect(store.listQueuedConversationIds()).toEqual([]);
     await gateway.stop();
     store.close();
   });

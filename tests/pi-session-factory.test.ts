@@ -2,6 +2,8 @@ import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, expect, it, vi, type Mock } from "vitest";
+import { ClawchatMemoryStore, clawchatMemoryTarget } from "../src/clawchat-memory.js";
+import type { ClawchatToolEnvironment } from "../src/clawchat-tools.js";
 import { GatewayStore } from "../src/gateway-store.js";
 import { PiChatSessionFactory } from "../src/pi-session-factory.js";
 
@@ -63,7 +65,7 @@ describe("PiChatSessionFactory", () => {
       store,
       transport: { send: async () => undefined }
     });
-    const original = store.getOrCreateChatSession("chat-1", () => firstFactory.createSession("chat-1"));
+    const original = store.ensureConversationSessionSet("chat-1", () => firstFactory.createSession("chat-1"));
     const restartedFactory = new PiChatSessionFactory({
       workspace,
       agentDir,
@@ -74,11 +76,299 @@ describe("PiChatSessionFactory", () => {
 
     const driver = await restartedFactory.openSession(original);
 
-    const recovered = store.getChatSession("chat-1");
+    const recovered = store.getActiveChatSession("chat-1");
     expect(recovered?.sessionId).toBe(original.sessionId);
     expect(recovered?.sessionPath).toContain(original.sessionId);
     await driver.dispose();
     store.close();
+  });
+
+  it("materializes current-group identity and members from the first group WebSocket Turn", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-sdk-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const store = GatewayStore.open(join(agentDir, "gateway.sqlite"));
+    const memory = new ClawchatMemoryStore(join(agentDir, "memory"));
+    const get = vi.fn(async (path: string) => {
+      expect(path).toBe("/v1/conversations/group-1");
+      return {
+        conversation: {
+          id: "group-1",
+          type: "group",
+          title: "ZPR8",
+          participants: [
+            { user_id: "owner-1" },
+            { user_id: "agent-user-1" },
+            { user_id: "member-2" }
+          ]
+        }
+      };
+    });
+    const prompt = vi.fn(async () => {
+      const currentGroup = await memory.read(clawchatMemoryTarget("group", "group-1"));
+      expect(currentGroup.exists).toBe(true);
+      expect(currentGroup.metadata).toMatchObject({
+        group_id: "group-1",
+        group_type: "group",
+        group_title: "ZPR8",
+        participant_ids: "owner-1,agent-user-1,member-2"
+      });
+    });
+    const factory = new PiChatSessionFactory({
+      workspace,
+      agentDir,
+      sessionDir: join(agentDir, "sessions"),
+      createAgentSessionFn: async () => ({
+        session: {
+          prompt,
+          sendCustomMessage: async () => undefined,
+          abort: async () => undefined,
+          dispose: () => undefined
+        }
+      }),
+      tools: {
+        memory,
+        api: { get },
+        profile: () => ({})
+      } as unknown as ClawchatToolEnvironment,
+      store,
+      transport: { send: async () => undefined }
+    });
+    const created = factory.createSession("group-1");
+    const driver = await factory.openSession({ chatId: "group-1", ...created });
+
+    try {
+      await expect(driver.runTurn(groupTurn("turn-group"))).resolves.toBeUndefined();
+      await expect(driver.runTurn(groupTurn("turn-group-later"))).resolves.toBeUndefined();
+      expect(get).toHaveBeenCalledOnce();
+      expect(prompt).toHaveBeenCalledTimes(2);
+    } finally {
+      await driver.dispose();
+      store.close();
+    }
+  });
+
+  it("retries group enrichment when a partial detail has no participant IDs", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-sdk-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const store = GatewayStore.open(join(agentDir, "gateway.sqlite"));
+    const memory = new ClawchatMemoryStore(join(agentDir, "memory"));
+    let request = 0;
+    const get = vi.fn(async () => {
+      request += 1;
+      return {
+        conversation: {
+          id: "group-1",
+          type: "group",
+          title: "ZPR8",
+          participants:
+            request === 1
+              ? []
+              : [{ user_id: "owner-1" }, { user_id: "agent-user-1" }]
+        }
+      };
+    });
+    const factory = new PiChatSessionFactory({
+      workspace,
+      agentDir,
+      sessionDir: join(agentDir, "sessions"),
+      createAgentSessionFn: async () => ({
+        session: {
+          prompt: async () => undefined,
+          sendCustomMessage: async () => undefined,
+          abort: async () => undefined,
+          dispose: () => undefined
+        }
+      }),
+      tools: {
+        memory,
+        api: { get },
+        profile: () => ({})
+      } as unknown as ClawchatToolEnvironment,
+      store,
+      transport: { send: async () => undefined }
+    });
+    const created = factory.createSession("group-1");
+    const driver = await factory.openSession({ chatId: "group-1", ...created });
+
+    try {
+      await driver.runTurn(groupTurn("turn-group-partial"));
+      await driver.runTurn(groupTurn("turn-group-complete"));
+      expect(get).toHaveBeenCalledTimes(2);
+      await expect(
+        memory.read(clawchatMemoryTarget("group", "group-1"))
+      ).resolves.toMatchObject({
+        metadata: { participant_ids: "owner-1,agent-user-1" }
+      });
+    } finally {
+      await driver.dispose();
+      store.close();
+    }
+  });
+
+  it("keeps the WebSocket group identity when member enrichment fails", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-sdk-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const store = GatewayStore.open(join(agentDir, "gateway.sqlite"));
+    const memory = new ClawchatMemoryStore(join(agentDir, "memory"));
+    const prompt = vi.fn(async () => {
+      await expect(
+        memory.read(clawchatMemoryTarget("group", "group-1"))
+      ).resolves.toMatchObject({
+        exists: true,
+        metadata: { group_id: "group-1", group_type: "group" }
+      });
+    });
+    const factory = new PiChatSessionFactory({
+      workspace,
+      agentDir,
+      sessionDir: join(agentDir, "sessions"),
+      groupMemoryEnrichmentTimeoutMs: 10,
+      createAgentSessionFn: async () => ({
+        session: {
+          prompt,
+          sendCustomMessage: async () => undefined,
+          abort: async () => undefined,
+          dispose: () => undefined
+        }
+      }),
+      tools: {
+        memory,
+        api: { get: vi.fn(async () => new Promise<never>(() => undefined)) },
+        profile: () => ({})
+      } as unknown as ClawchatToolEnvironment,
+      store,
+      transport: { send: async () => undefined }
+    });
+    const created = factory.createSession("group-1");
+    const driver = await factory.openSession({ chatId: "group-1", ...created });
+
+    try {
+      await expect(
+        Promise.race([
+          driver.runTurn(groupTurn("turn-group-offline")),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("group enrichment blocked the Turn")), 100)
+          )
+        ])
+      ).resolves.toBeUndefined();
+      expect(prompt).toHaveBeenCalledOnce();
+    } finally {
+      await driver.dispose();
+      store.close();
+    }
+  });
+
+  it("fails the group Turn when its durable WebSocket identity cannot be written", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-sdk-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const store = GatewayStore.open(join(agentDir, "gateway.sqlite"));
+    const memory = new ClawchatMemoryStore(join(agentDir, "memory"));
+    vi.spyOn(memory, "mergeMetadataIfChanged").mockRejectedValueOnce(
+      new Error("group identity write failed")
+    );
+    const get = vi.fn();
+    const prompt = vi.fn(async () => undefined);
+    const factory = new PiChatSessionFactory({
+      workspace,
+      agentDir,
+      sessionDir: join(agentDir, "sessions"),
+      createAgentSessionFn: async () => ({
+        session: {
+          prompt,
+          sendCustomMessage: async () => undefined,
+          abort: async () => undefined,
+          dispose: () => undefined
+        }
+      }),
+      tools: {
+        memory,
+        api: { get },
+        profile: () => ({})
+      } as unknown as ClawchatToolEnvironment,
+      store,
+      transport: { send: async () => undefined }
+    });
+    const created = factory.createSession("group-1");
+    const driver = await factory.openSession({ chatId: "group-1", ...created });
+
+    try {
+      await expect(driver.runTurn(groupTurn("turn-group-write-failure"))).rejects.toThrow(
+        "group identity write failed"
+      );
+      expect(get).not.toHaveBeenCalled();
+      expect(prompt).not.toHaveBeenCalled();
+    } finally {
+      await driver.dispose();
+      store.close();
+    }
+  });
+
+  it("aborts a group Turn while member enrichment is pending", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-sdk-"));
+    const workspace = join(agentDir, "project");
+    await mkdir(workspace);
+    const store = GatewayStore.open(join(agentDir, "gateway.sqlite"));
+    const memory = new ClawchatMemoryStore(join(agentDir, "memory"));
+    const requestStarted = Promise.withResolvers<void>();
+    const response = Promise.withResolvers<unknown>();
+    const prompt = vi.fn(async () => undefined);
+    const abort = vi.fn(async () => undefined);
+    const factory = new PiChatSessionFactory({
+      workspace,
+      agentDir,
+      sessionDir: join(agentDir, "sessions"),
+      createAgentSessionFn: async () => ({
+        session: {
+          prompt,
+          sendCustomMessage: async () => undefined,
+          abort,
+          dispose: () => undefined
+        }
+      }),
+      tools: {
+        memory,
+        api: {
+          get: vi.fn(async () => {
+            requestStarted.resolve();
+            return response.promise;
+          })
+        },
+        profile: () => ({})
+      } as unknown as ClawchatToolEnvironment,
+      store,
+      transport: { send: async () => undefined }
+    });
+    const created = factory.createSession("group-1");
+    const driver = await factory.openSession({ chatId: "group-1", ...created });
+    const running = driver.runTurn(groupTurn("turn-group-abort"));
+
+    try {
+      await requestStarted.promise;
+      if (!driver.abort) throw new Error("Expected abortable Chat Session driver");
+      await driver.abort();
+      response.resolve({
+        conversation: {
+          id: "group-1",
+          type: "group",
+          participants: [{ user_id: "owner-1" }]
+        }
+      });
+      await expect(running).rejects.toThrow("aborted");
+      expect(abort).toHaveBeenCalledOnce();
+      expect(prompt).not.toHaveBeenCalled();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const currentGroup = await memory.read(clawchatMemoryTarget("group", "group-1"));
+      expect(currentGroup.metadata).not.toHaveProperty("participant_ids");
+    } finally {
+      response.resolve({});
+      await running.catch(() => undefined);
+      await driver.dispose();
+      store.close();
+    }
   });
 
   it("materializes an image-only message when its Turn runs and releases the private source after prompting", async () => {
@@ -456,6 +746,30 @@ function imageTurn(id: string, url: string) {
               { kind: "image", url, name: "pixel.png", mime: "image/png" }
             ]
           }
+        }
+      }
+    }
+  };
+}
+
+function groupTurn(id: string) {
+  return {
+    id,
+    chatId: "group-1",
+    messageId: `message-${id}`,
+    status: "running" as const,
+    frame: {
+      version: "2",
+      event: "message.send",
+      trace_id: `trace-${id}`,
+      emitted_at: 1,
+      chat_id: "group-1",
+      chat_type: "group",
+      sender: { id: "owner-1", type: "group", nick_name: "Owner" },
+      payload: {
+        message_id: `message-${id}`,
+        message: {
+          body: { fragments: [{ kind: "text", text: "这个群里都有谁" }] }
         }
       }
     }

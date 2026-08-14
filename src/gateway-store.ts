@@ -6,11 +6,23 @@ import type { ClawchatOutputMode, ClawchatOutputModeOverride } from "./output-se
 
 const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
 
-export interface ChatSessionRecord {
+export interface ChatSessionMapping {
   chatId: string;
   sessionId: string;
   sessionPath: string;
 }
+
+export interface ChatSessionRecord extends ChatSessionMapping {
+  createdAt: number;
+  lastUsedAt: number | null;
+  active: boolean;
+}
+
+export type SessionCommand =
+  | { type: "new" }
+  | { type: "session" }
+  | { type: "resume-list"; page: number }
+  | { type: "resume"; sessionId: string };
 
 export interface AdmitInboundInput {
   dedupeKey: string;
@@ -19,11 +31,13 @@ export interface AdmitInboundInput {
   frame: unknown;
   dispatch: boolean;
   queueTurn?: boolean;
+  sessionCommand?: SessionCommand;
+  stop?: boolean;
 }
 
 export type InboundAdmission =
-  | { status: "accepted"; turnId: string | null }
-  | { status: "duplicate"; turnId: string | null };
+  | { status: "accepted"; workId: string | null; cancelledWork: number }
+  | { status: "duplicate"; workId: string | null; cancelledWork: 0 };
 
 export interface ChatTurn {
   id: string;
@@ -31,6 +45,10 @@ export interface ChatTurn {
   messageId: string;
   frame: unknown;
   status: "queued" | "running" | "complete" | "interrupted";
+}
+
+export interface ConversationWork extends ChatTurn {
+  command: SessionCommand | null;
 }
 
 export interface ClawchatAwarenessSource {
@@ -74,8 +92,8 @@ export interface OutboundRecord {
 export interface GatewayStoreStatus {
   sessions: Array<
     ChatSessionRecord & {
-      queuedTurns: number;
-      runningTurns: number;
+      queuedWork: number;
+      runningWork: number;
     }
   >;
   pendingOutbound: number;
@@ -111,12 +129,24 @@ export class GatewayStore {
       PRAGMA foreign_keys = ON;
       PRAGMA busy_timeout = 5000;
 
-      CREATE TABLE IF NOT EXISTS chat_sessions (
+      CREATE TABLE IF NOT EXISTS conversation_session_sets (
         chat_id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL UNIQUE,
-        session_path TEXT NOT NULL UNIQUE,
-        created_at INTEGER NOT NULL
+        active_session_id TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
       ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS chat_sessions (
+        session_id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        session_path TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER,
+        FOREIGN KEY (chat_id) REFERENCES conversation_session_sets(chat_id) ON DELETE CASCADE
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS chat_sessions_by_conversation
+        ON chat_sessions (chat_id, created_at DESC);
 
       CREATE TABLE IF NOT EXISTS chat_turns (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +154,9 @@ export class GatewayStore {
         chat_id TEXT NOT NULL,
         message_id TEXT NOT NULL,
         frame_json TEXT NOT NULL,
+        work_type TEXT NOT NULL DEFAULT 'turn'
+          CHECK (work_type IN ('turn', 'session.new', 'session.info', 'session.resume-list', 'session.resume')),
+        command_json TEXT,
         status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'complete', 'interrupted')),
         admitted_at INTEGER NOT NULL,
         started_at INTEGER,
@@ -269,33 +302,218 @@ export class GatewayStore {
     return new GatewayStore(database);
   }
 
-  getChatSession(chatId: string): ChatSessionRecord | null {
+  getActiveChatSession(chatId: string): ChatSessionRecord | null {
     const row = this.database
-      .prepare("SELECT chat_id, session_id, session_path FROM chat_sessions WHERE chat_id = ?")
+      .prepare(
+        `SELECT sessions.chat_id, sessions.session_id, sessions.session_path,
+                sessions.created_at, sessions.last_used_at, 1 AS active
+         FROM conversation_session_sets AS sets
+         JOIN chat_sessions AS sessions
+           ON sessions.chat_id = sets.chat_id
+          AND sessions.session_id = sets.active_session_id
+         WHERE sets.chat_id = ?`
+      )
       .get(chatId) as ChatSessionRow | undefined;
     return row ? mapChatSession(row) : null;
   }
 
-  getOrCreateChatSession(
+  getChatSession(chatId: string, sessionId: string): ChatSessionRecord | null {
+    const row = this.database
+      .prepare(
+        `SELECT sessions.chat_id, sessions.session_id, sessions.session_path,
+                sessions.created_at, sessions.last_used_at,
+                CASE WHEN sets.active_session_id = sessions.session_id THEN 1 ELSE 0 END AS active
+         FROM chat_sessions AS sessions
+         JOIN conversation_session_sets AS sets ON sets.chat_id = sessions.chat_id
+         WHERE sessions.chat_id = ? AND sessions.session_id = ?`
+      )
+      .get(chatId, sessionId) as ChatSessionRow | undefined;
+    return row ? mapChatSession(row) : null;
+  }
+
+  listChatSessions(chatId: string): ChatSessionRecord[] {
+    const rows = this.database
+      .prepare(
+        `SELECT sessions.chat_id, sessions.session_id, sessions.session_path,
+                sessions.created_at, sessions.last_used_at,
+                CASE WHEN sets.active_session_id = sessions.session_id THEN 1 ELSE 0 END AS active
+         FROM chat_sessions AS sessions
+         JOIN conversation_session_sets AS sets ON sets.chat_id = sessions.chat_id
+         WHERE sessions.chat_id = ?
+         ORDER BY COALESCE(sessions.last_used_at, sessions.created_at) DESC,
+                  sessions.created_at DESC,
+                  sessions.rowid DESC`
+      )
+      .all(chatId) as unknown as ChatSessionRow[];
+    return rows.map(mapChatSession);
+  }
+
+  listConversationIds(): string[] {
+    const rows = this.database
+      .prepare("SELECT chat_id FROM conversation_session_sets ORDER BY chat_id")
+      .all() as unknown as Array<{ chat_id: string }>;
+    return rows.map((row) => row.chat_id);
+  }
+
+  ensureConversationSessionSet(
     chatId: string,
     create: () => { sessionId: string; sessionPath: string }
   ): ChatSessionRecord {
     this.database.exec("BEGIN IMMEDIATE");
     try {
-      const existing = this.getChatSession(chatId);
+      const existing = this.getActiveChatSession(chatId);
       if (existing) {
         this.database.exec("COMMIT");
         return existing;
       }
-
       const created = create();
+      const now = Date.now();
       this.database
         .prepare(
-          "INSERT INTO chat_sessions (chat_id, session_id, session_path, created_at) VALUES (?, ?, ?, ?)"
+          `INSERT INTO conversation_session_sets
+            (chat_id, active_session_id, created_at, updated_at)
+           VALUES (?, ?, ?, ?)`
         )
-        .run(chatId, created.sessionId, created.sessionPath, Date.now());
+        .run(chatId, created.sessionId, now, now);
+      this.database
+        .prepare(
+          `INSERT INTO chat_sessions
+            (session_id, chat_id, session_path, created_at, last_used_at)
+           VALUES (?, ?, ?, ?, NULL)`
+        )
+        .run(created.sessionId, chatId, created.sessionPath, now);
       this.database.exec("COMMIT");
-      return { chatId, ...created };
+      return {
+        chatId,
+        ...created,
+        createdAt: now,
+        lastUsedAt: null,
+        active: true
+      };
+    } catch (error: unknown) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  createAndActivateChatSession(
+    chatId: string,
+    create: () => { sessionId: string; sessionPath: string }
+  ): { session: ChatSessionRecord; replacedEmpty: ChatSessionRecord | null } {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const previous = this.getActiveChatSession(chatId);
+      if (!previous) throw new Error(`Conversation Session Set '${chatId}' does not exist`);
+      const created = create();
+      const now = Date.now();
+      this.database
+        .prepare(
+          `INSERT INTO chat_sessions
+            (session_id, chat_id, session_path, created_at, last_used_at)
+           VALUES (?, ?, ?, ?, NULL)`
+        )
+        .run(created.sessionId, chatId, created.sessionPath, now);
+      this.database
+        .prepare(
+          `UPDATE conversation_session_sets
+           SET active_session_id = ?, updated_at = ?
+           WHERE chat_id = ?`
+        )
+        .run(created.sessionId, now, chatId);
+      const replacedEmpty = previous.lastUsedAt === null ? previous : null;
+      if (replacedEmpty) {
+        this.database
+          .prepare("DELETE FROM chat_sessions WHERE chat_id = ? AND session_id = ?")
+          .run(chatId, previous.sessionId);
+      }
+      this.database.exec("COMMIT");
+      return {
+        session: {
+          chatId,
+          ...created,
+          createdAt: now,
+          lastUsedAt: null,
+          active: true
+        },
+        replacedEmpty
+      };
+    } catch (error: unknown) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  activateChatSession(
+    chatId: string,
+    sessionId: string
+  ): { session: ChatSessionRecord; replacedEmpty: ChatSessionRecord | null } {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const target = this.getChatSession(chatId, sessionId);
+      if (!target) throw new Error(`Session '${sessionId}' is not owned by chat '${chatId}'`);
+      const previous = this.getActiveChatSession(chatId);
+      if (!previous) throw new Error(`Conversation Session Set '${chatId}' does not exist`);
+      if (target.active) {
+        this.database.exec("COMMIT");
+        return { session: target, replacedEmpty: null };
+      }
+      this.database
+        .prepare(
+          `UPDATE conversation_session_sets
+           SET active_session_id = ?, updated_at = ?
+           WHERE chat_id = ?`
+        )
+        .run(sessionId, Date.now(), chatId);
+      const replacedEmpty = previous.lastUsedAt === null ? previous : null;
+      if (replacedEmpty) {
+        this.database
+          .prepare("DELETE FROM chat_sessions WHERE chat_id = ? AND session_id = ?")
+          .run(chatId, previous.sessionId);
+      }
+      this.database.exec("COMMIT");
+      return { session: { ...target, active: true }, replacedEmpty };
+    } catch (error: unknown) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  markChatSessionUsed(chatId: string, sessionId: string): void {
+    const result = this.database
+      .prepare(
+        `UPDATE chat_sessions
+         SET last_used_at = ?
+         WHERE chat_id = ? AND session_id = ?`
+      )
+      .run(Date.now(), chatId, sessionId);
+    if (result.changes !== 1) {
+      throw new Error(`Chat Session '${sessionId}' is not owned by chat '${chatId}'`);
+    }
+  }
+
+  deleteConversationSessionSet(chatId: string): ChatSessionRecord[] {
+    this.database.exec("BEGIN IMMEDIATE");
+    try {
+      const sessions = this.listChatSessions(chatId);
+      this.database
+        .prepare(
+          `DELETE FROM awareness_sources
+           WHERE turn_id IN (SELECT id FROM chat_turns WHERE chat_id = ?)`
+        )
+        .run(chatId);
+      this.database
+        .prepare(
+          `DELETE FROM awareness_turns
+           WHERE turn_id IN (SELECT id FROM chat_turns WHERE chat_id = ?)`
+        )
+        .run(chatId);
+      this.database
+        .prepare("UPDATE inbound_frames SET turn_id = NULL WHERE chat_id = ?")
+        .run(chatId);
+      this.database.prepare("DELETE FROM chat_turns WHERE chat_id = ?").run(chatId);
+      this.database.prepare("DELETE FROM conversation_session_sets WHERE chat_id = ?").run(chatId);
+      this.database.exec("COMMIT");
+      return sessions;
     } catch (error: unknown) {
       this.database.exec("ROLLBACK");
       throw error;
@@ -361,22 +579,43 @@ export class GatewayStore {
           }
         }
         this.database.exec("COMMIT");
-        return { status: "duplicate", turnId: existing.turn_id };
+        return { status: "duplicate", workId: existing.turn_id, cancelledWork: 0 };
       }
 
       const now = Date.now();
       const frameJson = JSON.stringify(input.frame);
-      const queueTurn = input.dispatch && input.queueTurn !== false;
-      const turnId = queueTurn ? crypto.randomUUID() : null;
-      if (turnId) {
+      const queueWork =
+        input.queueTurn !== false && (input.dispatch || input.sessionCommand !== undefined);
+      const workId = queueWork ? crypto.randomUUID() : null;
+      const command = input.sessionCommand;
+      if (workId) {
         this.database
           .prepare(
             `INSERT INTO chat_turns
-              (id, chat_id, message_id, frame_json, status, admitted_at)
-             VALUES (?, ?, ?, ?, 'queued', ?)`
+              (id, chat_id, message_id, frame_json, work_type, command_json, status, admitted_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)`
           )
-          .run(turnId, input.chatId, input.messageId, frameJson, now);
+          .run(
+            workId,
+            input.chatId,
+            input.messageId,
+            frameJson,
+            command ? sessionCommandWorkType(command) : "turn",
+            command ? JSON.stringify(command) : null,
+            now
+          );
       }
+      const cancelledWork = input.stop
+        ? Number(
+            this.database
+              .prepare(
+                `UPDATE chat_turns
+                 SET status = 'interrupted', completed_at = ?
+                 WHERE chat_id = ? AND status = 'queued'`
+              )
+              .run(now, input.chatId).changes
+          )
+        : 0;
       this.database
         .prepare(
           `INSERT INTO inbound_frames
@@ -388,19 +627,19 @@ export class GatewayStore {
           input.messageId,
           input.chatId,
           frameJson,
-          queueTurn ? "queued" : input.dispatch ? "delivered" : "skipped",
-          turnId,
+          queueWork ? "queued" : input.dispatch || input.stop ? "delivered" : "skipped",
+          workId,
           now
         );
       this.database.exec("COMMIT");
-      return { status: "accepted", turnId };
+      return { status: "accepted", workId, cancelledWork };
     } catch (error: unknown) {
       this.database.exec("ROLLBACK");
       throw error;
     }
   }
 
-  claimNextTurn(chatId: string): ChatTurn | null {
+  claimNextWork(chatId: string): ConversationWork | null {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const running = this.database
@@ -413,13 +652,13 @@ export class GatewayStore {
 
       const row = this.database
         .prepare(
-          `SELECT id, chat_id, message_id, frame_json, status
+          `SELECT id, chat_id, message_id, frame_json, work_type, command_json, status
            FROM chat_turns
            WHERE chat_id = ? AND status = 'queued'
            ORDER BY sequence
            LIMIT 1`
         )
-        .get(chatId) as ChatTurnRow | undefined;
+        .get(chatId) as ConversationWorkRow | undefined;
       if (!row) {
         this.database.exec("COMMIT");
         return null;
@@ -429,36 +668,48 @@ export class GatewayStore {
         .prepare("UPDATE chat_turns SET status = 'running', started_at = ? WHERE id = ?")
         .run(Date.now(), row.id);
       this.database.exec("COMMIT");
-      return mapChatTurn({ ...row, status: "running" });
+      return mapConversationWork({ ...row, status: "running" });
     } catch (error: unknown) {
       this.database.exec("ROLLBACK");
       throw error;
     }
   }
 
-  completeTurn(turnId: string): void {
+  completeWork(workId: string): void {
     const result = this.database
       .prepare(
         "UPDATE chat_turns SET status = 'complete', completed_at = ? WHERE id = ? AND status = 'running'"
       )
-      .run(Date.now(), turnId);
+      .run(Date.now(), workId);
     if (result.changes !== 1) {
-      throw new Error(`Turn '${turnId}' is not running`);
+      throw new Error(`Conversation Work '${workId}' is not running`);
     }
   }
 
-  interruptTurn(turnId: string): void {
+  interruptWork(workId: string): void {
     const result = this.database
       .prepare(
         "UPDATE chat_turns SET status = 'interrupted', completed_at = ? WHERE id = ? AND status = 'running'"
       )
-      .run(Date.now(), turnId);
+      .run(Date.now(), workId);
     if (result.changes !== 1) {
-      throw new Error(`Turn '${turnId}' is not running`);
+      throw new Error(`Conversation Work '${workId}' is not running`);
     }
   }
 
-  recoverAfterRestart(): { interruptedTurnIds: string[] } {
+  cancelQueuedWork(chatId: string): number {
+    return Number(
+      this.database
+        .prepare(
+          `UPDATE chat_turns
+           SET status = 'interrupted', completed_at = ?
+           WHERE chat_id = ? AND status = 'queued'`
+        )
+        .run(Date.now(), chatId).changes
+    );
+  }
+
+  recoverAfterRestart(): { interruptedWorkIds: string[] } {
     this.database.exec("BEGIN IMMEDIATE");
     try {
       const rows = this.database
@@ -470,14 +721,14 @@ export class GatewayStore {
         )
         .run(Date.now());
       this.database.exec("COMMIT");
-      return { interruptedTurnIds: rows.map((row) => row.id) };
+      return { interruptedWorkIds: rows.map((row) => row.id) };
     } catch (error: unknown) {
       this.database.exec("ROLLBACK");
       throw error;
     }
   }
 
-  listQueuedChatIds(): string[] {
+  listQueuedConversationIds(): string[] {
     const rows = this.database
       .prepare("SELECT DISTINCT chat_id FROM chat_turns WHERE status = 'queued' ORDER BY chat_id")
       .all() as unknown as Array<{ chat_id: string }>;
@@ -684,12 +935,16 @@ export class GatewayStore {
            sessions.chat_id,
            sessions.session_id,
            sessions.session_path,
-           COALESCE(SUM(CASE WHEN turns.status = 'queued' THEN 1 ELSE 0 END), 0) AS queued_turns,
-           COALESCE(SUM(CASE WHEN turns.status = 'running' THEN 1 ELSE 0 END), 0) AS running_turns
+           sessions.created_at,
+           sessions.last_used_at,
+           CASE WHEN sets.active_session_id = sessions.session_id THEN 1 ELSE 0 END AS active,
+           (SELECT COUNT(*) FROM chat_turns AS queued
+             WHERE queued.chat_id = sessions.chat_id AND queued.status = 'queued') AS queued_work,
+           (SELECT COUNT(*) FROM chat_turns AS running
+             WHERE running.chat_id = sessions.chat_id AND running.status = 'running') AS running_work
          FROM chat_sessions AS sessions
-         LEFT JOIN chat_turns AS turns ON turns.chat_id = sessions.chat_id
-         GROUP BY sessions.chat_id, sessions.session_id, sessions.session_path
-         ORDER BY sessions.chat_id`
+         JOIN conversation_session_sets AS sets ON sets.chat_id = sessions.chat_id
+         ORDER BY sessions.chat_id, active DESC, sessions.created_at DESC, sessions.rowid DESC`
       )
       .all() as unknown as StatusSessionRow[];
     const pending = this.database
@@ -703,11 +958,9 @@ export class GatewayStore {
       .get() as { count: number };
     return {
       sessions: rows.map((row) => ({
-        chatId: row.chat_id,
-        sessionId: row.session_id,
-        sessionPath: row.session_path,
-        queuedTurns: row.queued_turns,
-        runningTurns: row.running_turns
+        ...mapChatSession(row),
+        queuedWork: row.queued_work,
+        runningWork: row.running_work
       })),
       pendingOutbound: pending.count,
       failedOutbound: failed.count,
@@ -1066,14 +1319,19 @@ interface ChatSessionRow {
   chat_id: string;
   session_id: string;
   session_path: string;
+  created_at: number;
+  last_used_at: number | null;
+  active: number;
 }
 
-interface ChatTurnRow {
+interface ConversationWorkRow {
   id: string;
   chat_id: string;
   message_id: string;
   frame_json: string;
-  status: ChatTurn["status"];
+  work_type: "turn" | "session.new" | "session.info" | "session.resume-list" | "session.resume";
+  command_json: string | null;
+  status: ConversationWork["status"];
 }
 
 interface OutboundRow {
@@ -1096,26 +1354,73 @@ interface HistoryTransferRow {
 }
 
 interface StatusSessionRow extends ChatSessionRow {
-  queued_turns: number;
-  running_turns: number;
+  queued_work: number;
+  running_work: number;
 }
 
 function mapChatSession(row: ChatSessionRow): ChatSessionRecord {
   return {
     chatId: row.chat_id,
     sessionId: row.session_id,
-    sessionPath: row.session_path
+    sessionPath: row.session_path,
+    createdAt: row.created_at,
+    lastUsedAt: row.last_used_at,
+    active: row.active === 1
   };
 }
 
-function mapChatTurn(row: ChatTurnRow): ChatTurn {
+function mapConversationWork(row: ConversationWorkRow): ConversationWork {
+  const command = row.command_json === null
+    ? null
+    : parseStoredSessionCommand(JSON.parse(row.command_json) as unknown);
+  if ((row.work_type === "turn") !== (command === null)) {
+    throw new Error(`Conversation Work '${row.id}' has inconsistent stored type`);
+  }
+  if (command && sessionCommandWorkType(command) !== row.work_type) {
+    throw new Error(`Conversation Work '${row.id}' has mismatched Session Command`);
+  }
   return {
     id: row.id,
     chatId: row.chat_id,
     messageId: row.message_id,
     frame: JSON.parse(row.frame_json) as unknown,
+    command,
     status: row.status
   };
+}
+
+function sessionCommandWorkType(
+  command: SessionCommand
+): ConversationWorkRow["work_type"] {
+  if (command.type === "new") return "session.new";
+  if (command.type === "session") return "session.info";
+  if (command.type === "resume-list") return "session.resume-list";
+  return "session.resume";
+}
+
+function parseStoredSessionCommand(value: unknown): SessionCommand {
+  if (!value || typeof value !== "object" || !("type" in value)) {
+    throw new Error("Invalid stored Session Command");
+  }
+  if (value.type === "new" || value.type === "session") return { type: value.type };
+  if (
+    value.type === "resume-list" &&
+    "page" in value &&
+    typeof value.page === "number" &&
+    Number.isSafeInteger(value.page) &&
+    value.page > 0
+  ) {
+    return { type: "resume-list", page: value.page };
+  }
+  if (
+    value.type === "resume" &&
+    "sessionId" in value &&
+    typeof value.sessionId === "string" &&
+    value.sessionId.trim()
+  ) {
+    return { type: "resume", sessionId: value.sessionId };
+  }
+  throw new Error("Invalid stored Session Command");
 }
 
 function classifyReply(frame: unknown): "provisional" | "author-final" | null {
@@ -1196,6 +1501,8 @@ function assertOutputMode(value: string): asserts value is ClawchatOutputMode {
 function migrateGatewaySchema(database: DatabaseSyncType): void {
   database.exec("BEGIN IMMEDIATE");
   try {
+    migrateConversationSessions(database);
+    migrateConversationWork(database);
     migrateChatOutputSettings(database);
     let columns = database.prepare("PRAGMA table_info(outbound_messages)").all() as Array<{
       name: string;
@@ -1278,6 +1585,82 @@ function migrateGatewaySchema(database: DatabaseSyncType): void {
     throw error;
   }
 }
+
+function migrateConversationSessions(database: DatabaseSyncType): void {
+  const columns = database.prepare("PRAGMA table_info(chat_sessions)").all() as Array<{
+    name: string;
+    pk: number;
+  }>;
+  const current =
+    columns.some((column) => column.name === "session_id" && column.pk === 1) &&
+    columns.some((column) => column.name === "last_used_at");
+  if (current) return;
+
+  const legacyRows = database
+    .prepare(
+      "SELECT chat_id, session_id, session_path, created_at FROM chat_sessions ORDER BY chat_id"
+    )
+    .all() as Array<{
+      chat_id: string;
+      session_id: string;
+      session_path: string;
+      created_at: number;
+    }>;
+  database.exec(`
+    DROP INDEX IF EXISTS chat_sessions_by_conversation;
+    ALTER TABLE chat_sessions RENAME TO chat_sessions_legacy;
+
+    CREATE TABLE chat_sessions (
+      session_id TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      session_path TEXT NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL,
+      last_used_at INTEGER,
+      FOREIGN KEY (chat_id) REFERENCES conversation_session_sets(chat_id) ON DELETE CASCADE
+    ) STRICT
+  `);
+  const insertSet = database.prepare(
+    `INSERT INTO conversation_session_sets
+      (chat_id, active_session_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?)`
+  );
+  const insertSession = database.prepare(
+    `INSERT INTO chat_sessions
+      (session_id, chat_id, session_path, created_at, last_used_at)
+     VALUES (?, ?, ?, ?, ?)`
+  );
+  for (const row of legacyRows) {
+    insertSet.run(row.chat_id, row.session_id, row.created_at, row.created_at);
+    insertSession.run(
+      row.session_id,
+      row.chat_id,
+      row.session_path,
+      row.created_at,
+      row.created_at
+    );
+  }
+  database.exec(`
+    DROP TABLE chat_sessions_legacy;
+    CREATE INDEX chat_sessions_by_conversation
+      ON chat_sessions (chat_id, created_at DESC)
+  `);
+}
+
+function migrateConversationWork(database: DatabaseSyncType): void {
+  const columns = database.prepare("PRAGMA table_info(chat_turns)").all() as Array<{
+    name: string;
+  }>;
+  if (!columns.some((column) => column.name === "work_type")) {
+    database.exec(
+      `ALTER TABLE chat_turns ADD COLUMN work_type TEXT NOT NULL DEFAULT 'turn'
+       CHECK (work_type IN ('turn', 'session.new', 'session.info', 'session.resume-list', 'session.resume'))`
+    );
+  }
+  if (!columns.some((column) => column.name === "command_json")) {
+    database.exec("ALTER TABLE chat_turns ADD COLUMN command_json TEXT");
+  }
+}
+
 function migrateChatOutputSettings(database: DatabaseSyncType): void {
   const columns = database.prepare("PRAGMA table_info(chat_output_settings)").all() as Array<{
     name: string;

@@ -11,26 +11,171 @@ const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as {
 };
 
 describe("GatewayStore", () => {
-  it("keeps one Pi session mapping for a chat across restarts", async () => {
+  it("keeps the active Pi session mapping for a chat across restarts", async () => {
     const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
     const path = join(directory, "gateway.sqlite");
     const firstStore = GatewayStore.open(path);
 
-    const first = firstStore.getOrCreateChatSession("chat-1", () => ({
+    const first = firstStore.ensureConversationSessionSet("chat-1", () => ({
       sessionId: "session-1",
       sessionPath: "/sessions/session-1.jsonl"
     }));
-    const same = firstStore.getOrCreateChatSession("chat-1", () => ({
+    const same = firstStore.ensureConversationSessionSet("chat-1", () => ({
       sessionId: "wrong-session",
       sessionPath: "/sessions/wrong.jsonl"
     }));
     firstStore.close();
 
     const reopened = GatewayStore.open(path);
-    expect(reopened.getChatSession("chat-1")).toEqual(first);
+    expect(reopened.getActiveChatSession("chat-1")).toEqual(first);
     expect(same).toEqual(first);
     reopened.close();
     expect((await stat(path)).mode & 0o777).toBe(0o600);
+  });
+
+  it("migrates legacy one-session chat mappings without losing ownership", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const path = join(directory, "gateway.sqlite");
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`
+      CREATE TABLE chat_sessions (
+        chat_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL UNIQUE,
+        session_path TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL
+      ) STRICT;
+      INSERT INTO chat_sessions (chat_id, session_id, session_path, created_at)
+      VALUES ('chat-legacy', 'session-legacy', '/sessions/legacy.jsonl', 42);
+    `);
+    legacy.close();
+
+    const migrated = GatewayStore.open(path);
+    expect(migrated.getActiveChatSession("chat-legacy")).toEqual({
+      chatId: "chat-legacy",
+      sessionId: "session-legacy",
+      sessionPath: "/sessions/legacy.jsonl",
+      createdAt: 42,
+      lastUsedAt: 42,
+      active: true
+    });
+    expect(migrated.listChatSessions("chat-legacy")).toHaveLength(1);
+    migrated.close();
+  });
+
+  it("owns multiple sessions per chat and removes only replaced empty sessions", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const initial = store.ensureConversationSessionSet("chat-1", () => ({
+      sessionId: "session-1",
+      sessionPath: "/sessions/session-1.jsonl"
+    }));
+
+    const firstTransition = store.createAndActivateChatSession("chat-1", () => ({
+      sessionId: "session-2",
+      sessionPath: "/sessions/session-2.jsonl"
+    }));
+    expect(firstTransition.replacedEmpty).toEqual(initial);
+    expect(store.listChatSessions("chat-1").map((session) => session.sessionId)).toEqual([
+      "session-2"
+    ]);
+
+    store.markChatSessionUsed("chat-1", "session-2");
+    const secondTransition = store.createAndActivateChatSession("chat-1", () => ({
+      sessionId: "session-3",
+      sessionPath: "/sessions/session-3.jsonl"
+    }));
+    expect(secondTransition.replacedEmpty).toBeNull();
+    expect(store.listChatSessions("chat-1")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sessionId: "session-2", active: false }),
+        expect.objectContaining({ sessionId: "session-3", active: true })
+      ])
+    );
+
+    const resumed = store.activateChatSession("chat-1", "session-2");
+    expect(resumed.replacedEmpty).toMatchObject({ sessionId: "session-3" });
+    expect(store.listChatSessions("chat-1").map((session) => session.sessionId)).toEqual([
+      "session-2"
+    ]);
+    expect(() => store.activateChatSession("chat-2", "session-2")).toThrow(
+      "not owned by chat 'chat-2'"
+    );
+    store.close();
+  });
+
+  it("deletes a conversation's sessions and work while preserving inbound dedupe", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    store.ensureConversationSessionSet("chat-1", () => ({
+      sessionId: "session-1",
+      sessionPath: "/sessions/session-1.jsonl"
+    }));
+    const admitted = store.admitInbound({
+      dedupeKey: "message:msg-1",
+      messageId: "msg-1",
+      chatId: "chat-1",
+      frame: { payload: { message_id: "msg-1" } },
+      dispatch: true
+    });
+
+    expect(store.deleteConversationSessionSet("chat-1")).toEqual([
+      expect.objectContaining({ sessionId: "session-1" })
+    ]);
+    expect(store.listConversationIds()).not.toContain("chat-1");
+    expect(store.listQueuedConversationIds()).not.toContain("chat-1");
+    expect(
+      store.admitInbound({
+        dedupeKey: "message:msg-1",
+        messageId: "msg-1",
+        chatId: "chat-1",
+        frame: { payload: { message_id: "msg-1" } },
+        dispatch: true
+      })
+    ).toEqual({ status: "duplicate", workId: null, cancelledWork: 0 });
+    expect(admitted.workId).not.toBeNull();
+    store.close();
+  });
+
+  it("uses stop admission as an atomic boundary around queued work", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-gateway-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    const running = store.admitInbound({
+      dedupeKey: "message:running",
+      messageId: "running",
+      chatId: "chat-1",
+      frame: { payload: { message_id: "running" } },
+      dispatch: true
+    });
+    store.claimNextWork("chat-1");
+    store.admitInbound({
+      dedupeKey: "message:before-stop",
+      messageId: "before-stop",
+      chatId: "chat-1",
+      frame: { payload: { message_id: "before-stop" } },
+      dispatch: true
+    });
+
+    const stopped = store.admitInbound({
+      dedupeKey: "message:stop",
+      messageId: "stop",
+      chatId: "chat-1",
+      frame: { payload: { message_id: "stop" } },
+      dispatch: false,
+      stop: true
+    });
+    expect(stopped).toMatchObject({ status: "accepted", workId: null, cancelledWork: 1 });
+
+    store.admitInbound({
+      dedupeKey: "message:after-stop",
+      messageId: "after-stop",
+      chatId: "chat-1",
+      frame: { payload: { message_id: "after-stop" } },
+      dispatch: true
+    });
+    expect(store.claimNextWork("chat-1")).toBeNull();
+    store.interruptWork(running.workId!);
+    expect(store.claimNextWork("chat-1")).toMatchObject({ messageId: "after-stop" });
+    store.close();
   });
 
   it("admits each inbound message once and claims turns FIFO per chat", async () => {
@@ -60,12 +205,12 @@ describe("GatewayStore", () => {
     });
 
     expect(first.status).toBe("accepted");
-    expect(duplicate).toEqual({ status: "duplicate", turnId: first.turnId });
-    const claimedFirst = store.claimNextTurn("chat-1");
+    expect(duplicate).toEqual({ status: "duplicate", workId: first.workId, cancelledWork: 0 });
+    const claimedFirst = store.claimNextWork("chat-1");
     expect(claimedFirst).toMatchObject({ messageId: "msg-1", frame: { payload: { text: "final" } } });
-    expect(store.claimNextTurn("chat-1")).toBeNull();
-    store.completeTurn(claimedFirst!.id);
-    expect(store.claimNextTurn("chat-1")).toMatchObject({ messageId: "msg-2" });
+    expect(store.claimNextWork("chat-1")).toBeNull();
+    store.completeWork(claimedFirst!.id);
+    expect(store.claimNextWork("chat-1")).toMatchObject({ messageId: "msg-2" });
     store.close();
   });
 
@@ -95,8 +240,8 @@ describe("GatewayStore", () => {
       dispatch: true
     });
 
-    expect(duplicate).toEqual({ status: "duplicate", turnId: admitted.turnId });
-    expect(store.claimNextTurn("chat-1")).toMatchObject({ frame: authorFinal });
+    expect(duplicate).toEqual({ status: "duplicate", workId: admitted.workId, cancelledWork: 0 });
+    expect(store.claimNextWork("chat-1")).toMatchObject({ frame: authorFinal });
     store.close();
   });
 
@@ -126,9 +271,9 @@ describe("GatewayStore", () => {
       dispatch: true
     });
 
-    expect(duplicate).toEqual({ status: "duplicate", turnId: provisional.turnId });
-    expect(store.claimNextTurn("chat-1")).toMatchObject({
-      id: provisional.turnId,
+    expect(duplicate).toEqual({ status: "duplicate", workId: provisional.workId, cancelledWork: 0 });
+    expect(store.claimNextWork("chat-1")).toMatchObject({
+      id: provisional.workId,
       frame: authorFinal
     });
     store.close();
@@ -157,8 +302,8 @@ describe("GatewayStore", () => {
       dispatch: true
     });
 
-    expect(duplicate).toEqual({ status: "duplicate", turnId: admitted.turnId });
-    expect(store.claimNextTurn("chat-1")).toMatchObject({ frame: rewritten });
+    expect(duplicate).toEqual({ status: "duplicate", workId: admitted.workId, cancelledWork: 0 });
+    expect(store.claimNextWork("chat-1")).toMatchObject({ frame: rewritten });
     store.close();
   });
 
@@ -180,12 +325,12 @@ describe("GatewayStore", () => {
       frame: { payload: { text: "never started" } },
       dispatch: true
     });
-    store.claimNextTurn("chat-1");
+    store.claimNextWork("chat-1");
     store.close();
 
     const reopened = GatewayStore.open(path);
-    expect(reopened.recoverAfterRestart()).toEqual({ interruptedTurnIds: [first.turnId] });
-    expect(reopened.claimNextTurn("chat-1")).toMatchObject({ messageId: "msg-2" });
+    expect(reopened.recoverAfterRestart()).toEqual({ interruptedWorkIds: [first.workId] });
+    expect(reopened.claimNextWork("chat-1")).toMatchObject({ messageId: "msg-2" });
     reopened.close();
   });
 

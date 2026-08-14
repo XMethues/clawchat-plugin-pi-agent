@@ -43,6 +43,61 @@ describe("registerClawchatTools", () => {
     ]);
   });
 
+  it("projects complete null-aware group metadata without clearing omitted participants", async () => {
+    const tools = new Map<string, RegisteredTool>();
+    const mergeMetadataIfChanged = vi.fn(
+      async (_target: unknown, _metadata: Record<string, unknown>) => true
+    );
+    const read = vi.fn(async () => ({
+      exists: true,
+      metadata: { group_id: "group-1", participant_ids: "owner-1,agent-user-1" }
+    }));
+    const get = vi.fn(async () => ({
+      conversation: {
+        id: "group-1",
+        type: "group",
+        avatar_url: null,
+        member_add_policy: null,
+        group: { owner: null },
+        updated_at: "2026-08-12T11:00:00.000Z"
+      }
+    }));
+    const pi = {
+      registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool)
+    } as unknown as ExtensionAPI;
+    registerClawchatTools(
+      pi,
+      toolEnvironment({
+        get,
+        memory: {
+          beginMetadataRefresh: () => 1,
+          mergeMetadataIfChanged,
+          read
+        } as unknown as ClawchatMemoryStore
+      })
+    );
+
+    const result = await tools.get("clawchat_metadata_sync")!.execute("call-group-pull", {
+      targetType: "group",
+      targetId: "group-1",
+      direction: "pull"
+    });
+
+    expect(result.details).toMatchObject({ ok: true, targetId: "group-1" });
+    const patch = mergeMetadataIfChanged.mock.calls[0]?.[1];
+    expect(patch).toMatchObject({
+      group_id: "group-1",
+      group_type: "group",
+      group_avatar_url: null,
+      group_member_add_policy: null,
+      group_owner_id: null,
+      group_owner_nickname: null,
+      group_owner_profile_type: null,
+      updated_at: "2026-08-12T11:00:00.000Z"
+    });
+    expect(patch).not.toHaveProperty("participant_ids");
+  });
+
   it("sends structured mentions only into the Active ClawChat Turn and marks them terminal", async () => {
     const tools = new Map<string, RegisteredTool>();
     const sendFrame = vi.fn(async () => undefined);
@@ -118,12 +173,13 @@ describe("registerClawchatTools", () => {
 
 function toolEnvironment(
   overrides: Partial<ClawchatToolEnvironment> & {
+    get?: (path: string) => Promise<unknown>;
     post?: (path: string, body?: unknown) => Promise<unknown>;
   } = {}
 ): ClawchatToolEnvironment {
-  const { post, ...environmentOverrides } = overrides;
+  const { get, post, ...environmentOverrides } = overrides;
   const api = {
-    get: vi.fn(async () => ({})),
+    get: get ?? vi.fn(async () => ({})),
     post: post ?? vi.fn(async () => ({})),
     patch: vi.fn(async () => ({})),
     delete: vi.fn(async () => ({})),

@@ -80,7 +80,7 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
       write(`Chat Sessions: ${status.sessions.length}`);
       for (const session of status.sessions) {
         write(
-          `  ${session.chatId} -> ${session.sessionId} queued=${session.queuedTurns} running=${session.runningTurns} ${session.sessionPath}`
+          `  ${session.chatId} -> ${session.sessionId} active=${session.active ? "yes" : "no"} queued=${session.queuedWork} running=${session.runningWork} ${session.sessionPath}`
         );
       }
       write(`Outbound pending: ${status.pendingOutbound}`);

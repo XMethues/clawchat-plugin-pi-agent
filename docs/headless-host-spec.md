@@ -54,9 +54,10 @@ clawchat-pi status [--profile <name>]
 - `run` fails when another Host or Activation holds the same profile lease.
 - `status` reports activation state, canonical Workspace, stable device,
   separate REST/WebSocket/Media endpoints, structured agent identity,
-  process-lock state, known Chat Sessions and queue counts, pending/failed
-  Outbox counts, quarantined frames, and any durable replay-truncation boundary.
-  It never prints tokens or message content.
+  process-lock state, each Conversation Session Set with its Active Chat
+  Session, historical sessions, and work counts, pending/failed Outbox counts,
+  quarantined frames, and any durable replay-truncation boundary. It never
+  prints tokens or message content.
 
 The interactive Extension keeps `/clawchat-activate`. It reads and writes the same named Host Profile state as the executable, with `default` as its default profile.
 
@@ -84,17 +85,17 @@ State lives below Pi's agent directory:
 
 `gateway.sqlite` is mode `0600` and is the Gateway Store described in ADR 0011. It stores protocol and routing state, not model context or secrets duplicated from the profile file.
 
-Pi sessions remain in Pi's standard session directory for the profile Workspace. The Gateway Store maps each `chat_id` to one Pi session ID and allocated JSONL path. Pi materializes a new JSONL file only after its first assistant response; until then, restart recovery may allocate a new path for the same session ID and atomically update that path. A newly observed chat gets a new Pi session ID; an existing materialized mapping is reopened. A mapping is never silently reassigned to a different session ID.
+Pi sessions remain in Pi's standard session directory for the profile Workspace. The Gateway Store maps each `chat_id` to a Conversation Session Set containing exactly one Active Chat Session and zero or more historical sessions, each with its own Pi session ID and allocated JSONL path. Pi materializes a new JSONL file only after its first turn; until then, restart recovery may allocate a new path for the same session ID and atomically update that path. Every newly observed conversation gets a set and initial Active Chat Session even when Group Dispatch Mode skips its messages. A session is never moved to another conversation or silently reassigned to a different session ID.
 
 ## Runtime topology and module boundaries
 
 | Module | Interface and responsibility |
 | --- | --- |
 | `HostProfileRepository` | Activates, loads, validates, and atomically saves one profile; owns opaque credentials, structured identity, separate endpoints, stable device identity, Workspace binding, and the exclusive operation lease shared by Activation and Host ownership. |
-| `GatewayStore` | Transactionally admits inbound frames, records message dedupe and reliable ACK high-water state, stores poison quarantine and replay truncation, owns durable per-chat queues and materialized outbound attempts, and maps chats to Pi sessions. SQLite is the production adapter; tests use a temporary SQLite file. |
+| `GatewayStore` | Transactionally admits inbound frames, records message dedupe and reliable ACK high-water state, stores poison quarantine and replay truncation, owns durable per-conversation work queues and materialized outbound attempts, and persists Conversation Session Sets. SQLite is the production adapter; tests use a temporary SQLite file. |
 | `ClawChatGateway` | Exposes start, stop, admitted-frame delivery, and materialized send operations. Internally owns challenge/connect, capability negotiation, token/nonce recovery, replay, ACK scheduling, reconnect, self-echo filtering, stable outbound identity, and ACK-timeout reconciliation. Callers do not manage protocol cursors. |
-| `ChatSessionRegistry` | Resolves an admitted `chat_id` to one runtime, lazily creates or restores it, serializes its turns, and disposes all runtimes during Host shutdown. It does not own the WebSocket. |
-| `ChatSessionRuntime` | Owns one Pi `AgentSessionRuntime`, `SessionManager`, `SettingsManager`, `ResourceLoader`/Extension runtime, Chat Turn Queue consumer, and effective output settings. It processes one turn at a time. |
+| `ChatSessionRegistry` | Creates or restores a Conversation Session Set, loads the Active Chat Session required by each queued work item, executes ordered Session Transitions, and disposes runtimes during transition, conversation deletion, or Host shutdown. It does not own the WebSocket. |
+| `ChatSessionRuntime` | Owns one Pi `AgentSessionRuntime`, `SessionManager`, `SettingsManager`, `ResourceLoader`/Extension runtime, and effective output settings. It processes one turn at a time. |
 | `OutputProjector` | Converts completed Pi assistant, thinking, and visible tool events to unquoted ClawChat `message.send` frames in direct chats and quoted `message.reply` frames in group chats, and brackets a turn with `typing.update`. It does not own transport or persistence. |
 
 These are module seams, not one-class-per-row requirements. Public interfaces stay small; handshake state, SQL tables, Pi event assembly, and retry mechanics remain hidden inside their owning modules. Tests target each interface's behavior.
@@ -233,16 +234,30 @@ Direct messages always enter their Chat Session after durable admission. Groups 
 Integration control commands are recognized before group dispatch policy, never enter Pi context, and remain usable while a group is muted or a Chat Session is busy:
 
 ```text
+/new
+/session
+/resume [list [page]|<session_id>]
+/stop
 /clawchat-group mention|all|muted
 /clawchat-output minimal|normal|full|inherit
 ```
 
+The Pi-style session commands are available only to the Agent owner.
+`/new` creates and activates a fresh Chat Session. `/session` reports only
+structural metadata and usage statistics. `/resume` pages historical sessions
+without message content, and `/resume <session_id>` accepts only a session owned
+by the current conversation. Session Transitions share the conversation FIFO:
+earlier work settles in the former Active Chat Session and later work uses the
+replacement. `/stop` is the exception: admission atomically cancels older queued
+work, then aborts the current runtime like Pi's interactive Escape; later
+messages remain eligible.
+
 `/clawchat-group` is valid only in a group. `/clawchat-output` persists a
-per-Chat-Session Output Mode override. Its status reply reports the effective
-mode, the Host Profile default, and the chat override; `inherit` deletes the
-override and follows the profile default. Consistent with Execution Authority,
-the integration does not add an owner-only command gate; any participant whose
-message reaches the ClawChat agent can issue these integration commands.
+per-conversation Output Mode override. Its status reply reports the effective
+mode, the Host Profile default, and the conversation override; `inherit`
+deletes the override and follows the profile default. Any participant whose
+message reaches the ClawChat agent can issue these `/clawchat-*` integration
+commands.
 
 Unsupported ClawChat content is durably acknowledged and marked skipped. It is not rendered into synthetic prompt text.
 
@@ -258,10 +273,25 @@ require an explicit registered ClawChat tool call. Ordinary user turns keep
 their inbound quote context and Group Dispatch behavior.
 
 Every successful `hello-ok` starts one non-blocking, single-flight
-authoritative recovery. It refreshes the conversation list, detail and
-announcement state for known mapped or loaded conversations, and the connected
-agent's structured behavior/profile state. Identical snapshots are no-ops;
-changed snapshots coalesce into at most one owner Awareness Turn per cycle.
+authoritative recovery. It refreshes the conversation list plus detail and
+announcement state for every listed, mapped, or loaded conversation, and the
+connected agent's structured behavior/profile state. A conversation Awareness
+signal materializes authoritative group metadata immediately. Independently,
+the first accepted Group Chat Turn durably records the WebSocket `chat_id` and
+`chat_type` before Pi runs. That identity write is mandatory. Authoritative
+detail and participant enrichment is bounded and best-effort: a timeout or REST
+failure does not block the user Turn, and a later Turn retries until one
+enrichment succeeds and participant IDs are present. Successful enrichment is
+not repeated per message; Awareness signals and reconnect recovery maintain
+subsequent changes. Per-target memory mutations serialize metadata patches with
+agent-authored body writes, and an enrichment abandoned by timeout or abort
+cannot commit a late response. Each authoritative REST fetch reserves a
+per-target generation before network I/O, so a superseded unversioned response
+cannot commit out of order. Group records mark the accepted server version as
+`group_authoritative_updated_at`; an unmarked legacy `updated_at` is replaced by
+the first authoritative refresh, and later older snapshots cannot regress the
+record. Identical snapshots are no-ops; changed snapshots coalesce into at most
+one owner Awareness Turn per cycle.
 Failures retry with bounded exponential backoff, while live metadata
 invalidations remain the low-latency path.
 
@@ -274,21 +304,22 @@ forever.
 
 ## Chat Session lifecycle
 
-- A Chat Session runtime is created lazily on the first dispatchable message.
-- Each runtime has its own Pi `SessionManager`, `SettingsManager`, `ResourceLoader`, Extension runtime, and Pi event subscriptions. Mutable Pi loaders or Extension runtimes are never shared between chats.
+- A Conversation Session Set and its initial Active Chat Session are created when the Host observes the conversation through recovery, lifecycle signals, or an inbound frame; this does not invoke Pi.
+- Each loaded runtime has its own Pi `SessionManager`, `SettingsManager`, `ResourceLoader`, Extension runtime, and Pi event subscriptions. Mutable Pi loaders or Extension runtimes are never shared between Chat Sessions.
 - Process-wide immutable model/provider services may be shared when the Pi SDK permits it.
 - Every runtime uses the Host Profile Workspace as `cwd` and reopens the JSONL recorded in the Gateway Store.
-- Loaded runtimes remain resident until Host shutdown. There is no per-session disconnect, idle expiry, or maximum loaded-session limit.
-- The Registry may run different Chat Sessions concurrently. One Chat Session consumes only the head of its durable FIFO queue and starts the next item after `agent_settled` closes the current turn.
-- A newly admitted message never steers, interrupts, or becomes a Pi follow-up to the current turn. It waits in the durable queue.
+- Loaded runtimes remain resident until Host shutdown, an explicit Session Transition disposes the former Active Chat Session, or conversation deletion removes the full set. There is no idle expiry or maximum loaded-session limit.
+- The Registry may run different Conversation Session Sets concurrently. One set consumes only the head of its durable FIFO work queue and starts the next item after the current item settles.
+- `/new` and `/resume <session_id>` are Session Transitions in that FIFO. An empty session replaced during a transition is deleted; a session that has received any attempted turn is retained as history.
+- A newly admitted ordinary message never steers, interrupts, or becomes a Pi follow-up to the current turn. It waits in the durable queue. `/stop` alone interrupts outside the queue as described above.
 
 ### Restart recovery
 
-- A queued turn that was never started remains queued and resumes in FIFO order.
-- Before invoking Pi, the Registry atomically changes that turn from `queued` to `running`.
-- After `agent_settled` and durable creation of all materialized replies, it marks the turn complete.
-- At startup, a turn left in `running` is marked `interrupted` and is not automatically replayed, per ADR 0012. This avoids repeating non-idempotent tool effects.
-- An interrupted turn does not generate adapter-authored failure prose. Its persisted Pi session remains available for later messages and TUI inspection.
+- Queued work that was never started remains queued and resumes in FIFO order.
+- Before execution, the Registry atomically changes work from `queued` to `running`.
+- After a Chat Turn reaches `agent_settled` and all materialized replies are durable, or after a Session Command completes, it marks the work complete.
+- At startup, work left in `running` is marked `interrupted` and is not automatically replayed, per ADR 0012. This avoids repeating non-idempotent tool effects or Session Transitions.
+- Interrupted work does not generate adapter-authored failure prose. Persisted Pi sessions remain available for later messages and owner-authorized resume.
 
 ## Pi input and output
 

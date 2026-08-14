@@ -6,7 +6,7 @@ import {
   formatDimensionNote,
   resizeImage
 } from "@earendil-works/pi-coding-agent";
-import { renderInboundPrompt, renderInboundPromptHeader } from "./inbound.js";
+import { hasMediaFragments, renderInboundPrompt, renderInboundPromptHeader } from "./inbound.js";
 import type { ClawchatInboundMessage, MediaFragment } from "./types.js";
 
 export interface InboundMediaPolicy {
@@ -71,11 +71,34 @@ const DEFAULT_POLICY: InboundMediaPolicy = {
   turnTimeoutMs: 5 * 60_000
 };
 const RETRY_DELAY_MS = 250;
+const MAX_DOWNLOAD_ATTEMPTS = 2;
 const MAX_REMOVE_ATTEMPTS = 3;
 const MAX_REDIRECTS = 5;
 const MAX_FILENAME_BYTES = 120;
 const UTF8_ENCODER = new TextEncoder();
 const UTF8_DECODER = new TextDecoder();
+
+export function plainInboundTurn(message: ClawchatInboundMessage): MaterializedInboundTurn {
+  return { prompt: renderInboundPrompt(message), images: [], release: async () => undefined };
+}
+
+class AttachmentByteBudget {
+  private usedBytes = 0;
+
+  constructor(private readonly maximumBytes: number) {}
+
+  get used(): number {
+    return this.usedBytes;
+  }
+
+  remaining(): number {
+    return this.maximumBytes - this.usedBytes;
+  }
+
+  account(count: number): void {
+    this.usedBytes += count;
+  }
+}
 
 type DelayFn = (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 type TimeoutKey =
@@ -124,16 +147,8 @@ export class InboundMediaMaterializer {
     signal?: AbortSignal
   ): Promise<MaterializedInboundTurn> {
     const fragments = message.payload.message.body.fragments;
-    if (
-      !fragments.some(
-        (fragment) =>
-          fragment.kind === "image" ||
-          fragment.kind === "file" ||
-          fragment.kind === "audio" ||
-          fragment.kind === "video"
-      )
-    ) {
-      return { prompt: renderInboundPrompt(message), images: [], release: async () => undefined };
+    if (!hasMediaFragments(fragments)) {
+      return plainInboundTurn(message);
     }
 
     let leaseDir: string | undefined;
@@ -334,31 +349,27 @@ export class InboundMediaMaterializer {
       new DownloadFailure(false, "Inbound media attachment timed out"),
       this.timeoutDelayFn("attachmentTimeoutMs")
     );
-    let attachmentBytes = 0;
 
     try {
-      for (let attempt = 0; attempt < 2; attempt += 1) {
+      for (let attempt = 0; attempt < MAX_DOWNLOAD_ATTEMPTS; attempt += 1) {
+        const attemptBudget = new AttachmentByteBudget(this.policy.maxAttachmentBytes);
         try {
           return await this.downloadAttempt(
             initialUrl,
             fragment,
             aggregate,
-            attachmentController.signal,
-            () => attachmentBytes,
-            (count) => {
-              attachmentBytes += count;
-            }
+            attemptBudget,
+            attachmentController.signal
           );
         } catch (error: unknown) {
+          aggregate.downloadedBytes -= attemptBudget.used;
           const failure =
             error instanceof DownloadFailure
               ? error
               : new DownloadFailure(false, "Inbound media processing failed");
           if (
-            attempt === 0 &&
+            attempt < MAX_DOWNLOAD_ATTEMPTS - 1 &&
             failure.retryable &&
-            attachmentBytes < this.policy.maxAttachmentBytes &&
-            aggregate.downloadedBytes < this.policy.maxTurnBytes &&
             !attachmentController.signal.aborted &&
             !turnSignal.aborted
           ) {
@@ -379,9 +390,8 @@ export class InboundMediaMaterializer {
     initialUrl: string,
     fragment: MediaFragment,
     aggregate: { downloadedBytes: number },
-    attachmentSignal: AbortSignal,
-    attachmentBytes: () => number,
-    accountAttachmentBytes: (count: number) => void
+    attemptBudget: AttachmentByteBudget,
+    attachmentSignal: AbortSignal
   ): Promise<DownloadedBody> {
     let currentUrl = initialUrl;
 
@@ -450,7 +460,7 @@ export class InboundMediaMaterializer {
           throw new DownloadFailure(false);
         }
 
-        const remainingAttachmentBytes = this.policy.maxAttachmentBytes - attachmentBytes();
+        const remainingAttachmentBytes = attemptBudget.remaining();
         const remainingTurnBytes = this.policy.maxTurnBytes - aggregate.downloadedBytes;
         const declaredContentLength = contentLength(response.headers.get("content-length"));
         if (
@@ -471,8 +481,7 @@ export class InboundMediaMaterializer {
           declaredContentLength,
           aggregate,
           requestController,
-          attachmentBytes,
-          accountAttachmentBytes
+          attemptBudget
         );
       } finally {
         unlinkAttachment();
@@ -487,8 +496,7 @@ export class InboundMediaMaterializer {
     declaredContentLength: number | undefined,
     aggregate: { downloadedBytes: number },
     requestController: AbortController,
-    attachmentBytes: () => number,
-    accountAttachmentBytes: (count: number) => void
+    attemptBudget: AttachmentByteBudget
   ): Promise<DownloadedBody> {
     if (requestController.signal.aborted) {
       cancelResponseBody(response);
@@ -513,7 +521,7 @@ export class InboundMediaMaterializer {
     requestController.signal.addEventListener("abort", cancelReader, { once: true });
     const bodyBuffer = new BoundedBodyBuffer(
       Math.min(
-        this.policy.maxAttachmentBytes - attachmentBytes(),
+        attemptBudget.remaining(),
         this.policy.maxTurnBytes - aggregate.downloadedBytes
       ),
       declaredContentLength
@@ -560,10 +568,10 @@ export class InboundMediaMaterializer {
         if (read.done) break;
 
         const count = read.value.byteLength;
-        accountAttachmentBytes(count);
+        attemptBudget.account(count);
         aggregate.downloadedBytes += count;
         if (
-          attachmentBytes() > this.policy.maxAttachmentBytes ||
+          attemptBudget.used > this.policy.maxAttachmentBytes ||
           aggregate.downloadedBytes > this.policy.maxTurnBytes
         ) {
           throw new DownloadFailure(false);

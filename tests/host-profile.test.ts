@@ -83,7 +83,7 @@ describe("HostProfileRepository", () => {
     await writeFile(join(profileDirectory, "skills", "old.md"), "old skill\n");
     const gatewayPath = join(profileDirectory, "gateway.sqlite");
     const gateway = GatewayStore.open(gatewayPath);
-    gateway.getOrCreateChatSession("chat-1", () => ({ sessionId: "session-1", sessionPath }));
+    gateway.ensureConversationSessionSet("chat-1", () => ({ sessionId: "session-1", sessionPath }));
     gateway.enqueueOutbound({
       traceId: "out-1",
       chatId: "chat-1",
