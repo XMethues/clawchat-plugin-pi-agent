@@ -59,14 +59,14 @@ export class ClawchatInboundRouter {
           control: { type: "denied", command: sessionDecision.command }
         };
       }
-      if (sessionDecision.invalidUsage) {
+      if ("invalidUsage" in sessionDecision) {
         return {
           dispatch: false,
           control: { type: "invalid", usage: sessionDecision.invalidUsage }
         };
       }
-      if (sessionDecision.stop) return { dispatch: false, stop: true };
-      return { dispatch: false, sessionCommand: sessionDecision.sessionCommand! };
+      if ("stop" in sessionDecision) return { dispatch: false, stop: true };
+      return { dispatch: false, sessionCommand: sessionDecision.sessionCommand };
     }
 
     const groupCommand = /^\/clawchat-group\s+(mention|all|muted)\s*$/i.exec(text);
@@ -123,18 +123,12 @@ export class ClawchatInboundRouter {
       `ClawChat output mode: effective ${effective}; profile default ${this.modeDefault}; override ${override ?? "inherit"}.`
     );
   }
-
-  replyControl(message: ClawchatInboundMessage, text: string): Promise<void> {
-    return this.reply(message, text);
-  }
 }
 
-interface ParsedSessionCommand {
-  command: "/new" | "/session" | "/resume" | "/stop";
-  sessionCommand?: SessionCommand;
-  stop?: boolean;
-  invalidUsage?: string;
-}
+type ParsedSessionCommand =
+  | { command: "/new" | "/session" | "/resume"; sessionCommand: SessionCommand }
+  | { command: "/stop"; stop: true }
+  | { command: "/new" | "/session" | "/resume" | "/stop"; invalidUsage: string };
 
 function parseSessionCommand(text: string): ParsedSessionCommand | null {
   if (/^\/new\s*$/i.test(text)) {

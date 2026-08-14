@@ -1,16 +1,18 @@
 import {
   mkdir,
-  mkdtemp,
   readFile,
-  readdir,
-  rm,
   stat,
   writeFile
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, relative } from "node:path";
 import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  cleanupTempDirs,
+  leaseEntries,
+  makeTempDir,
+  minimalTestTools
+} from "./helpers/inbound-media.js";
 import { GatewayStore } from "../src/gateway-store.js";
 import { InboundMediaMaterializer } from "../src/inbound-media.js";
 import { PiChatSessionFactory } from "../src/pi-session-factory.js";
@@ -73,15 +75,13 @@ const GENERIC_ATTACHMENTS: readonly GenericFixture[] = [
   }
 ];
 
-const tempDirs: string[] = [];
-
 afterEach(async () => {
-  await Promise.all(tempDirs.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await cleanupTempDirs();
 });
 
 describe("generic inbound media materialization", () => {
   it("hands PDF, Office, audio, video, and arbitrary binary fragments to Pi as numbered private files", async () => {
-    const profileDir = await makeTempDir();
+    const profileDir = await makeTempDir("clawchat-generic-media-");
     const workspace = join(profileDir, "workspace");
     const mediaRoot = join(profileDir, "private-media");
     await mkdir(workspace);
@@ -143,11 +143,11 @@ describe("generic inbound media materialization", () => {
     for (const localPath of localPaths) {
       await expect(readFile(localPath)).rejects.toMatchObject({ code: "ENOENT" });
     }
-    expect(await listLeaseEntries(mediaRoot)).toEqual([]);
+    expect(await leaseEntries(mediaRoot)).toEqual([]);
   });
 
   it("infers stable safe extensions for unnamed known package MIME types", async () => {
-    const profileDir = await makeTempDir();
+    const profileDir = await makeTempDir("clawchat-generic-media-");
     const mediaRoot = join(profileDir, "private-media");
     const fixtures = [
       {
@@ -211,7 +211,7 @@ describe("generic inbound media materialization", () => {
   });
 
   it("applies the bounded downloader to a generic attachment instead of publishing an oversized file", async () => {
-    const profileDir = await makeTempDir();
+    const profileDir = await makeTempDir("clawchat-generic-media-");
     const mediaRoot = join(profileDir, "private-media");
     const mediaUrl = "https://media.clawling.com/private/oversized-pdf";
     const fetchFn = vi.fn(async () =>
@@ -241,14 +241,14 @@ describe("generic inbound media materialization", () => {
     expect(result.images).toEqual([]);
     expect(result.prompt).toContain("[Attachment 1 unavailable:");
     expect(result.prompt).not.toContain(mediaUrl);
-    expect(await listLeaseEntries(mediaRoot)).toEqual([]);
+    expect(await leaseEntries(mediaRoot)).toEqual([]);
     await result.release();
   });
 });
 
 describe("PiChatSessionFactory generic attachment handoff", () => {
   it("loads a configured Pi Package tool that consumes the leased generic path during the Turn", async () => {
-    const profileDir = await makeTempDir();
+    const profileDir = await makeTempDir("clawchat-generic-media-");
     const workspace = join(profileDir, "workspace");
     const mediaRoot = join(profileDir, "private-media");
     const packageSource = "./packages/attachment-reader";
@@ -329,6 +329,7 @@ describe("PiChatSessionFactory generic attachment handoff", () => {
       agentDir: profileDir,
       sessionDir: join(profileDir, "sessions"),
       media: { rootDir: mediaRoot, fetchFn: fetchFn as typeof fetch },
+      tools: minimalTestTools,
       createAgentSessionFn: async ({ agentDir, resourceLoader }) => {
         expect(agentDir).toBe(profileDir);
         expect(resourceLoader).toBeInstanceOf(DefaultResourceLoader);
@@ -397,7 +398,7 @@ describe("PiChatSessionFactory generic attachment handoff", () => {
       promptSettled.resolve();
       await running;
       await expect(readFile(promptedPath!)).rejects.toMatchObject({ code: "ENOENT" });
-      expect(await listLeaseEntries(mediaRoot)).toEqual([]);
+      expect(await leaseEntries(mediaRoot)).toEqual([]);
     } finally {
       promptSettled.resolve();
       await running?.catch(() => undefined);
@@ -469,19 +470,4 @@ function genericTurn(id: string, fragment: MediaFragment) {
     status: "running" as const,
     frame: genericMessage(id, [fragment])
   };
-}
-
-async function makeTempDir(): Promise<string> {
-  const path = await mkdtemp(join(tmpdir(), "clawchat-generic-media-"));
-  tempDirs.push(path);
-  return path;
-}
-
-async function listLeaseEntries(rootDir: string): Promise<string[]> {
-  try {
-    return await readdir(rootDir, { recursive: true });
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
 }

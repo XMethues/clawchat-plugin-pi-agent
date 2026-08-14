@@ -47,9 +47,9 @@ export interface ChatTurn {
   status: "queued" | "running" | "complete" | "interrupted";
 }
 
-export interface ConversationWork extends ChatTurn {
-  command: SessionCommand | null;
-}
+export type ConversationWork =
+  | (ChatTurn & { command: null })
+  | (ChatTurn & { command: SessionCommand });
 
 export interface ClawchatAwarenessSource {
   sourceId: string;
@@ -413,19 +413,7 @@ export class GatewayStore {
            VALUES (?, ?, ?, ?, NULL)`
         )
         .run(created.sessionId, chatId, created.sessionPath, now);
-      this.database
-        .prepare(
-          `UPDATE conversation_session_sets
-           SET active_session_id = ?, updated_at = ?
-           WHERE chat_id = ?`
-        )
-        .run(created.sessionId, now, chatId);
-      const replacedEmpty = previous.lastUsedAt === null ? previous : null;
-      if (replacedEmpty) {
-        this.database
-          .prepare("DELETE FROM chat_sessions WHERE chat_id = ? AND session_id = ?")
-          .run(chatId, previous.sessionId);
-      }
+      const replacedEmpty = this.replaceActiveSession(chatId, previous, created.sessionId, now);
       this.database.exec("COMMIT");
       return {
         session: {
@@ -457,25 +445,35 @@ export class GatewayStore {
         this.database.exec("COMMIT");
         return { session: target, replacedEmpty: null };
       }
-      this.database
-        .prepare(
-          `UPDATE conversation_session_sets
-           SET active_session_id = ?, updated_at = ?
-           WHERE chat_id = ?`
-        )
-        .run(sessionId, Date.now(), chatId);
-      const replacedEmpty = previous.lastUsedAt === null ? previous : null;
-      if (replacedEmpty) {
-        this.database
-          .prepare("DELETE FROM chat_sessions WHERE chat_id = ? AND session_id = ?")
-          .run(chatId, previous.sessionId);
-      }
+      const replacedEmpty = this.replaceActiveSession(chatId, previous, sessionId, Date.now());
       this.database.exec("COMMIT");
       return { session: { ...target, active: true }, replacedEmpty };
     } catch (error: unknown) {
       this.database.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  private replaceActiveSession(
+    chatId: string,
+    previous: ChatSessionRecord,
+    replacementSessionId: string,
+    now: number
+  ): ChatSessionRecord | null {
+    this.database
+      .prepare(
+        `UPDATE conversation_session_sets
+         SET active_session_id = ?, updated_at = ?
+         WHERE chat_id = ?`
+      )
+      .run(replacementSessionId, now, chatId);
+    const replacedEmpty = previous.lastUsedAt === null ? previous : null;
+    if (replacedEmpty) {
+      this.database
+        .prepare("DELETE FROM chat_sessions WHERE chat_id = ? AND session_id = ?")
+        .run(chatId, previous.sessionId);
+    }
+    return replacedEmpty;
   }
 
   markChatSessionUsed(chatId: string, sessionId: string): void {
@@ -606,15 +604,7 @@ export class GatewayStore {
           );
       }
       const cancelledWork = input.stop
-        ? Number(
-            this.database
-              .prepare(
-                `UPDATE chat_turns
-                 SET status = 'interrupted', completed_at = ?
-                 WHERE chat_id = ? AND status = 'queued'`
-              )
-              .run(now, input.chatId).changes
-          )
+        ? this.cancelQueuedWorkRows(input.chatId, now)
         : 0;
       this.database
         .prepare(
@@ -698,6 +688,10 @@ export class GatewayStore {
   }
 
   cancelQueuedWork(chatId: string): number {
+    return this.cancelQueuedWorkRows(chatId, Date.now());
+  }
+
+  private cancelQueuedWorkRows(chatId: string, now: number): number {
     return Number(
       this.database
         .prepare(
@@ -705,7 +699,7 @@ export class GatewayStore {
            SET status = 'interrupted', completed_at = ?
            WHERE chat_id = ? AND status = 'queued'`
         )
-        .run(Date.now(), chatId).changes
+        .run(now, chatId).changes
     );
   }
 
@@ -1386,7 +1380,7 @@ function mapConversationWork(row: ConversationWorkRow): ConversationWork {
     frame: JSON.parse(row.frame_json) as unknown,
     command,
     status: row.status
-  };
+  } as ConversationWork;
 }
 
 function sessionCommandWorkType(

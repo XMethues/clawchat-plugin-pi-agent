@@ -430,6 +430,13 @@ export function clawchatMemoryTarget(
   return { targetType, targetId: normalizedId };
 }
 
+export function hasParticipantIds(metadata: Record<string, string>): boolean {
+  return (
+    typeof metadata.participant_ids === "string" &&
+    metadata.participant_ids.split(",").some((id) => id.trim().length > 0)
+  );
+}
+
 function validateTarget(target: ClawchatMemoryTarget): void {
   clawchatMemoryTarget(target.targetType, target.targetId);
 }

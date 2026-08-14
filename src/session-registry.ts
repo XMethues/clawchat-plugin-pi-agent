@@ -3,7 +3,8 @@ import type {
   ChatSessionMapping,
   ChatTurn,
   ConversationWork,
-  GatewayStore
+  GatewayStore,
+  SessionCommand
 } from "./gateway-store.js";
 import type { ClawchatInboundMessage } from "./types.js";
 
@@ -123,14 +124,32 @@ export class ChatSessionRegistry {
     return worker.promise;
   }
 
-  async stop(chatId: string): Promise<{ interrupted: boolean }> {
+  async stop(
+    chatId: string,
+    options: { abortTimeoutMs?: number } = {}
+  ): Promise<{ interrupted: boolean }> {
     const work = this.activeWork.get(chatId);
     if (!work) return { interrupted: false };
     this.forcedInterrupts.add(work.id);
     this.store.interruptWork(work.id);
     const runtime = this.runtimes.get(chatId);
-    if (runtime) await (await runtime.driver).abort();
+    if (runtime) await this.abortRuntime(runtime, options.abortTimeoutMs);
     return { interrupted: true };
+  }
+
+  private async abortRuntime(runtime: RuntimeEntry, timeoutMs?: number): Promise<void> {
+    const abort = async () => {
+      try {
+        await (await runtime.driver).abort();
+      } catch {
+        // Runtime abort is best-effort; the work is already durably interrupted.
+      }
+    };
+    if (timeoutMs === undefined || timeoutMs <= 0) {
+      await abort();
+      return;
+    }
+    await settlesWithin([abort()], timeoutMs);
   }
 
   async deleteConversation(chatId: string): Promise<number> {
@@ -179,9 +198,13 @@ export class ChatSessionRegistry {
           if (work.command === null) {
             const mapping = this.requireActiveSession(chatId);
             this.store.markChatSessionUsed(chatId, mapping.sessionId);
+            // Skip opening a runtime when /stop already interrupted this work
+            // before it started; the check below the await covers a stop that
+            // lands while the runtime is still opening.
+            if (this.forcedInterrupts.has(work.id)) continue;
             const runtime = await this.getOrOpenRuntime(mapping);
             if (this.forcedInterrupts.has(work.id)) continue;
-            await runtime.runTurn(work as ChatTurn);
+            await runtime.runTurn(work);
           } else {
             await this.runSessionCommand(work);
           }
@@ -200,9 +223,11 @@ export class ChatSessionRegistry {
     } while (!this.stopping && !this.deleting.has(chatId) && worker.notified);
   }
 
-  private async runSessionCommand(work: ConversationWork): Promise<void> {
+  private async runSessionCommand(
+    work: ChatTurn & { command: SessionCommand }
+  ): Promise<void> {
     const message = work.frame as ClawchatInboundMessage;
-    const command = work.command!;
+    const command = work.command;
     if (command.type === "new") {
       const transition = this.store.createAndActivateChatSession(
         work.chatId,

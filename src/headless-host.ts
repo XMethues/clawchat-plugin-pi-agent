@@ -19,7 +19,9 @@ import {
   type PiChatSessionFactoryOptions
 } from "./pi-session-factory.js";
 import { ChatSessionRegistry } from "./session-registry.js";
-import type { ClawchatTransport } from "./types.js";
+import type { ClawchatInboundMessage, ClawchatTransport } from "./types.js";
+
+const STOP_ABORT_TIMEOUT_MS = 2_000;
 import { createClawchatToolRuntime } from "./clawchat-runtime.js";
 
 export interface HeadlessPiHostOptions {
@@ -103,14 +105,15 @@ export class HeadlessPiHost {
         }
       };
       const replyProjector = new ClawchatOutputProjector({ transport });
+      const reply = async (message: ClawchatInboundMessage, text: string): Promise<void> => {
+        await replyProjector.replyTo(message, text);
+      };
       const router = new ClawchatInboundRouter({
         store,
         agentUserId: profile.agent.userId,
         agentOwnerId: profile.agent.ownerId,
         modeDefault: profile.output.modeDefault,
-        reply: async (message, text) => {
-          await replyProjector.replyTo(message, text);
-        }
+        reply
       });
       const factory = new PiChatSessionFactory({
         workspace: profile.workspace,
@@ -142,9 +145,7 @@ export class HeadlessPiHost {
       const registry = new ChatSessionRegistry({
         store,
         factory,
-        reply: async (message, text) => {
-          await router.replyControl(message, text);
-        },
+        reply,
         onError: (error, work) => {
           this.onStatus?.(
             `work ${work.id} interrupted: ${error instanceof Error ? error.message : String(error)}`
@@ -205,8 +206,12 @@ export class HeadlessPiHost {
         classifyInbound: (message) => router.classify(message),
         onAcceptedControl: async (message, decision, result) => {
           if (decision.stop) {
-            const stopped = await registry.stop(message.chat_id);
-            await router.replyControl(
+            // Bound the Pi abort so a stuck runtime cannot stall the gateway
+            // frame queue while the /stop frame is being processed.
+            const stopped = await registry.stop(message.chat_id, {
+              abortTimeoutMs: STOP_ABORT_TIMEOUT_MS
+            });
+            await reply(
               message,
               `Stopped: active turn ${stopped.interrupted ? "interrupted" : "not running"}; queued work cancelled ${result.cancelledWork}.`
             );
@@ -215,7 +220,7 @@ export class HeadlessPiHost {
           await router.applyAcceptedControl(message, decision);
         },
         onConversationObserved: (message) => {
-          registry.ensureConversation(message.chat_id);
+          if (!this.stopping) registry.ensureConversation(message.chat_id);
         },
         onInboundMessage: async (message) => {
           void registry.wake(message.chat_id).catch((error: unknown) => {

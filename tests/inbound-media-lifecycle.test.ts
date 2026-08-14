@@ -1,14 +1,18 @@
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  cleanupTempDirs,
+  leaseEntries,
+  makeTempDir,
+  minimalTestTools
+} from "./helpers/inbound-media.js";
 import { GatewayStore } from "../src/gateway-store.js";
 import type { InboundMediaOptions } from "../src/inbound-media.js";
 import { PiChatSessionFactory } from "../src/pi-session-factory.js";
 import { ChatSessionRegistry } from "../src/session-registry.js";
 import type { ClawchatInboundMessage, MediaFragment } from "../src/types.js";
 
-const tempDirs: string[] = [];
 const SOURCE_BYTES = Uint8Array.from(Buffer.from("private original attachment", "utf8"));
 
 type RemoveFn = (
@@ -17,7 +21,7 @@ type RemoveFn = (
 ) => Promise<void>;
 
 afterEach(async () => {
-  await Promise.all(tempDirs.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await cleanupTempDirs();
   vi.restoreAllMocks();
 });
 
@@ -255,7 +259,7 @@ interface FactoryFixture {
 
 
 async function openFactory(options: FactoryOptions = {}): Promise<FactoryFixture> {
-  const parent = await makeTempDir();
+  const parent = await makeTempDir("clawchat-inbound-media-lifecycle-");
   const workspace = join(parent, "workspace");
   const mediaRoot = join(parent, "inbound-media");
   const storePath = join(parent, "gateway.sqlite");
@@ -276,6 +280,7 @@ async function openFactory(options: FactoryOptions = {}): Promise<FactoryFixture
     agentDir: parent,
     sessionDir: join(parent, "sessions"),
     media,
+    tools: minimalTestTools,
     createAgentSessionFn: async () => ({
       session: {
         prompt: options.prompt ?? (async () => undefined),
@@ -328,19 +333,4 @@ function file(id: string): MediaFragment {
     name: `${id}.bin`,
     mime: "application/octet-stream"
   };
-}
-
-async function makeTempDir(): Promise<string> {
-  const path = await mkdtemp(join(tmpdir(), "clawchat-inbound-media-lifecycle-"));
-  tempDirs.push(path);
-  return path;
-}
-
-async function leaseEntries(rootDir: string): Promise<string[]> {
-  try {
-    return await readdir(rootDir, { recursive: true });
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
 }

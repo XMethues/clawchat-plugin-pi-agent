@@ -281,6 +281,47 @@ describe("ChatSessionRegistry", () => {
     store.close();
   });
 
+  it("bounds the runtime abort wait on stop", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-registry-"));
+    const store = GatewayStore.open(join(directory, "gateway.sqlite"));
+    admit(store, "chat-1", "msg-1");
+    const release = deferred<void>();
+    const registry = new ChatSessionRegistry({
+      store,
+      factory: {
+        createSession: () => ({
+          sessionId: "session-chat-1",
+          sessionPath: "/sessions/chat-1.jsonl"
+        }),
+        openSession: async (mapping) => ({
+          runTurn: async () => {
+            await release.promise;
+          },
+          getInfo: async () => sessionInfo(mapping.sessionId),
+          abort: async () => {
+            // A hung Pi abort must not block stop past the bound.
+            await new Promise<void>(() => undefined);
+          },
+          dispose: async () => undefined
+        }),
+        inspectSession: async () => ({ messageCount: 0 }),
+        deleteSession: async () => undefined
+      },
+      reply: async () => undefined
+    });
+    const worker = registry.wake("chat-1");
+    await waitFor(() => store.getStatus().sessions[0]?.runningWork === 1);
+
+    const started = Date.now();
+    const stopped = registry.stop("chat-1", { abortTimeoutMs: 20 });
+    await expect(stopped).resolves.toEqual({ interrupted: true });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    release.resolve();
+    await worker;
+    await registry.shutdown();
+    store.close();
+  });
+
   it("does not start a turn stopped while its runtime is opening", async () => {
     const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-registry-"));
     const store = GatewayStore.open(join(directory, "gateway.sqlite"));

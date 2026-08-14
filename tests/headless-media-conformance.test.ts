@@ -1,11 +1,11 @@
-import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
 import WebSocket, { WebSocketServer } from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { leaseEntries, SMALL_PNG, cleanupTempDirs, makeTempDir } from "./helpers/inbound-media.js";
 import { GatewayStore } from "../src/gateway-store.js";
 import { HeadlessPiHost } from "../src/headless-host.js";
 import { HostProfileRepository } from "../src/host-profile.js";
@@ -32,15 +32,7 @@ const URLS = {
   rejectedMuted: "https://media.clawling.com/private/must-not-fetch-muted"
 } as const;
 
-const SMALL_PNG = Uint8Array.from(
-  Buffer.from(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-    "base64"
-  )
-);
-
 const servers: WebSocketServer[] = [];
-const tempDirectories: string[] = [];
 
 afterEach(async () => {
   vi.unstubAllGlobals();
@@ -51,16 +43,14 @@ afterEach(async () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     })
   );
-  await Promise.all(
-    tempDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true }))
-  );
+  await cleanupTempDirs();
 });
 
 describe("real Headless Host inbound media conformance", () => {
   it("durably admits a dispatched media frame before its fetch and keeps dispatched media private and isolated", async () => {
     const server = await listen();
     const restOrigin = websocketUrl(server).replace(/^ws/, "http");
-    const agentDir = await temporaryDirectory();
+    const agentDir = await makeTempDir("clawchat-pi-media-conformance-");
     const workspace = join(agentDir, "workspace");
     await mkdir(workspace);
     const profiles = new HostProfileRepository({ agentDir, createDeviceId: () => DEVICE_ID });
@@ -600,21 +590,6 @@ async function waitForMissing(path: string): Promise<void> {
     await new Promise<void>((resolve) => setImmediate(resolve));
   }
   throw new Error(`Timed out waiting for media cleanup: ${path}`);
-}
-
-async function leaseEntries(rootDir: string): Promise<string[]> {
-  try {
-    return await readdir(rootDir, { recursive: true });
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
-}
-
-async function temporaryDirectory(): Promise<string> {
-  const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-media-conformance-"));
-  tempDirectories.push(directory);
-  return directory;
 }
 
 async function listen(): Promise<WebSocketServer> {

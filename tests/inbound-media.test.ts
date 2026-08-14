@@ -1,19 +1,18 @@
-import { mkdtemp, readdir, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  InboundMediaMaterializer,
-  type InboundMediaOptions
-} from "../src/inbound-media.js";
+  cleanupTempDirs,
+  chunkedResponse,
+  failingAfterChunks,
+  leaseEntries,
+  makeMaterializer,
+  partiallyFailingResponse,
+  pngResponse,
+  SMALL_PNG,
+  splitEvery,
+  stalledResponse
+} from "./helpers/inbound-media.js";
 import type { ClawchatInboundMessage, MediaFragment } from "../src/types.js";
 
-const SMALL_PNG = Uint8Array.from(
-  Buffer.from(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-    "base64"
-  )
-);
 const SMALL_BMP = Uint8Array.from([
   0x42, 0x4d, 0x3a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00,
   0x28, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
@@ -21,11 +20,8 @@ const SMALL_BMP = Uint8Array.from([
   0x13, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
   0xff, 0x00
 ]);
-const IMAGE_HEADERS = { "content-type": "image/png", "content-length": "1" };
-const tempDirs: string[] = [];
-
 afterEach(async () => {
-  await Promise.all(tempDirs.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await cleanupTempDirs();
 });
 
 describe("InboundMediaMaterializer download boundary", () => {
@@ -517,125 +513,6 @@ function imageMessage(id: string, fragments: ImageFragment[]): ClawchatInboundMe
   };
 }
 
-async function makeMaterializer(fetchFn: unknown, overrides: Partial<InboundMediaOptions> = {}) {
-  const parent = await mkdtemp(join(tmpdir(), "clawchat-inbound-media-"));
-  tempDirs.push(parent);
-  const rootDir = join(parent, "leases");
-  return {
-    rootDir,
-    materializer: new InboundMediaMaterializer({
-      rootDir,
-      fetchFn: fetchFn as typeof fetch,
-      ...overrides
-    })
-  };
-}
-
-function pngResponse(): Response {
-  return new Response(SMALL_PNG, { headers: IMAGE_HEADERS });
-}
-
-function chunkedResponse(
-  chunks: Uint8Array[],
-  headers: ConstructorParameters<typeof Headers>[0] = IMAGE_HEADERS
-) {
-  let index = 0;
-  let pullCount = 0;
-  const cancelled = Promise.withResolvers<unknown>();
-  const response = new Response(
-    new ReadableStream<Uint8Array>(
-      {
-        pull(controller) {
-          pullCount += 1;
-          const chunk = chunks[index++];
-          if (!chunk) return controller.close();
-          controller.enqueue(chunk);
-          if (index === chunks.length) controller.close();
-        },
-        cancel: cancelled.resolve
-      },
-      { highWaterMark: 0 }
-    ),
-    { headers }
-  );
-  return { response, pulls: () => pullCount, cancelled: cancelled.promise };
-}
-
-function partiallyFailingResponse(chunk: Uint8Array): Response {
-  let emitted = false;
-  return new Response(
-    new ReadableStream<Uint8Array>(
-      {
-        pull(controller) {
-          if (emitted) {
-            controller.error(new TypeError("socket reset"));
-            return;
-          }
-          emitted = true;
-          controller.enqueue(chunk);
-        }
-      },
-      { highWaterMark: 0 }
-    ),
-    { headers: { "content-type": "image/png" } }
-  );
-}
-
-function failingAfterChunks(chunks: Uint8Array[]): { response: Response; cancelled: Promise<unknown> } {
-  const cancelled = Promise.withResolvers<unknown>();
-  let index = 0;
-  const response = new Response(
-    new ReadableStream<Uint8Array>(
-      {
-        pull(controller) {
-          const chunk = chunks[index++];
-          if (!chunk) {
-            controller.error(new TypeError("socket reset"));
-            return;
-          }
-          controller.enqueue(chunk);
-        },
-        cancel: cancelled.resolve
-      },
-      { highWaterMark: 0 }
-    ),
-    { headers: { "content-type": "image/png" } }
-  );
-  return { response, cancelled: cancelled.promise };
-}
-
-function stalledResponse() {
-  const started = Promise.withResolvers<void>();
-  const cancelled = Promise.withResolvers<unknown>();
-  let firstPull = true;
-  const response = new Response(
-    new ReadableStream<Uint8Array>(
-      {
-        pull(controller) {
-          if (!firstPull) {
-            started.resolve();
-            return new Promise<void>(() => undefined);
-          }
-          firstPull = false;
-          controller.enqueue(SMALL_PNG.subarray(0, 8));
-        },
-        cancel: cancelled.resolve
-      },
-      { highWaterMark: 0 }
-    ),
-    { headers: IMAGE_HEADERS }
-  );
-  return { response, started: started.promise, cancelled: cancelled.promise };
-}
-
-function splitEvery(bytes: Uint8Array, size: number): Uint8Array[] {
-  const chunks: Uint8Array[] = [];
-  for (let offset = 0; offset < bytes.byteLength; offset += size) {
-    chunks.push(bytes.subarray(offset, Math.min(offset + size, bytes.byteLength)));
-  }
-  return chunks;
-}
-
 function timeoutPolicy(overrides: Partial<TimeoutPolicy>): TimeoutPolicy {
   return {
     connectionTimeoutMs: 101,
@@ -687,14 +564,5 @@ class ManualDelays {
       await Promise.resolve();
     }
     throw new Error(`No delay was scheduled for ${milliseconds} ms`);
-  }
-}
-
-async function leaseEntries(rootDir: string): Promise<string[]> {
-  try {
-    return await readdir(rootDir, { recursive: true });
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
   }
 }

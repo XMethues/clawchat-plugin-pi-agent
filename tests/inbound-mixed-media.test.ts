@@ -1,23 +1,26 @@
-import { mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { deflateSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  cleanupTempDirs,
+  makeTempDir,
+  utf8
+} from "./helpers/inbound-media.js";
 import { InboundMediaMaterializer } from "../src/inbound-media.js";
 import type { ClawchatFragment, ClawchatInboundMessage } from "../src/types.js";
 
 const RED_PNG = pixelPng(255, 0, 0);
 const BLUE_PNG = pixelPng(0, 0, 255);
 const DOCUMENT = "first document line\nsecond document line\nEND-DOCUMENT";
-const tempDirs: string[] = [];
 
 afterEach(async () => {
-  await Promise.all(tempDirs.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await cleanupTempDirs();
 });
 
 describe("ordered mixed inbound media", () => {
   it("projects interleaved text, numbered media, and a failure in order while appending successful images in numbered order", async () => {
-    const rootDir = join(await tempDir(), "private-media");
+    const rootDir = join(await makeTempDir("clawchat-inbound-mixed-media-"), "private-media");
     const urls = {
       red: "https://media.clawling.com/private/red",
       document: "https://media.clawling.com/private/document",
@@ -87,7 +90,7 @@ describe("ordered mixed inbound media", () => {
   });
 
   it("concatenates adjacent text fragments without inserting a separator around ordered media", async () => {
-    const rootDir = join(await tempDir(), "private-media");
+    const rootDir = join(await makeTempDir("clawchat-inbound-mixed-media-"), "private-media");
     const materializer = new InboundMediaMaterializer({
       rootDir,
       fetchFn: vi.fn(async () => new Response(RED_PNG, { headers: { "content-type": "image/png" } }))
@@ -119,7 +122,7 @@ describe("ordered mixed inbound media", () => {
 
 describe("invalid media sources", () => {
   it("materializes an all-invalid media-only direct Turn as numbered failures without fetching", async () => {
-    const rootDir = join(await tempDir(), "private-media");
+    const rootDir = join(await makeTempDir("clawchat-inbound-mixed-media-"), "private-media");
     const fetchFn = vi.fn();
     const materializer = new InboundMediaMaterializer({
       rootDir,
@@ -149,7 +152,7 @@ describe("invalid media sources", () => {
 
 describe("mixed-media private filenames", () => {
   it("preserves normal Unicode and deterministically bounds and isolates duplicate and hostile names", async () => {
-    const parent = await tempDir();
+    const parent = await makeTempDir("clawchat-inbound-mixed-media-");
     const rootDir = join(parent, "private-media");
     const names = [
       "résumé-東京.bin",
@@ -210,7 +213,7 @@ describe("mixed-media private filenames", () => {
   });
 
   it("makes Windows-forbidden, trailing, and reserved device names portable", async () => {
-    const rootDir = join(await tempDir(), "private-media");
+    const rootDir = join(await makeTempDir("clawchat-inbound-mixed-media-"), "private-media");
     const names = [
       `quote<colon>:"name.txt`,
       "nested/slash.txt",
@@ -267,7 +270,7 @@ describe("mixed-media private filenames", () => {
   });
 
   it("replaces file-block attribute delimiters while keeping the private text path readable", async () => {
-    const rootDir = join(await tempDir(), "private-media");
+    const rootDir = join(await makeTempDir("clawchat-inbound-mixed-media-"), "private-media");
     const content = "safe local text";
     const materializer = new InboundMediaMaterializer({
       rootDir,
@@ -305,7 +308,7 @@ describe("mixed-media private filenames", () => {
 
 describe("materialized mixed-media replies", () => {
   it("accepts message.reply through the same path without changing author-final identifiers", async () => {
-    const rootDir = join(await tempDir(), "private-media");
+    const rootDir = join(await makeTempDir("clawchat-inbound-mixed-media-"), "private-media");
     const url = "https://media.clawling.com/private/reply-file";
     const materializer = new InboundMediaMaterializer({
       rootDir,
@@ -396,16 +399,6 @@ function expectInOrder(prompt: string, projections: string[]): void {
     expect(next, `ordered projection ${JSON.stringify(projection)}`).toBeGreaterThan(cursor);
     cursor = next;
   }
-}
-
-async function tempDir(): Promise<string> {
-  const path = await mkdtemp(join(tmpdir(), "clawchat-inbound-mixed-media-"));
-  tempDirs.push(path);
-  return path;
-}
-
-function utf8(value: string): Uint8Array {
-  return Uint8Array.from(Buffer.from(value, "utf8"));
 }
 
 function pixelPng(red: number, green: number, blue: number): Uint8Array {

@@ -1,13 +1,17 @@
-import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  cleanupTempDirs,
+  leaseEntries,
+  makeTempDir,
+  minimalTestTools,
+  utf8
+} from "./helpers/inbound-media.js";
 import { GatewayStore } from "../src/gateway-store.js";
 import { InboundMediaMaterializer } from "../src/inbound-media.js";
 import { PiChatSessionFactory } from "../src/pi-session-factory.js";
 import type { ClawchatInboundMessage, MediaFragment } from "../src/types.js";
-
-const tempDirs: string[] = [];
 
 interface TextFixture {
   name: string;
@@ -26,12 +30,12 @@ interface RejectedTextFixture {
 }
 
 afterEach(async () => {
-  await Promise.all(tempDirs.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  await cleanupTempDirs();
 });
 
 describe("inbound text documents", () => {
   it("completes a text-document-only Turn with the complete Pi file block and a Turn-scoped path", async () => {
-    const parent = await makeTempDir();
+    const parent = await makeTempDir("clawchat-inbound-text-media-");
     const workspace = join(parent, "workspace");
     const mediaRoot = join(parent, "private-media");
     await mkdir(workspace);
@@ -58,6 +62,7 @@ describe("inbound text documents", () => {
       agentDir: parent,
       sessionDir: join(parent, "sessions"),
       media: { rootDir: mediaRoot, fetchFn: fetchFn as typeof fetch },
+      tools: minimalTestTools,
       createAgentSessionFn: async () => ({
         session: {
           prompt,
@@ -281,7 +286,7 @@ function genericDescriptor(prompt: string, fixture: RejectedTextFixture): { path
 }
 
 async function makeMaterializer(bytes: Uint8Array, detectedMime: string) {
-  const parent = await makeTempDir();
+  const parent = await makeTempDir("clawchat-inbound-text-media-");
   const rootDir = join(parent, "leases");
   return {
     rootDir,
@@ -292,12 +297,6 @@ async function makeMaterializer(bytes: Uint8Array, detectedMime: string) {
       ) as typeof fetch
     })
   };
-}
-
-async function makeTempDir(): Promise<string> {
-  const path = await mkdtemp(join(tmpdir(), "clawchat-inbound-text-media-"));
-  tempDirs.push(path);
-  return path;
 }
 
 function fileTurn(id: string, url: string, name: string, mime: string) {
@@ -337,10 +336,6 @@ function fileMessage(
   };
 }
 
-function utf8(content: string): Uint8Array {
-  return Uint8Array.from(Buffer.from(content, "utf8"));
-}
-
 function utf16LeWithBom(content: string): Uint8Array {
   return Uint8Array.from(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(content, "utf16le")]));
 }
@@ -351,13 +346,4 @@ function utf16BeWithBom(content: string): Uint8Array {
     [littleEndian[index], littleEndian[index + 1]] = [littleEndian[index + 1]!, littleEndian[index]!];
   }
   return Uint8Array.from(Buffer.concat([Buffer.from([0xfe, 0xff]), littleEndian]));
-}
-
-async function leaseEntries(rootDir: string): Promise<string[]> {
-  try {
-    return await readdir(rootDir, { recursive: true });
-  } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
 }

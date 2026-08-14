@@ -18,6 +18,7 @@ describe("PiChatSessionFactory", () => {
       workspace,
       agentDir,
       sessionDir,
+      tools: minimalTools(agentDir),
       store,
       transport: { send: async () => undefined }
     });
@@ -41,6 +42,7 @@ describe("PiChatSessionFactory", () => {
       workspace,
       agentDir,
       sessionDir: join(agentDir, "sessions"),
+      tools: minimalTools(agentDir),
       store,
       transport: { send: async () => undefined }
     });
@@ -62,6 +64,7 @@ describe("PiChatSessionFactory", () => {
       workspace,
       agentDir,
       sessionDir,
+      tools: minimalTools(agentDir),
       store,
       transport: { send: async () => undefined }
     });
@@ -70,6 +73,7 @@ describe("PiChatSessionFactory", () => {
       workspace,
       agentDir,
       sessionDir,
+      tools: minimalTools(agentDir),
       store,
       transport: { send: async () => undefined }
     });
@@ -403,6 +407,7 @@ describe("PiChatSessionFactory", () => {
           dispose: () => undefined
         }
       }),
+      tools: minimalTools(agentDir),
       store,
       transport: { send: async () => undefined }
     });
@@ -499,6 +504,7 @@ describe("PiChatSessionFactory", () => {
           dispose: () => undefined
         }
       }),
+      tools: minimalTools(agentDir),
       store,
       transport: { send: async () => undefined }
     });
@@ -581,6 +587,7 @@ async function runNativePiImageTurn(
       agentDir,
       sessionDir,
       media: { rootDir: mediaRoot, fetchFn: mediaFetch as typeof fetch },
+      tools: minimalTools(agentDir),
       store,
       transport: { send: async () => undefined }
     });
@@ -750,6 +757,14 @@ function imageTurn(id: string, url: string) {
       }
     }
   };
+}
+
+function minimalTools(agentDir: string): ClawchatToolEnvironment {
+  return {
+    memory: new ClawchatMemoryStore(join(agentDir, "memory")),
+    api: {} as never,
+    profile: () => ({}) as never
+  } as unknown as ClawchatToolEnvironment;
 }
 
 function groupTurn(id: string) {

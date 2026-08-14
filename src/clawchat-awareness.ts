@@ -209,14 +209,7 @@ export class ClawchatAwarenessCoordinator {
   async handle(event: ClawchatGatewayEvent): Promise<AwarenessAdmission | null> {
     const sourceId = awarenessSourceId(event);
     if (this.store.getAwarenessSourceTurn(sourceId)) return null;
-    const lifecycleChatId =
-      event.event === "chat.metadata.invalidated"
-        ? requireString(event.chat_id, "chat_id")
-        : event.event === "notify.signal" &&
-            typeof event.payload?.type === "string" &&
-            event.payload.type.startsWith("conversation.")
-          ? requireString(event.payload.entity_id, "payload.entity_id")
-          : undefined;
+    const lifecycleChatId = signalTargetChatId(event, { includeDissolved: true });
     if (lifecycleChatId) {
       if (
         event.event === "notify.signal" &&
@@ -237,15 +230,7 @@ export class ClawchatAwarenessCoordinator {
         requireString(event.payload.entity_id, "payload.entity_id")
       );
     }
-    const refreshTargetId =
-      event.event === "chat.metadata.invalidated"
-        ? requireString(event.chat_id, "chat_id")
-        : event.event === "notify.signal" &&
-            typeof event.payload?.type === "string" &&
-            event.payload.type !== "conversation.dissolved" &&
-            event.payload.type.startsWith("conversation.")
-          ? requireString(event.payload.entity_id, "payload.entity_id")
-          : undefined;
+    const refreshTargetId = signalTargetChatId(event, { includeDissolved: false });
     const refreshGeneration =
       this.memory && refreshTargetId
         ? this.memory.beginMetadataRefresh(clawchatMemoryTarget("group", refreshTargetId))
@@ -533,6 +518,24 @@ function awarenessSourceId(event: ClawchatGatewayEvent): string {
     return requireString(event.payload?.event_id ?? event.trace_id, "event_id");
   }
   throw new Error(`Unsupported awareness event '${event.event}'`);
+}
+
+function signalTargetChatId(
+  event: ClawchatGatewayEvent,
+  options: { includeDissolved: boolean }
+): string | undefined {
+  if (event.event === "chat.metadata.invalidated") {
+    return requireString(event.chat_id, "chat_id");
+  }
+  if (
+    event.event === "notify.signal" &&
+    typeof event.payload?.type === "string" &&
+    event.payload.type.startsWith("conversation.") &&
+    (options.includeDissolved || event.payload.type !== "conversation.dissolved")
+  ) {
+    return requireString(event.payload.entity_id, "payload.entity_id");
+  }
+  return undefined;
 }
 
 function isDistinctMomentSignal(signalType: string): boolean {
