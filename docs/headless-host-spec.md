@@ -96,7 +96,7 @@ Pi sessions remain in Pi's standard session directory for the profile Workspace.
 | `ClawChatGateway` | Exposes start, stop, admitted-frame delivery, and materialized send operations. Internally owns challenge/connect, capability negotiation, token/nonce recovery, replay, ACK scheduling, reconnect, self-echo filtering, stable outbound identity, and ACK-timeout reconciliation. Callers do not manage protocol cursors. |
 | `ChatSessionRegistry` | Creates or restores a Conversation Session Set, loads the Active Chat Session required by each queued work item, executes ordered Session Transitions, and disposes runtimes during transition, conversation deletion, or Host shutdown. It does not own the WebSocket. |
 | `ChatSessionRuntime` | Owns one Pi `AgentSessionRuntime`, `SessionManager`, `SettingsManager`, `ResourceLoader`/Extension runtime, and effective output settings. It processes one turn at a time. |
-| `OutputProjector` | Converts completed Pi assistant, thinking, and visible tool events to unquoted ClawChat `message.send` frames in direct chats and quoted `message.reply` frames in group chats, and brackets a turn with `typing.update`. It does not own transport or persistence. |
+| `OutputProjector` | Converts completed Pi assistant, thinking, and visible tool events to unquoted ClawChat `message.send` frames and brackets a turn with `typing.update`. Explicit reply and structured-mention delivery belongs to the Active Turn-scoped `clawchat_send_message` tool. It does not own transport or persistence. |
 
 These are module seams, not one-class-per-row requirements. Public interfaces stay small; handshake state, SQL tables, Pi event assembly, and retry mechanics remain hidden inside their owning modules. Tests target each interface's behavior.
 

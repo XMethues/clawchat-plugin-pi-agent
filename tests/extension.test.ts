@@ -224,7 +224,7 @@ describe("ClawChat Pi Management Extension", () => {
     expect(pi.tools.size).toBe(32);
     expect(pi.tools.has("clawchat_get_account_profile")).toBe(true);
     expect(pi.tools.has("clawchat_memory_read")).toBe(true);
-    expect(pi.tools.has("clawchat_mention_message")).toBe(false);
+    expect(pi.tools.has("clawchat_send_message")).toBe(false);
     expect(pi.tools.has("clawchat_react_message")).toBe(false);
     expect(setStatus).toHaveBeenCalledWith("clawchat", "profile ready");
 

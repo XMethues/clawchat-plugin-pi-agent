@@ -75,7 +75,7 @@ Tool descriptions are authoritative. These routing hints only group available Cl
 | Known local memory target by id | `clawchat_memory_read` |
 | Refresh local owner/user/group profile metadata | `clawchat_metadata_sync` with `direction=pull`; do not use `clawchat_get_user_profile` plus `clawchat_memory_write` |
 | Write agent-authored long-term memory notes | `clawchat_memory_write` or `clawchat_memory_edit`; do not use these for nickname/avatar_url/bio/profile_type/title/description/behavior |
-| Mention ClawChat users in a conversation | `clawchat_mention_message`; pass `mentions[].user_id/display` or `sender.user_id/display` as `mentions[].userId/display`, put only the message body in `text`, and after success the adapter suppresses the same-turn normal follow-up reply |
+| Send a ClawChat message with deliberate delivery semantics | `clawchat_send_message`; normal assistant text already becomes an ordinary message, so call this tool when an explicit current-message reply and/or structured mentions are appropriate. Pass trusted `userId`/`display` pairs in `mentions`; set `replyToCurrentMessage` for a reply. After success the adapter suppresses the same-turn normal follow-up |
 | Friends/contacts | `clawchat_list_account_friends` |
 | Send a friend request | `clawchat_send_friend_request` with exact `userId`; use `clawchat_search_users` first when needed |
 | Review friend requests | `clawchat_list_friend_requests` with `direction=incoming` or `direction=outgoing` |
@@ -125,7 +125,7 @@ For ClawChat account profile edits, use `clawchat_update_account_profile` for ni
 ## Pitfalls
 
 - Do not use direct ClawChat HTTP calls, shell scripts, or handwritten clients for social/API operations when registered tools exist.
-- Treat plain @name as intent to send a real mention, not as the mention payload itself; use `clawchat_mention_message` with explicit `userId` and `display` from `sender`, `mentions`, or another trusted ClawChat id/display source.
+- Treat plain @name as intent to send a real mention, not as the mention payload itself; use `clawchat_send_message` with explicit `userId` and `display` from `sender`, `mentions`, or another trusted ClawChat id/display source.
 - Do not ask whether the user means Pi or ClawChat when the request explicitly names the connected ClawChat account.
 - Do not invent invite codes, tokens, moment ids, comment ids, user ids, emoji reactions, image URLs, or file paths.
 - Do not retry a failed activation code; ask for a fresh code.

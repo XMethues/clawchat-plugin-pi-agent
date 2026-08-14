@@ -23,7 +23,7 @@ describe("registerClawchatTools", () => {
       "clawchat_memory_search",
       "clawchat_metadata_update",
       "clawchat_send_friend_request",
-      "clawchat_mention_message",
+      "clawchat_send_message",
       "clawchat_react_message",
       "clawchat_liveware_login"
     ]));
@@ -98,47 +98,84 @@ describe("registerClawchatTools", () => {
     expect(patch).not.toHaveProperty("participant_ids");
   });
 
-  it("sends structured mentions only into the Active ClawChat Turn and marks them terminal", async () => {
+  it("sends ordinary, reply, and mention messages into the Active ClawChat Turn", async () => {
     const tools = new Map<string, RegisteredTool>();
-    const sendFrame = vi.fn(async () => undefined);
+    const sendFrame = vi.fn(async (_frame: Record<string, unknown>) => undefined);
     const onTerminalSend = vi.fn();
     const pi = { registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool) } as unknown as ExtensionAPI;
     registerClawchatTools(pi, toolEnvironment({ sendFrame, onTerminalSend }));
+    const sendMessage = tools.get("clawchat_send_message")!;
 
-    const result = await tools.get("clawchat_mention_message")!.execute("call-1", {
-      chatId: "chat-1",
-      chatType: "group",
+    const ordinary = await sendMessage.execute("call-1", { text: "ordinary answer" });
+    await sendMessage.execute("call-2", {
+      text: "direct answer",
+      replyToCurrentMessage: true
+    });
+    await sendMessage.execute("call-3", {
       mentions: [{ userId: "user-2", display: "Alice" }],
       text: "please review"
     });
 
-    expect(sendFrame).toHaveBeenCalledWith(expect.objectContaining({
+    expect(sendFrame.mock.calls[0]?.[0]).toMatchObject({
       event: "message.send",
       chat_id: "chat-1",
       to: { id: "chat-1", type: "group" },
-      payload: expect.objectContaining({
+      payload: {
         message_mode: "normal",
-        message: expect.objectContaining({
+        message: {
+          body: { fragments: [{ kind: "text", text: "ordinary answer" }] },
+          context: { mentions: [], reply: null }
+        }
+      }
+    });
+    expect(sendFrame.mock.calls[1]?.[0]).toMatchObject({
+      event: "message.reply",
+      payload: {
+        message: {
+          body: { fragments: [{ kind: "text", text: "direct answer" }] },
+          context: {
+            mentions: [],
+            reply: {
+              reply_to_msg_id: "message-1",
+              reply_preview: {
+                id: "user-1",
+                nick_name: "Bob",
+                fragments: [{ kind: "text", text: "question" }]
+              }
+            }
+          }
+        }
+      }
+    });
+    expect(sendFrame.mock.calls[2]?.[0]).toMatchObject({
+      event: "message.send",
+      payload: {
+        message: {
           body: { fragments: [
             { kind: "mention", user_id: "user-2", display: "Alice" },
             { kind: "text", text: " please review" }
-          ] }
-        })
-      })
-    }));
+          ] },
+          context: {
+            mentions: [{ kind: "mention", user_id: "user-2", display: "Alice" }],
+            reply: null
+          }
+        }
+      }
+    });
     expect(sendFrame).toHaveBeenCalledWith(expect.objectContaining({
       payload: expect.not.objectContaining({ message_id: expect.anything() })
     }));
-    expect(result.details).toMatchObject({ traceId: "pi-tool-trace-1" });
-    expect(result.details).toMatchObject({ sent: true, terminal: true, noFollowupReply: true });
-    expect(onTerminalSend).toHaveBeenCalledOnce();
-
-    const rejected = await tools.get("clawchat_mention_message")!.execute("call-2", {
-      chatId: "other-chat",
-      mentions: [{ userId: "user-2", display: "Alice" }]
+    expect(ordinary.details).toMatchObject({
+      sent: true,
+      terminal: true,
+      noFollowupReply: true,
+      traceId: "pi-tool-trace-1"
     });
+    expect(onTerminalSend).toHaveBeenCalledTimes(3);
+
+    const rejected = await sendMessage.execute("call-4", {});
     expect(rejected.details).toMatchObject({ error: "validation" });
-    expect(sendFrame).toHaveBeenCalledTimes(1);
+    expect(sendFrame).toHaveBeenCalledTimes(3);
   });
 
   it("returns pending permission outcomes as terminal non-retryable results and audits the call", async () => {
@@ -200,7 +237,13 @@ function toolEnvironment(
     }),
     api: api as unknown as ClawchatToolEnvironment["api"],
     memory: {} as ClawchatMemoryStore,
-    activeTurn: () => ({ chatId: "chat-1", chatType: "group", messageId: "message-1" }),
+    activeTurn: () => ({
+      chatId: "chat-1",
+      chatType: "group",
+      messageId: "message-1",
+      sender: { id: "user-1", type: "group", nick_name: "Bob" },
+      preview: [{ kind: "text", text: "question" }]
+    }),
     sendFrame: vi.fn(async () => undefined),
     idFactory: () => "trace-1",
     now: () => 123,

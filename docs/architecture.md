@@ -41,9 +41,9 @@ by Hosted Session Bindings. The complete runtime contract is specified in
 - `output-settings.ts` resolves the Host Profile Output Mode default and
   per-conversation `minimal`, `normal`, `full`, or `inherit` override.
 - `output-projector.ts` maps completed Pi assistant, thinking, tool, and
-  `MEDIA:` attachment output to complete, unquoted `message.send` messages in
-  direct chats and quoted `message.reply` messages in group chats, and brackets
-  work with `typing.update`.
+  `MEDIA:` attachment output to complete, unquoted `message.send` messages and
+  brackets work with `typing.update`. Explicit reply and structured-mention
+  delivery belongs to the Active Turn-scoped `clawchat_send_message` tool.
 - `clawchat-api.ts` owns authenticated REST and Media envelopes plus repeatable,
   single-flight reactive token refresh while treating tokens as opaque values.
 - `clawchat-memory.ts` owns profile-local Markdown memory, metadata/body
@@ -138,8 +138,9 @@ direct Chat Session, not a fabricated inbound message. The binding supplies
 Owner Turn Memory, Active ClawChat Turn tool context, and an optional audit
 source, and is cleared on success, failure, or abort. Model-generated Awareness
 text and output-projection events remain internal; an Awareness Turn can affect
-ClawChat only through an explicit registered ClawChat tool call. Ordinary group
-user replies remain quoted `message.reply` messages.
+ClawChat only through an explicit registered ClawChat tool call. Automatic
+assistant output uses ordinary `message.send`; `clawchat_send_message` lets Pi
+deliberately send an explicit reply, structured mentions, or both.
 
 ### Activation, identity, and endpoints
 

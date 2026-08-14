@@ -4,6 +4,7 @@ import type {
   ToolExecutionEndEvent,
   ToolExecutionStartEvent
 } from "@earendil-works/pi-coding-agent";
+import { extractInboundText } from "./inbound.js";
 import {
   ClawchatOutputProjector,
   outputTurnFromInbound,
@@ -97,6 +98,7 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
   const controller: HeadlessExtensionController = {
     beginTurn: async (message) => {
       if (!piApi) throw new Error("Headless Extension is not initialized");
+      const text = extractInboundText(message);
       await activate({
         target: outputTurnFromInbound(message),
         auditSource: message.payload.message_id,
@@ -104,7 +106,11 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
         toolContext: {
           chatId: message.chat_id,
           chatType: message.chat_type,
-          messageId: message.payload.message_id
+          messageId: message.payload.message_id,
+          sender: message.sender,
+          preview: text
+            ? [{ kind: "text", text: text.length > 240 ? `${text.slice(0, 237)}...` : text }]
+            : []
         },
         projectOutput: true
       });

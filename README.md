@@ -23,11 +23,12 @@ The Headless Pi Host:
   lost ACKs time out and reconcile by reconnecting, waiting for replay, and
   resending that same identity;
 - projects Pi output according to each chat's effective `minimal`, `normal`, or
-  `full` mode as complete unquoted `message.send` messages in direct chats and
-  quoted `message.reply` messages in group chats;
+  `full` mode as complete unquoted `message.send` messages;
+- lets Pi deliberately select ordinary, current-message reply, and structured
+  mention delivery through the Active Turn-scoped `clawchat_send_message` tool;
 - runs metadata-change Awareness Turns through the owner's Hosted Session
   Binding and converges authoritative metadata after every connection; and
-- registers the pinned ClawChat social, metadata, memory, mention/reaction,
+- registers the pinned ClawChat social, metadata, memory, message/reaction,
   app, media-upload, and liveware-login tool set in each Pi runtime.
 
 ## Commands

@@ -84,7 +84,7 @@ describe("HeadlessPiHost", () => {
             JSON.stringify({ version: "2", event: "replay.done", trace_id: "replay", emitted_at: 3, payload: {} })
           );
           socket.send(JSON.stringify(groupCommandFrame()));
-        } else if (frame.event === "message.reply") {
+        } else if (frame.event === "message.send") {
           resolveReply(frame.payload.message.body.fragments[0].text);
           socket.send(
             JSON.stringify({

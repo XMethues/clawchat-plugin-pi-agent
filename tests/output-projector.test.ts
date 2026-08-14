@@ -139,7 +139,7 @@ describe("ClawchatOutputProjector", () => {
     }]);
   });
 
-  it("quotes the triggering message in a group reply", async () => {
+  it("sends a group control response as an ordinary message", async () => {
     const sent: ClawchatOutboundMessage[] = [];
     const projector = new ClawchatOutputProjector({
       transport: { send: async (message) => { sent.push(message); } }
@@ -148,26 +148,16 @@ describe("ClawchatOutputProjector", () => {
     inbound.chat_type = "group";
     inbound.sender.type = "group";
 
-    await projector.replyTo(inbound, "Group answer");
+    await projector.sendTo(inbound, "Group answer");
 
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({
-      event: "message.reply",
+      event: "message.send",
       chat_id: "chat-1",
       to: { id: "chat-1", type: "group" },
       payload: {
         message: {
-          context: {
-            mentions: [],
-            reply: {
-              reply_to_msg_id: "message-1",
-              reply_preview: {
-                id: "user-1",
-                nick_name: "Alice",
-                fragments: [{ kind: "text", text: "hello pi" }]
-              }
-            }
-          }
+          context: { mentions: [], reply: null }
         }
       }
     });
@@ -228,7 +218,7 @@ describe("ClawchatOutputProjector", () => {
     });
   });
 
-  it("sends only the final non-empty assistant result as a group reply in minimal mode", async () => {
+  it("sends the final assistant result as an ordinary group message in minimal mode", async () => {
     const sent: ClawchatOutboundMessage[] = [];
     const projector = new ClawchatOutputProjector({
       transport: { send: async (message) => { sent.push(message); } }
@@ -263,25 +253,16 @@ describe("ClawchatOutputProjector", () => {
 
     expect(sent.map((message) => message.event)).toEqual([
       "typing.update",
-      "message.reply",
+      "message.send",
       "typing.update"
     ]);
     expect(sent[1]).toMatchObject({
-      event: "message.reply",
+      event: "message.send",
       payload: {
         message_mode: "normal",
         message: {
           body: { fragments: [{ kind: "text", text: "Group final" }] },
-          context: {
-            reply: {
-              reply_to_msg_id: "message-1",
-              reply_preview: {
-                id: "user-1",
-                nick_name: "Alice",
-                fragments: [{ kind: "text", text: "hello pi" }]
-              }
-            }
-          }
+          context: { mentions: [], reply: null }
         }
       }
     });

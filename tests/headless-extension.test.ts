@@ -21,6 +21,11 @@ describe("Headless ClawChat Pi Extension", () => {
       idFactory: () => "trace-1"
     });
     extension(pi as never);
+    const prompt = await handlers.get("before_agent_start")!({ systemPrompt: "base" });
+    expect(prompt.systemPrompt).toContain(
+      "Normal assistant text is delivered as an ordinary unquoted ClawChat message"
+    );
+    expect(prompt.systemPrompt).toContain("clawchat_send_message");
 
     await controller.beginTurn(inboundMessage());
     await handlers.get("message_end")!({
@@ -75,7 +80,7 @@ describe("Headless ClawChat Pi Extension", () => {
     expect(replies[0]?.payload.message.body.fragments).toEqual([{ kind: "text", text: "It is raining." }]);
   });
 
-  it("does not flush buffered minimal text after a terminal ClawChat tool sends the reply", async () => {
+  it("does not flush buffered minimal text after the send-message tool replies", async () => {
     const handlers = new Map<string, Function>();
     const registeredTools = new Map<string, { execute: (id: string, args: unknown) => Promise<unknown> }>();
     const sent: ClawchatOutboundMessage[] = [];
@@ -105,15 +110,14 @@ describe("Headless ClawChat Pi Extension", () => {
       type: "message_end",
       message: { role: "assistant", content: [{ type: "text", text: "I will send it." }] }
     });
-    await registeredTools.get("clawchat_mention_message")!.execute("call-1", {
-      chatId: "chat-1",
-      chatType: "direct",
-      mentions: [{ userId: "user-2", display: "Alice" }],
-      text: "done"
+    await registeredTools.get("clawchat_send_message")!.execute("call-1", {
+      text: "done",
+      replyToCurrentMessage: true
     });
     await handlers.get("agent_settled")!({ type: "agent_settled" });
 
     expect(sendFrame).toHaveBeenCalledOnce();
+    expect(sendFrame).toHaveBeenCalledWith(expect.objectContaining({ event: "message.reply" }));
     expect(sent.filter((message) => message.event === "message.send")).toHaveLength(0);
   });
 

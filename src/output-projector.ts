@@ -11,7 +11,6 @@ import type {
   ClawchatOutboundContent,
   ClawchatOutboundMessage,
   ClawchatTransport,
-  TextFragment
 } from "./types.js";
 
 export type PiOutputEvent = MessageEndEvent | ToolExecutionStartEvent | ToolExecutionEndEvent;
@@ -25,9 +24,6 @@ export type OutputTurn =
   | {
       chatId: string;
       chatType: "group";
-      inboundMessageId: string;
-      sender: ClawchatInboundMessage["sender"];
-      preview: TextFragment[];
     };
 
 export interface OutputProjectorOptions {
@@ -131,47 +127,22 @@ export class ClawchatOutputProjector {
     }
   }
 
-  async replyTo(message: ClawchatInboundMessage, text: string, mode: ClawchatMessageMode = "normal"): Promise<void> {
+  async sendTo(message: ClawchatInboundMessage, text: string, mode: ClawchatMessageMode = "normal"): Promise<void> {
     await this.sendMaterialized(outputTurnFromInbound(message), text, mode);
   }
 
   private async sendMaterialized(turn: OutputTurn, text: string, mode: ClawchatMessageMode): Promise<void> {
     const fragments = mode === "normal" ? await this.materializeFragments(text) : [{ kind: "text" as const, text }];
     if (fragments.length === 0) return;
-    if (turn.chatType === "direct") {
-      await this.send({
-        event: "message.send",
-        chat_id: turn.chatId,
-        to: { id: turn.chatId, type: turn.chatType },
-        payload: {
-          message_mode: mode,
-          message: {
-            body: { fragments },
-            context: { mentions: [], reply: null }
-          }
-        }
-      });
-      return;
-    }
     await this.send({
-      event: "message.reply",
+      event: "message.send",
       chat_id: turn.chatId,
       to: { id: turn.chatId, type: turn.chatType },
       payload: {
         message_mode: mode,
         message: {
           body: { fragments },
-          context: {
-            mentions: [],
-            reply: {
-              reply_to_msg_id: turn.inboundMessageId,
-              reply_preview: {
-                id: turn.sender.id,
-                ...(turn.sender.nick_name ? { nick_name: turn.sender.nick_name } : {}),
-                fragments: turn.preview
-              }
-            }
-          }
+          context: { mentions: [], reply: null }
         }
       }
     });
@@ -226,26 +197,7 @@ export class ClawchatOutputProjector {
 }
 
 export function outputTurnFromInbound(message: ClawchatInboundMessage): OutputTurn {
-  if (message.chat_type === "direct") {
-    return { chatId: message.chat_id, chatType: "direct" };
-  }
-  return {
-    chatId: message.chat_id,
-    chatType: "group",
-    inboundMessageId: message.payload.message_id,
-    sender: message.sender,
-    preview: trimPreview(message.payload.message.body.fragments)
-  };
-}
-
-function trimPreview(fragments: ClawchatFragment[]): TextFragment[] {
-  const text = fragments
-    .filter((fragment): fragment is TextFragment => fragment.kind === "text")
-    .map((fragment) => fragment.text)
-    .join("")
-    .trim();
-  if (!text) return [];
-  return [{ kind: "text", text: text.length > 240 ? `${text.slice(0, 237)}...` : text }];
+  return { chatId: message.chat_id, chatType: message.chat_type };
 }
 
 function mediaFragment(value: Record<string, unknown>): Extract<ClawchatFragment, { url: string }> {

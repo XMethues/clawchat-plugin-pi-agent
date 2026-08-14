@@ -106,7 +106,7 @@ export class HeadlessPiHost {
       };
       const replyProjector = new ClawchatOutputProjector({ transport });
       const reply = async (message: ClawchatInboundMessage, text: string): Promise<void> => {
-        await replyProjector.replyTo(message, text);
+        await replyProjector.sendTo(message, text);
       };
       const router = new ClawchatInboundRouter({
         store,

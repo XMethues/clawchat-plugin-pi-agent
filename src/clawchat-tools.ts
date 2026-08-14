@@ -12,12 +12,15 @@ import {
   type ClawchatMemoryTargetType
 } from "./clawchat-memory.js";
 import type { HostProfile } from "./host-profile.js";
+import type { ClawchatFragment, ClawchatInboundMessage } from "./types.js";
 import { isUnknownRecord } from "./type-guards.js";
 
 export interface ActiveClawchatTurn {
   chatId: string;
   chatType: "direct" | "group";
   messageId?: string;
+  sender?: ClawchatInboundMessage["sender"];
+  preview?: ClawchatFragment[];
 }
 
 export interface ClawchatToolCallRecord {
@@ -67,7 +70,9 @@ export function appendClawchatSystemPrompt(systemPrompt: string): string {
 
 ## ClawChat capabilities
 
-This runtime includes the inherited \`clawchat-core\` and \`clawchat-liveware\` skills plus registered \`clawchat_*\` tools. Use those tools directly for supported ClawChat operations. Never bypass them with shell commands, curl, scripts, or handwritten HTTP clients. Tool schemas are authoritative; if a named tool is unavailable in this runtime, report that limitation instead of bypassing it.`;
+This runtime includes the inherited \`clawchat-core\` and \`clawchat-liveware\` skills plus registered \`clawchat_*\` tools. Use those tools directly for supported ClawChat operations. Never bypass them with shell commands, curl, scripts, or handwritten HTTP clients. Tool schemas are authoritative; if a named tool is unavailable in this runtime, report that limitation instead of bypassing it.
+
+Normal assistant text is delivered as an ordinary unquoted ClawChat message. When the conversation calls for an explicit reply to the current message, a structured mention, or both, use \`clawchat_send_message\`; a successful call sends the response and suppresses a duplicate normal follow-up.`;
 }
 
 export async function appendClawchatMemoryPrompt(
@@ -343,21 +348,20 @@ const TOOL_SPECS: ToolSpec[] = [
       })
   ),
   {
-    name: "clawchat_mention_message",
-    label: "Send ClawChat Mention Message",
-    description: "Send a real structured mention in the Active ClawChat Turn's conversation.",
+    name: "clawchat_send_message",
+    label: "Send ClawChat Message",
+    description:
+      "Send one message in the Active ClawChat Turn's conversation. Omit replyToCurrentMessage for an ordinary message; set it for an explicit reply; include mentions for structured mentions.",
     requiresGateway: true,
     parameters: Type.Object({
-      chatId: Type.String({ minLength: 1 }),
-      chatType: Type.Optional(Type.String({ enum: ["direct", "group"] })),
       text: Type.Optional(Type.String()),
-      mentions: Type.Array(
+      mentions: Type.Optional(Type.Array(
         Type.Object({ userId: Type.String({ minLength: 1 }), display: Type.String({ minLength: 1 }) }),
         { minItems: 1 }
-      ),
-      replyToMessageId: Type.Optional(Type.String())
+      )),
+      replyToCurrentMessage: Type.Optional(Type.Boolean())
     }),
-    execute: sendMention
+    execute: sendMessage
   },
   {
     name: "clawchat_react_message",
@@ -687,48 +691,51 @@ async function pullGroupMetadata(
   };
 }
 
-async function sendMention(args: Record<string, unknown>, env: ClawchatToolEnvironment): Promise<unknown> {
+async function sendMessage(args: Record<string, unknown>, env: ClawchatToolEnvironment): Promise<unknown> {
   const turn = requireActiveTurn(env);
-  const chatId = requiredString(args.chatId, "chatId");
-  if (chatId !== turn.chatId) throw new Error("chatId must match the Active ClawChat Turn");
-  if (args.chatType !== undefined && args.chatType !== turn.chatType) {
-    throw new Error("chatType must match the Active ClawChat Turn");
+  if (args.text !== undefined && typeof args.text !== "string") throw new Error("text must be a string");
+  const text = typeof args.text === "string" ? args.text.trim() : "";
+  const mentions = parseMessageMentions(args.mentions);
+  if (!text && mentions.length === 0) throw new Error("text or mentions is required");
+  if (args.replyToCurrentMessage !== undefined && typeof args.replyToCurrentMessage !== "boolean") {
+    throw new Error("replyToCurrentMessage must be a boolean");
   }
-  if (!Array.isArray(args.mentions) || args.mentions.length === 0) throw new Error("mentions must be non-empty");
-  const seen = new Set<string>();
-  const mentions: Array<{ userId: string; display: string }> = [];
-  for (const [index, raw] of args.mentions.entries()) {
-    if (!isUnknownRecord(raw)) throw new Error(`mentions[${index}] must be an object`);
-    const userId = requiredString(raw.userId, `mentions[${index}].userId`);
-    if (seen.has(userId)) continue;
-    seen.add(userId);
-    const display = requiredString(raw.display, `mentions[${index}].display`).replace(/^@/, "");
-    if (!display) throw new Error(`mentions[${index}].display is required`);
-    mentions.push({ userId, display });
+
+  const replyToCurrentMessage = args.replyToCurrentMessage === true;
+  if (replyToCurrentMessage && (!turn.messageId || !turn.sender || !turn.preview)) {
+    throw new Error("The Active ClawChat Turn has no current message to reply to");
   }
-  const fragments: Array<Record<string, unknown>> = mentions.map((mention) => ({
-    kind: "mention",
+  const mentionFragments = mentions.map((mention) => ({
+    kind: "mention" as const,
     user_id: mention.userId,
     display: mention.display
   }));
-  if (typeof args.text === "string" && args.text.trim()) fragments.push({ kind: "text", text: ` ${args.text.trim()}` });
+  const fragments: Array<Record<string, unknown>> = [...mentionFragments];
+  if (text) fragments.push({ kind: "text", text: mentions.length > 0 ? ` ${text}` : text });
   const now = env.now?.() ?? Date.now();
   const traceId = `pi-tool-${env.idFactory?.() ?? crypto.randomUUID()}`;
   await env.sendFrame?.({
     version: "2",
-    event: "message.send",
+    event: replyToCurrentMessage ? "message.reply" : "message.send",
     trace_id: traceId,
     emitted_at: now,
-    chat_id: chatId,
-    to: { id: chatId, type: turn.chatType },
+    chat_id: turn.chatId,
+    to: { id: turn.chatId, type: turn.chatType },
     payload: {
       message_mode: "normal",
       message: {
         body: { fragments },
         context: {
-          mentions: fragments.filter((fragment) => fragment.kind === "mention"),
-          reply: typeof args.replyToMessageId === "string"
-            ? { reply_to_msg_id: args.replyToMessageId, reply_preview: null }
+          mentions: mentionFragments,
+          reply: replyToCurrentMessage
+            ? {
+                reply_to_msg_id: turn.messageId,
+                reply_preview: {
+                  id: turn.sender!.id,
+                  ...(turn.sender!.nick_name ? { nick_name: turn.sender!.nick_name } : {}),
+                  fragments: turn.preview
+                }
+              }
             : null
         }
       }
@@ -738,10 +745,28 @@ async function sendMention(args: Record<string, unknown>, env: ClawchatToolEnvir
     sent: true,
     terminal: true,
     noFollowupReply: true,
-    instruction: "The mention message has already been sent; do not send a duplicate normal follow-up reply.",
+    instruction: "The ClawChat message has already been sent; do not send a duplicate normal follow-up reply.",
     traceId,
+    delivery: replyToCurrentMessage ? "reply" : mentions.length > 0 ? "mention" : "normal",
     mentions: mentions.map((mention) => mention.userId)
   };
+}
+
+function parseMessageMentions(value: unknown): Array<{ userId: string; display: string }> {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length === 0) throw new Error("mentions must be a non-empty array");
+  const seen = new Set<string>();
+  const mentions: Array<{ userId: string; display: string }> = [];
+  for (const [index, raw] of value.entries()) {
+    if (!isUnknownRecord(raw)) throw new Error(`mentions[${index}] must be an object`);
+    const userId = requiredString(raw.userId, `mentions[${index}].userId`);
+    if (seen.has(userId)) continue;
+    seen.add(userId);
+    const display = requiredString(raw.display, `mentions[${index}].display`).replace(/^@/, "");
+    if (!display) throw new Error(`mentions[${index}].display is required`);
+    mentions.push({ userId, display });
+  }
+  return mentions;
 }
 
 async function sendReaction(args: Record<string, unknown>, env: ClawchatToolEnvironment): Promise<unknown> {
