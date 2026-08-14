@@ -33,13 +33,27 @@ The Headless Pi Host:
 
 ## Installation
 
-Install the Pi extension from npm:
+Install Pi first:
+
+```bash
+npm install --global @earendil-works/pi-coding-agent
+```
+
+Then install ClawChat Pi Agent as a Pi package:
 
 ```bash
 pi install npm:clawchat-pi-agent
 ```
 
-Install the Headless Host CLI globally:
+The Pi-managed install is sufficient for the extension, skills, and Headless
+Host. Its CLI is available at:
+
+```bash
+"${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/npm/node_modules/.bin/clawchat-pi" status
+```
+
+To expose `clawchat-pi` globally on `PATH`, optionally install the npm package
+globally:
 
 ```bash
 npm install --global clawchat-pi-agent
