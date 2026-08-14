@@ -1,7 +1,15 @@
 {
-  "name": "@newbase-clawchat/clawchat-pi",
+  "name": "clawchat-pi-agent",
   "version": "0.1.0",
   "description": "ClawChat Protocol v2 extension and headless multi-session host for Pi.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/XMethues/clawchat-pi-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/XMethues/clawchat-pi-agent/issues"
+  },
+  "homepage": "https://github.com/XMethues/clawchat-pi-agent#readme",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
@@ -22,11 +30,11 @@
     "docs"
   ],
   "bin": {
-    "clawchat-pi": "./dist/src/bin.js"
+    "clawchat-pi": "dist/src/bin.js"
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
-    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "build": "npm run clean && tsc -p tsconfig.build.json && node -e \"require('node:fs').chmodSync('dist/src/bin.js', 0o755)\"",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "smoke:gateway": "node scripts/smoke-built-gateway.mjs"

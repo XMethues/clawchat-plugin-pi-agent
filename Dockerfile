@@ -1,11 +1,11 @@
 
-FROM node:24-bookworm-slim AS clawchat-plugin-builder
+FROM node:24-bookworm-slim AS clawchat-pi-agent-builder
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates git \
   && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /build/clawchat-pi
+WORKDIR /build/clawchat-pi-agent
 COPY package.json package-lock.json tsconfig.json tsconfig.build.json ./
 RUN npm ci --ignore-scripts
 COPY src ./src
@@ -20,12 +20,12 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends bash ca-certificates git ripgrep \
   && rm -rf /var/lib/apt/lists/*
 
-COPY --from=clawchat-plugin-builder /tmp/newbase-clawchat-clawchat-pi-*.tgz /tmp/clawchat-pi.tgz
+COPY --from=clawchat-pi-agent-builder /tmp/clawchat-pi-agent-*.tgz /tmp/clawchat-pi-agent.tgz
 RUN npm install -g --ignore-scripts \
     @earendil-works/pi-coding-agent \
-    /tmp/clawchat-pi.tgz \
-  && pi install /usr/local/lib/node_modules/@newbase-clawchat/clawchat-pi \
-  && rm /tmp/clawchat-pi.tgz \
+    /tmp/clawchat-pi-agent.tgz \
+  && pi install /usr/local/lib/node_modules/clawchat-pi-agent \
+  && rm /tmp/clawchat-pi-agent.tgz \
   && npm cache clean --force
 
 WORKDIR /workspace

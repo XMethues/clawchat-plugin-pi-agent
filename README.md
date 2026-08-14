@@ -1,4 +1,4 @@
-# ClawChat Pi
+# ClawChat Pi Agent
 
 Pi package for ClawChat Protocol v2.
 
@@ -30,6 +30,20 @@ The Headless Pi Host:
   Binding and converges authoritative metadata after every connection; and
 - registers the pinned ClawChat social, metadata, memory, message/reaction,
   app, media-upload, and liveware-login tool set in each Pi runtime.
+
+## Installation
+
+Install the Pi extension from npm:
+
+```bash
+pi install npm:clawchat-pi-agent
+```
+
+Install the Headless Host CLI globally:
+
+```bash
+npm install --global clawchat-pi-agent
+```
 
 ## Commands
 
