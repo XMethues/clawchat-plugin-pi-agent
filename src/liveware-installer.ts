@@ -5,7 +5,7 @@ import { delimiter, join, resolve } from "node:path";
 
 const LIVEWARE_ORIGIN = "https://media.clawling.chat";
 const MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024;
-const DOWNLOAD_TIMEOUT_MS = 30_000;
+const DOWNLOAD_TIMEOUT_MS = 120_000;
 const LOCK_TIMEOUT_MS = 30_000;
 const STALE_LOCK_MS = 2 * 60_000;
 const LOCK_RETRY_MS = 250;
@@ -27,6 +27,7 @@ export interface LivewareCliInstallerOptions {
   fetch?: typeof fetch;
   now?: () => number;
   delay?: (milliseconds: number) => Promise<void>;
+  timeoutSignal?: (milliseconds: number) => AbortSignal;
 }
 
 export class LivewareCliInstaller {
@@ -37,6 +38,7 @@ export class LivewareCliInstaller {
   private readonly fetchFn: typeof fetch;
   private readonly now: () => number;
   private readonly delay: (milliseconds: number) => Promise<void>;
+  private readonly timeoutSignal: (milliseconds: number) => AbortSignal;
   private ensureInFlight: Promise<string> | undefined;
 
   constructor(options: LivewareCliInstallerOptions) {
@@ -51,6 +53,7 @@ export class LivewareCliInstaller {
       setTimeout(resolveDelay, milliseconds);
       return promise;
     });
+    this.timeoutSignal = options.timeoutSignal ?? AbortSignal.timeout;
     prependPath(this.installDirectory, this.environment);
   }
 
@@ -155,7 +158,7 @@ export class LivewareCliInstaller {
     for (let redirects = 0; redirects <= 5; redirects += 1) {
       response = await this.fetchFn(currentUrl, {
         redirect: "manual",
-        signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS)
+        signal: this.timeoutSignal(DOWNLOAD_TIMEOUT_MS)
       });
       if (![301, 302, 303, 307, 308].includes(response.status)) break;
       const location = response.headers.get("location");

@@ -138,6 +138,24 @@ describe("LivewareCliInstaller", () => {
     await expect(installer.ensure()).rejects.toThrow("exceeds 33554432 bytes");
   });
 
+  it("configures a two-minute total download deadline", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "liveware-timeout-"));
+    const timeoutSignal = vi.fn((_milliseconds: number) => new AbortController().signal);
+    const fetchFn = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) =>
+      new Response(Uint8Array.from([0x7f, 0x45, 0x4c, 0x46]), { status: 200 }));
+    const installer = new LivewareCliInstaller({
+      installDirectory: directory,
+      platform: "linux",
+      arch: "x64",
+      environment: { PATH: "" },
+      fetch: fetchFn,
+      timeoutSignal
+    });
+
+    await expect(installer.ensure()).resolves.toBe(join(directory, "liveware"));
+    expect(timeoutSignal).toHaveBeenCalledWith(120_000);
+  });
+
   it("rejects redirects outside the Liveware distribution origin", async () => {
     const directory = await mkdtemp(join(tmpdir(), "liveware-redirect-"));
     const fetchFn = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => new Response(null, {
