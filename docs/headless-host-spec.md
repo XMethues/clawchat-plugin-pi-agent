@@ -96,7 +96,7 @@ Pi sessions remain in Pi's standard session directory for the profile Workspace.
 | `ClawChatGateway` | Exposes start, stop, admitted-frame delivery, and materialized send operations. Internally owns challenge/connect, capability negotiation, token/nonce recovery, replay, ACK scheduling, reconnect, self-echo filtering, stable outbound identity, and ACK-timeout reconciliation. Callers do not manage protocol cursors. |
 | `ChatSessionRegistry` | Creates or restores a Conversation Session Set, loads the Active Chat Session required by each queued work item, executes ordered Session Transitions, and disposes runtimes during transition, conversation deletion, or Host shutdown. It does not own the WebSocket. |
 | `ChatSessionRuntime` | Owns one Pi `AgentSessionRuntime`, `SessionManager`, `SettingsManager`, `ResourceLoader`/Extension runtime, and effective output settings. It processes one turn at a time. |
-| `OutputProjector` | Converts completed Pi assistant, thinking, and visible tool events to unquoted ClawChat `message.send` frames and brackets a turn with `typing.update`. Explicit reply and structured-mention delivery belongs to the Active Turn-scoped `clawchat_send_message` tool. It does not own transport or persistence. |
+| `OutputProjector` | Converts completed Pi assistant, thinking, and visible tool events to unquoted ClawChat `message.send` frames and brackets a turn with `typing.update`. It projects direct chats immediately, buffers group chats until settlement, and suppresses eligible Silent Turns. Explicit reply and structured-mention delivery belongs to the Active Turn-scoped `clawchat_send_message` tool. It does not own transport or persistence. |
 
 These are module seams, not one-class-per-row requirements. Public interfaces stay small; handshake state, SQL tables, Pi event assembly, and retry mechanics remain hidden inside their owning modules. Tests target each interface's behavior.
 
@@ -323,7 +323,7 @@ forever.
 
 ## Pi input and output
 
-The inbound prompt contains the accepted materialized text and the minimum sender/chat metadata needed by Pi. Adapter control commands and unsupported content never enter model context.
+The inbound prompt contains accepted materialized text, minimum sender/chat metadata, and—for Group Chat Turns—the authoritative mention kind `direct`, `everyone`, or `none`. Adapter control commands and unsupported content never enter model context.
 
 Output follows these rules:
 
@@ -337,6 +337,17 @@ Output follows these rules:
   tool events;
 - `full`: send every completed assistant text block, completed thinking, and
   completed tool output;
+- direct chats retain their current projection timing, while group chats buffer
+  every automatically selected event until the Turn settles;
+- if a group message does not directly mention the Agent and the final
+  non-empty assistant block trims to exact uppercase `[SILENT]`, discard all
+  buffered assistant, thinking, and tool projection while retaining Pi session
+  history;
+- a direct Agent mention is ineligible for a Silent Turn, so an erroneous
+  `[SILENT]` marker is projected as ordinary assistant text;
+- group Turn abort discards all buffered projection; `typing.update` remains
+  visible, and a completed explicit `clawchat_send_message` cannot be
+  retracted;
 - send thinking under a Markdown heading with its content in a fenced code
   block and `message_mode: "thinking"`;
 - send completed tool arguments and results or errors under an emoji-labelled
@@ -353,8 +364,9 @@ weather-tool result, and a final forecast, `minimal` sends only the forecast;
 result; and `full` additionally sends completed thinking and the tool result.
 The mode changes projection only, never tool execution.
 
-The Gateway sends what Pi produces subject only to the effective Output Mode. It
-does not summarize, redact, or reinterpret assistant output.
+The Gateway sends what Pi produces subject to the effective Output Mode and
+group-only Silent Turn policy. It does not summarize or rewrite assistant
+content.
 
 ## Execution authority
 

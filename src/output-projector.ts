@@ -3,6 +3,7 @@ import type {
   ToolExecutionEndEvent,
   ToolExecutionStartEvent
 } from "@earendil-works/pi-coding-agent";
+import type { ClawchatGroupMention } from "./inbound.js";
 import type { ClawchatOutputMode } from "./output-settings.js";
 import type {
   ClawchatInboundMessage,
@@ -10,11 +11,15 @@ import type {
   ClawchatFragment,
   ClawchatOutboundContent,
   ClawchatOutboundMessage,
-  ClawchatTransport,
+  ClawchatTransport
 } from "./types.js";
 
 export type PiOutputEvent = MessageEndEvent | ToolExecutionStartEvent | ToolExecutionEndEvent;
 
+interface BufferedPiOutputEvent {
+  event: PiOutputEvent;
+  mode: ClawchatOutputMode;
+}
 
 export type OutputTurn =
   | {
@@ -24,6 +29,7 @@ export type OutputTurn =
   | {
       chatId: string;
       chatType: "group";
+      mentionKind: ClawchatGroupMention;
     };
 
 export interface OutputProjectorOptions {
@@ -41,6 +47,7 @@ export class ClawchatOutputProjector {
   private readonly toolArguments = new Map<string, unknown>();
   private activeTurn: OutputTurn | undefined;
   private minimalAssistantText: string | undefined;
+  private readonly bufferedOutput: BufferedPiOutputEvent[] = [];
 
   constructor(options: OutputProjectorOptions) {
     this.transport = options.transport;
@@ -52,6 +59,7 @@ export class ClawchatOutputProjector {
   async beginTurn(turn: OutputTurn): Promise<void> {
     if (this.activeTurn) throw new Error("A ClawChat output turn is already active");
     this.minimalAssistantText = undefined;
+    this.bufferedOutput.length = 0;
     this.activeTurn = turn;
     try {
       await this.sendTyping(turn, true);
@@ -59,6 +67,7 @@ export class ClawchatOutputProjector {
       this.activeTurn = undefined;
       this.toolArguments.clear();
       this.minimalAssistantText = undefined;
+      this.bufferedOutput.length = 0;
       throw error;
     }
   }
@@ -66,12 +75,22 @@ export class ClawchatOutputProjector {
   async handle(event: PiOutputEvent, mode: ClawchatOutputMode): Promise<void> {
     const turn = this.activeTurn;
     if (!turn) return;
+    if (turn.chatType === "group") {
+      this.bufferedOutput.push({ event, mode });
+      return;
+    }
+    await this.projectEvent(turn, event, mode);
+  }
 
+  private async projectEvent(
+    turn: OutputTurn,
+    event: PiOutputEvent,
+    mode: ClawchatOutputMode
+  ): Promise<void> {
     if (event.type === "tool_execution_start") {
       this.toolArguments.set(event.toolCallId, event.args);
       return;
     }
-
     if (event.type === "tool_execution_end") {
       const args = this.toolArguments.get(event.toolCallId);
       this.toolArguments.delete(event.toolCallId);
@@ -80,9 +99,7 @@ export class ClawchatOutputProjector {
       }
       return;
     }
-
     if (event.message.role !== "assistant") return;
-
     if (mode === "full") {
       const thinking = event.message.content
         .flatMap((part) =>
@@ -93,10 +110,7 @@ export class ClawchatOutputProjector {
         await this.sendMaterialized(turn, `### Thinking\n\n${formatCodeBlock(thinking)}`, "thinking");
       }
     }
-
-    const text = event.message.content
-      .flatMap((part) => (part.type === "text" && part.text ? [part.text] : []))
-      .join("\n\n");
+    const text = assistantText(event);
     if (!text.trim()) return;
     if (mode === "minimal") {
       this.minimalAssistantText = text;
@@ -105,14 +119,24 @@ export class ClawchatOutputProjector {
     await this.sendMaterialized(turn, text, "normal");
   }
 
-  discardPendingAssistantText(): void {
+  discardPendingOutput(): void {
+    this.bufferedOutput.length = 0;
     this.minimalAssistantText = undefined;
+    this.toolArguments.clear();
   }
 
   async endTurn(): Promise<void> {
     const turn = this.activeTurn;
     if (!turn) return;
     try {
+      if (turn.chatType === "group") {
+        const buffered = this.bufferedOutput.splice(0);
+        if (!isSilentGroupTurn(turn, buffered)) {
+          for (const output of buffered) {
+            await this.projectEvent(turn, output.event, output.mode);
+          }
+        }
+      }
       if (this.minimalAssistantText !== undefined) {
         await this.sendMaterialized(turn, this.minimalAssistantText, "normal");
       }
@@ -121,6 +145,7 @@ export class ClawchatOutputProjector {
         await this.sendTyping(turn, false);
       } finally {
         this.activeTurn = undefined;
+        this.bufferedOutput.length = 0;
         this.minimalAssistantText = undefined;
         this.toolArguments.clear();
       }
@@ -196,8 +221,34 @@ export class ClawchatOutputProjector {
   }
 }
 
-export function outputTurnFromInbound(message: ClawchatInboundMessage): OutputTurn {
-  return { chatId: message.chat_id, chatType: message.chat_type };
+export function outputTurnFromInbound(
+  message: ClawchatInboundMessage,
+  mentionKind: ClawchatGroupMention = "none"
+): OutputTurn {
+  return message.chat_type === "group"
+    ? { chatId: message.chat_id, chatType: "group", mentionKind }
+    : { chatId: message.chat_id, chatType: "direct" };
+}
+
+function assistantText(event: MessageEndEvent): string {
+  if (event.message.role !== "assistant") return "";
+  return event.message.content
+    .flatMap((part) => (part.type === "text" && part.text ? [part.text] : []))
+    .join("\n\n");
+}
+
+function isSilentGroupTurn(
+  turn: Extract<OutputTurn, { chatType: "group" }>,
+  output: readonly BufferedPiOutputEvent[]
+): boolean {
+  if (turn.mentionKind === "direct") return false;
+  for (let index = output.length - 1; index >= 0; index -= 1) {
+    const event = output[index]!.event;
+    if (event.type !== "message_end") continue;
+    const text = assistantText(event).trim();
+    if (text) return text === "[SILENT]";
+  }
+  return false;
 }
 
 function mediaFragment(value: Record<string, unknown>): Extract<ClawchatFragment, { url: string }> {

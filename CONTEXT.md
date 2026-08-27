@@ -100,12 +100,24 @@ _Avoid_: server replay, Pi session import, encrypted history sync
 The per-group policy `mention`, `all`, or `muted` that controls whether an accepted ClawChat message becomes a Chat Turn. It never controls whether the group's Conversation Session Set exists; `muted` still consumes, deduplicates, and acknowledges frames without invoking Pi, direct chats always dispatch, and groups default to `mention`.
 _Avoid_: subscription state, Session creation policy, WebSocket mute, replay pause
 
+**Silent Turn**:
+A dispatched Group Chat Turn that Pi deliberately completes without Reply Delivery because responding would not be useful or relevant. It still remains part of the Chat Session context.
+_Avoid_: muted message, skipped inbound frame, empty response, failed delivery
+
+**Silent Marker**:
+The exact group-only assistant response `[SILENT]` by which Pi selects a Silent Turn. It is retained in the Chat Session but never becomes Reply Delivery.
+_Avoid_: private-chat marker, partial-text match, lowercase variant, empty response
+
+**Group-wide Mention**:
+A structured `@everyone` mention addressed to all participants in a Group Chat. It admits the message to an Agent using mention dispatch but does not require that Agent to reply.
+_Avoid_: `@all`, direct Agent mention, mandatory Agent response
+
 **Execution Authority**:
 The native tool and operating-system authority of the Pi process. Every message admitted by Group Dispatch Mode runs with the same Pi configuration and process permissions; this equality does not grant Host Profile administration, whose ClawChat Control Commands require the current owner.
 _Avoid_: ClawChat tool permission gate, sender-based tool policy, implicit sandbox
 
 **Reply Delivery**:
-The non-token-streaming projection of Pi output into complete materialized ClawChat messages according to the effective Output Mode. `minimal` buffers assistant text and sends only the last non-empty block at turn end; `normal` sends all assistant text blocks; `full` additionally sends completed thinking under a Markdown heading with fenced content and completed tool output under an emoji-labelled Markdown heading with fenced arguments and results. Automatic projection always uses ordinary, unquoted `message.send` delivery. When conversational context calls for an explicit reply, structured mentions, or both, Pi uses `clawchat_send_message`; that terminal tool call owns delivery and suppresses an automatic duplicate. A turn may therefore produce one or more complete messages, but never `message.created` / `message.add` / `message.done` lifecycle frames or synthetic failure prose; `typing.update` brackets the active turn.
+The non-token-streaming projection of Pi output into complete materialized ClawChat messages according to the effective Output Mode. `minimal` selects only the last non-empty assistant block; `normal` selects all assistant blocks; `full` additionally selects completed thinking and tool output. Direct Chat selections project immediately, while Group Chat selections wait until the Turn settles so a Silent Marker can suppress the whole automatic projection. Automatic projection uses ordinary, unquoted `message.send`; explicit reply or structured-mention delivery uses `clawchat_send_message`, whose successful send owns delivery and suppresses any automatic duplicate. A Turn may produce zero or more complete messages, but never streaming lifecycle frames or synthetic failure prose; `typing.update` brackets the active Turn.
 _Avoid_: token streaming, synthetic assistant reply, adapter-authored rewriting, unconditional tool progress
 
 **Inbound Stream Materialization**:

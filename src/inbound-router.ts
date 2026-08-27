@@ -1,10 +1,7 @@
 import type { GatewayStore, SessionCommand } from "./gateway-store.js";
-import { extractInboundText, hasMediaFragments } from "./inbound.js";
-import {
-  parseOutputModeCommand,
-  type ClawchatOutputMode,
-  type ClawchatOutputModeOverride
-} from "./output-settings.js";
+import { classifyGroupMention, extractInboundText, hasMediaFragments } from "./inbound.js";
+import { parseOutputModeCommand } from "./output-settings.js";
+import type { ClawchatOutputMode, ClawchatOutputModeOverride } from "./output-settings.js";
 import type { ClawchatInboundMessage } from "./types.js";
 
 export type InboundControl =
@@ -90,7 +87,7 @@ export class ClawchatInboundRouter {
     const mode = this.store.getGroupDispatchMode(message.chat_id);
     if (mode === "all") return { dispatch: true };
     if (mode === "muted") return { dispatch: false };
-    return { dispatch: hasMention(message, this.agentUserId) };
+    return { dispatch: classifyGroupMention(message, this.agentUserId) !== "none" };
   }
 
   async applyAcceptedControl(message: ClawchatInboundMessage, decision: InboundDecision): Promise<void> {
@@ -170,12 +167,3 @@ function parseSessionCommand(text: string): ParsedSessionCommand | null {
   };
 }
 
-function hasMention(message: ClawchatInboundMessage, userId: string): boolean {
-  const mentions = message.payload.message.context?.mentions;
-  if (!Array.isArray(mentions)) return false;
-  return mentions.some((mention) => {
-    if (typeof mention === "string") return mention === userId;
-    if (!mention || typeof mention !== "object" || !("user_id" in mention)) return false;
-    return mention.user_id === userId || mention.user_id === "all";
-  });
-}

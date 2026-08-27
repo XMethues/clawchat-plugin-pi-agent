@@ -4,23 +4,18 @@ import type {
   ToolExecutionEndEvent,
   ToolExecutionStartEvent
 } from "@earendil-works/pi-coding-agent";
-import { extractInboundText } from "./inbound.js";
-import {
-  ClawchatOutputProjector,
-  outputTurnFromInbound,
-  type OutputTurn,
-  type PiOutputEvent
-} from "./output-projector.js";
+import { classifyGroupMention, extractInboundText } from "./inbound.js";
+import { ClawchatOutputProjector, outputTurnFromInbound } from "./output-projector.js";
+import type { OutputTurn, PiOutputEvent } from "./output-projector.js";
 import type { ClawchatOutputMode } from "./output-settings.js";
 import type { ClawchatInboundMessage, ClawchatTransport } from "./types.js";
 import {
   appendClawchatMemoryPrompt,
   appendClawchatSystemPrompt,
   registerClawchatTools,
-  uploadClawchatMediaFile,
-  type ActiveClawchatTurn,
-  type ClawchatToolEnvironment
+  uploadClawchatMediaFile
 } from "./clawchat-tools.js";
+import type { ActiveClawchatTurn, ClawchatToolEnvironment } from "./clawchat-tools.js";
 
 export interface HeadlessClawchatPiExtensionOptions {
   transport: ClawchatTransport;
@@ -82,10 +77,10 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
     }
   };
 
-  const deactivate = async (discardPendingAssistantText: boolean): Promise<void> => {
+  const deactivate = async (discardPendingOutput: boolean): Promise<void> => {
     if (!active) return;
-    if (active.projectOutput && discardPendingAssistantText) {
-      projector.discardPendingAssistantText();
+    if (active.projectOutput && discardPendingOutput) {
+      projector.discardPendingOutput();
     }
     try {
       if (active.projectOutput) await projector.endTurn();
@@ -99,14 +94,19 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
     beginTurn: async (message) => {
       if (!piApi) throw new Error("Headless Extension is not initialized");
       const text = extractInboundText(message);
+      const mentionKind = classifyGroupMention(
+        message,
+        options.tools?.profile().agent?.userId ?? ""
+      );
       await activate({
-        target: outputTurnFromInbound(message),
+        target: outputTurnFromInbound(message, mentionKind),
         auditSource: message.payload.message_id,
         outputMode: options.outputMode(message),
         toolContext: {
           chatId: message.chat_id,
           chatType: message.chat_type,
           messageId: message.payload.message_id,
+          ...(message.chat_type === "group" ? { mentionKind } : {}),
           sender: message.sender,
           preview: text
             ? [{ kind: "text", text: text.length > 240 ? `${text.slice(0, 237)}...` : text }]
@@ -169,12 +169,12 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
           }),
         onTerminalSend: () => {
           terminalReplySent = true;
-          projector.discardPendingAssistantText();
+          projector.discardPendingOutput();
         }
       });
     }
     pi.on("before_agent_start", async (event) => {
-      let systemPrompt = appendClawchatSystemPrompt(event.systemPrompt);
+      let systemPrompt = appendClawchatSystemPrompt(event.systemPrompt, active?.toolContext);
       if (active && options.tools) {
         systemPrompt = await appendClawchatMemoryPrompt(
           systemPrompt,

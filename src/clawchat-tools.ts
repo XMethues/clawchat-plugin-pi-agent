@@ -12,6 +12,7 @@ import {
   type ClawchatMemoryTargetType
 } from "./clawchat-memory.js";
 import type { HostProfile } from "./host-profile.js";
+import type { ClawchatGroupMention } from "./inbound.js";
 import type { ClawchatFragment, ClawchatInboundMessage } from "./types.js";
 import { isUnknownRecord } from "./type-guards.js";
 
@@ -19,6 +20,7 @@ export interface ActiveClawchatTurn {
   chatId: string;
   chatType: "direct" | "group";
   messageId?: string;
+  mentionKind?: ClawchatGroupMention;
   sender?: ClawchatInboundMessage["sender"];
   preview?: ClawchatFragment[];
 }
@@ -66,14 +68,32 @@ const DIRECT_TOOL_INSTRUCTION =
   "Use this registered ClawChat tool directly; do not bypass it with shell, curl, scripts, or handwritten HTTP clients.";
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 
-export function appendClawchatSystemPrompt(systemPrompt: string): string {
-  return `${systemPrompt}
+export function appendClawchatSystemPrompt(
+  systemPrompt: string,
+  turn?: Pick<ActiveClawchatTurn, "chatType" | "mentionKind">
+): string {
+  const capabilities = `${systemPrompt}
 
 ## ClawChat capabilities
 
 This runtime includes the inherited \`clawchat-core\` and \`clawchat-liveware\` skills plus registered \`clawchat_*\` tools. Use those tools directly for supported ClawChat operations. Never bypass them with shell commands, curl, scripts, or handwritten HTTP clients. Tool schemas are authoritative; if a named tool is unavailable in this runtime, report that limitation instead of bypassing it.
 
 Normal assistant text is delivered as an ordinary unquoted ClawChat message. When the conversation calls for an explicit reply to the current message, a structured mention, or both, use \`clawchat_send_message\`; a successful call sends the response and suppresses a duplicate normal follow-up.`;
+  if (turn?.chatType !== "group") return capabilities;
+
+  const mentionKind = turn.mentionKind ?? "none";
+  const mentionRule = mentionKind === "direct"
+    ? "This message directly mentions you. You must respond and must not use the Silent Marker."
+    : mentionKind === "everyone"
+      ? "This message contains a group-wide @everyone mention. You may still choose a Silent Turn."
+      : "This message does not mention you. Default to listening unless a response would add clear value.";
+  return `${capabilities}
+
+## Group response policy
+
+Before producing assistant text or calling any tool, decide whether this group message needs a response. ${mentionRule}
+
+When the message is unrelated, belongs to the human conversation, or needs no useful response, call no tools and output exactly \`[SILENT]\` as the only assistant text. The marker is uppercase and must contain no other text. Otherwise respond normally.`;
 }
 
 export async function appendClawchatMemoryPrompt(

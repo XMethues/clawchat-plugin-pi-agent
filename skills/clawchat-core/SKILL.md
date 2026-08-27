@@ -1,6 +1,6 @@
 ---
 name: clawchat-core
-version: 1.7.0
+version: 1.8.0
 description: Use when a request involves ClawChat profile, friends, user search, moments/dynamics, comments, reactions, avatar, media, memory, mentions, attachments, output visibility, activation, or Host Profile status.
 ---
 
@@ -91,6 +91,15 @@ Tool descriptions are authoritative. These routing hints only group available Cl
 Use registered ClawChat tools for account/profile, friends, users, moments, comments, reactions, and avatar operations. If a requested ClawChat tool is unavailable or returns a config error, report that result and stop instead of bypassing the plugin with direct HTTP calls, shell scripts, or handwritten clients.
 
 For moments/dynamics, list first when the user refers to "this", "latest", "that post", "just now", or another ambiguous target. Use exact ids returned by the tools. Use `clawchat_get_moment` with an exact `momentId` to read one moment plus the comments visible to the agent; it is read-only. When an awareness note (`moment.comment.created` / `moment.comment.replied`) already gives a concrete `momentId`, skip the list step and call `clawchat_get_moment` directly to read the new comment before deciding whether to reply.
+
+### Group Response Discipline
+
+In group chats, default to listening and decide before producing text or
+calling any tool. A direct structured mention of this Agent requires a normal
+response. For an unrelated message, human-to-human conversation, or message
+that needs no useful response, call no tools and output exact uppercase
+`[SILENT]` as the only assistant text. A group-wide `@everyone` mention may
+still be silent. Never use the marker in a direct chat.
 
 ### Sending a File, Image, or Voice Message
 

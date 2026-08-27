@@ -53,6 +53,11 @@ describe("ClawchatOutputProjector", () => {
       } as unknown as MessageEndEvent,
       "full"
     );
+    expect(sent.map((message) => message.event)).toEqual([
+      "typing.update",
+      "message.send",
+      "message.send"
+    ]);
     await projector.handle(
       { type: "tool_execution_start", toolCallId: "call-1", toolName: "read", args: { path: "README.md" } },
       "full"
@@ -249,6 +254,8 @@ describe("ClawchatOutputProjector", () => {
       } as unknown as MessageEndEvent,
       "minimal"
     );
+
+    expect(sent.map((message) => message.event)).toEqual(["typing.update"]);
     await projector.endTurn();
 
     expect(sent.map((message) => message.event)).toEqual([
@@ -266,6 +273,134 @@ describe("ClawchatOutputProjector", () => {
         }
       }
     });
+  });
+
+  it("buffers normal group output until the turn ends and preserves block order", async () => {
+    const sent: ClawchatOutboundMessage[] = [];
+    const projector = new ClawchatOutputProjector({
+      transport: { send: async (message) => { sent.push(message); } }
+    });
+    const inbound = inboundMessage();
+    inbound.chat_type = "group";
+    inbound.sender.type = "group";
+    await projector.beginTurn(outputTurnFromInbound(inbound));
+
+    await projector.handle({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "First" }] }
+    } as unknown as MessageEndEvent, "normal");
+    await projector.handle({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "Second" }] }
+    } as unknown as MessageEndEvent, "normal");
+
+    expect(sent.map((message) => message.event)).toEqual(["typing.update"]);
+    await projector.endTurn();
+    expect(sent.map((message) => message.event)).toEqual([
+      "typing.update",
+      "message.send",
+      "message.send",
+      "typing.update"
+    ]);
+    expect(sent.filter((message) => message.event === "message.send")
+      .map((message) => message.payload.message.body.fragments)).toEqual([
+      [{ kind: "text", text: "First" }],
+      [{ kind: "text", text: "Second" }]
+    ]);
+  });
+
+  it("suppresses every buffered full-mode output when the final group block is SILENT", async () => {
+    const sent: ClawchatOutboundMessage[] = [];
+    const projector = new ClawchatOutputProjector({
+      transport: { send: async (message) => { sent.push(message); } }
+    });
+    const inbound = inboundMessage();
+    inbound.chat_type = "group";
+    inbound.sender.type = "group";
+    await projector.beginTurn(outputTurnFromInbound(inbound, "everyone"));
+
+    await projector.handle({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "internal" },
+          { type: "text", text: "Earlier block" }
+        ]
+      }
+    } as unknown as MessageEndEvent, "full");
+    await projector.handle({
+      type: "tool_execution_start",
+      toolCallId: "call-silent",
+      toolName: "read",
+      args: { path: "README.md" }
+    } as ToolExecutionStartEvent, "full");
+    await projector.handle({
+      type: "tool_execution_end",
+      toolCallId: "call-silent",
+      toolName: "read",
+      result: "contents",
+      isError: false
+    } as ToolExecutionEndEvent, "full");
+    await projector.handle({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "\n [SILENT] \n" }] }
+    } as unknown as MessageEndEvent, "full");
+    await projector.endTurn();
+
+    expect(sent.map((message) => message.event)).toEqual(["typing.update", "typing.update"]);
+  });
+
+  it("does not silence a direct Agent mention or a lowercase marker", async () => {
+    const directMentionSent: ClawchatOutboundMessage[] = [];
+    const directMentionProjector = new ClawchatOutputProjector({
+      transport: { send: async (message) => { directMentionSent.push(message); } }
+    });
+    const inbound = inboundMessage();
+    inbound.chat_type = "group";
+    inbound.sender.type = "group";
+    await directMentionProjector.beginTurn(outputTurnFromInbound(inbound, "direct"));
+    await directMentionProjector.handle({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "[SILENT]" }] }
+    } as unknown as MessageEndEvent, "normal");
+    await directMentionProjector.endTurn();
+
+    const lowercaseSent: ClawchatOutboundMessage[] = [];
+    const lowercaseProjector = new ClawchatOutputProjector({
+      transport: { send: async (message) => { lowercaseSent.push(message); } }
+    });
+    await lowercaseProjector.beginTurn(outputTurnFromInbound(inbound));
+    await lowercaseProjector.handle({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "[silent]" }] }
+    } as unknown as MessageEndEvent, "normal");
+    await lowercaseProjector.endTurn();
+
+    expect(directMentionSent.find((message) => message.event === "message.send")
+      ?.payload.message.body.fragments).toEqual([{ kind: "text", text: "[SILENT]" }]);
+    expect(lowercaseSent.find((message) => message.event === "message.send")
+      ?.payload.message.body.fragments).toEqual([{ kind: "text", text: "[silent]" }]);
+  });
+
+  it("discards buffered group output when the turn aborts", async () => {
+    const sent: ClawchatOutboundMessage[] = [];
+    const projector = new ClawchatOutputProjector({
+      transport: { send: async (message) => { sent.push(message); } }
+    });
+    const inbound = inboundMessage();
+    inbound.chat_type = "group";
+    inbound.sender.type = "group";
+    await projector.beginTurn(outputTurnFromInbound(inbound));
+    await projector.handle({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "partial" }] }
+    } as unknown as MessageEndEvent, "normal");
+
+    projector.discardPendingOutput();
+    await projector.endTurn();
+
+    expect(sent.map((message) => message.event)).toEqual(["typing.update", "typing.update"]);
   });
 
   it("sends every non-empty assistant text and excludes thinking and tools in normal mode", async () => {

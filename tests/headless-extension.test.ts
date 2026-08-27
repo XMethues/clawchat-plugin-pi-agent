@@ -26,8 +26,12 @@ describe("Headless ClawChat Pi Extension", () => {
       "Normal assistant text is delivered as an ordinary unquoted ClawChat message"
     );
     expect(prompt.systemPrompt).toContain("clawchat_send_message");
+    expect(prompt.systemPrompt).not.toContain("[SILENT]");
 
     await controller.beginTurn(inboundMessage());
+    const directPrompt = await handlers.get("before_agent_start")!({ systemPrompt: "base" });
+    expect(directPrompt.systemPrompt).not.toContain("## Group response policy");
+    expect(directPrompt.systemPrompt).not.toContain("[SILENT]");
     await handlers.get("message_end")!({
       type: "message_end",
       message: {
@@ -105,7 +109,10 @@ describe("Headless ClawChat Pi Extension", () => {
         registeredTools.set(tool.name, tool)
     } as never);
 
-    await controller.beginTurn(inboundMessage());
+    const inbound = inboundMessage();
+    inbound.chat_type = "group";
+    inbound.sender.type = "group";
+    await controller.beginTurn(inbound);
     await handlers.get("message_end")!({
       type: "message_end",
       message: { role: "assistant", content: [{ type: "text", text: "I will send it." }] }
@@ -119,6 +126,39 @@ describe("Headless ClawChat Pi Extension", () => {
     expect(sendFrame).toHaveBeenCalledOnce();
     expect(sendFrame).toHaveBeenCalledWith(expect.objectContaining({ event: "message.reply" }));
     expect(sent.filter((message) => message.event === "message.send")).toHaveLength(0);
+  });
+
+  it.each([
+    [[{ user_id: "agent-user-1" }], "directly mentions you. You must respond"],
+    [[{ user_id: "all" }], "group-wide @everyone mention"],
+    [[], "does not mention you. Default to listening"]
+  ] as const)("injects authoritative group reply policy for mentions %j", async (mentions, expected) => {
+    const handlers = new Map<string, Function>();
+    const { extension, controller } = createHeadlessClawchatPiExtension({
+      transport: { send: async () => undefined },
+      outputMode: () => "normal",
+      tools: {
+        api: {},
+        memory: { renderTurnContext: async () => "" },
+        profile: () => ({ agent: { userId: "agent-user-1" } })
+      } as never
+    });
+    extension({
+      on: (event: string, handler: Function) => handlers.set(event, handler),
+      registerTool: () => undefined
+    } as never);
+    const inbound = inboundMessage();
+    inbound.chat_type = "group";
+    inbound.sender.type = "group";
+    inbound.payload.message.context = { mentions, reply: null };
+
+    await controller.beginTurn(inbound);
+    const prompt = await handlers.get("before_agent_start")!({ systemPrompt: "base" });
+    await handlers.get("agent_settled")!({ type: "agent_settled" });
+
+    expect(prompt.systemPrompt).toContain("## Group response policy");
+    expect(prompt.systemPrompt).toContain(expected);
+    expect(prompt.systemPrompt).toContain("output exactly `[SILENT]` as the only assistant text");
   });
 
   it("binds an Awareness Turn to owner memory and tools without projecting model text", async () => {

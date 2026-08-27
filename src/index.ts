@@ -41,7 +41,8 @@ export type {
   InboundControl,
   InboundDecision
 } from "./inbound-router.js";
-export { extractInboundText, renderInboundPrompt } from "./inbound.js";
+export { classifyGroupMention, extractInboundText, renderInboundPrompt } from "./inbound.js";
+export type { ClawchatGroupMention } from "./inbound.js";
 export { ClawchatOutputProjector, outputTurnFromInbound } from "./output-projector.js";
 export type { OutputProjectorOptions, OutputTurn, PiOutputEvent } from "./output-projector.js";
 export {

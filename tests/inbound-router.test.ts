@@ -3,10 +3,26 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { GatewayStore } from "../src/gateway-store.js";
+import { classifyGroupMention } from "../src/inbound.js";
 import { ClawchatInboundRouter } from "../src/inbound-router.js";
 import type { ClawchatInboundMessage } from "../src/types.js";
 
 describe("ClawchatInboundRouter", () => {
+  it("classifies authoritative group mention context for reply policy", () => {
+    expect(classifyGroupMention(
+      groupMessage("direct", [{ user_id: "all" }, { user_id: "agent-user-1" }]),
+      "agent-user-1"
+    )).toBe("direct");
+    expect(classifyGroupMention(
+      groupMessage("everyone", [{ user_id: "all" }]),
+      "agent-user-1"
+    )).toBe("everyone");
+    expect(classifyGroupMention(
+      groupMessage("other", [{ user_id: "human-2" }]),
+      "agent-user-1"
+    )).toBe("none");
+  });
+
   it("dispatches canonical, legacy, and everyone mentions in mention mode", async () => {
     const directory = await mkdtemp(join(tmpdir(), "clawchat-pi-router-"));
     const store = GatewayStore.open(join(directory, "gateway.sqlite"));

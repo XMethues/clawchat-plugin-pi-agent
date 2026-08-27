@@ -42,8 +42,10 @@ by Hosted Session Bindings. The complete runtime contract is specified in
   per-conversation `minimal`, `normal`, `full`, or `inherit` override.
 - `output-projector.ts` maps completed Pi assistant, thinking, tool, and
   `MEDIA:` attachment output to complete, unquoted `message.send` messages and
-  brackets work with `typing.update`. Explicit reply and structured-mention
-  delivery belongs to the Active Turn-scoped `clawchat_send_message` tool.
+  brackets work with `typing.update`. Direct chats project immediately; group
+  chats buffer automatic output until settlement and discard eligible Silent
+  Turns. Explicit reply and structured-mention delivery belongs to the Active
+  Turn-scoped `clawchat_send_message` tool.
 - `clawchat-api.ts` owns authenticated REST and Media envelopes plus repeatable,
   single-flight reactive token refresh while treating tokens as opaque values.
 - `clawchat-memory.ts` owns profile-local Markdown memory, metadata/body
