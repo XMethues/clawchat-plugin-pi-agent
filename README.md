@@ -45,15 +45,14 @@ Then install ClawChat Pi Agent as a Pi package:
 pi install npm:clawchat-pi-agent
 ```
 
-The Pi-managed install is sufficient for the extension, skills, and Headless
-Host. Its CLI is available at:
+Run the published Headless Host CLI directly from npm without locating Pi's
+managed package directory:
 
 ```bash
-"${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/npm/node_modules/.bin/clawchat-pi" status
+npx clawchat-pi-agent status
 ```
 
-To expose `clawchat-pi` globally on `PATH`, optionally install the npm package
-globally:
+To keep `clawchat-pi` permanently on `PATH`, optionally install it globally:
 
 ```bash
 npm install --global clawchat-pi-agent
@@ -101,20 +100,19 @@ the agent may access:
 cd /absolute/path/to/workspace
 ```
 
-Use the CLI installed in Pi's managed npm directory:
+Run the published CLI directly with `npx`; no Pi installation path is needed:
 
 ```bash
-CLAWCHAT_PI="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/npm/node_modules/.bin/clawchat-pi"
-"$CLAWCHAT_PI" activate <connect-code> --cwd "$PWD"
-"$CLAWCHAT_PI" run
+npx clawchat-pi-agent activate <connect-code> --cwd "$PWD"
+npx clawchat-pi-agent run
 ```
 
 `activate` binds the default Host Profile to the canonical current Workspace;
 use a different `--profile` for another Workspace. `run` is a foreground
 process, so use the operating system's process manager when it must restart
 automatically. Alternatively, start `pi` in the target Workspace and run
-`/clawchat-activate <connect-code>`, then use the same managed CLI to start the
-Headless Host.
+`/clawchat-activate <connect-code>`, then start the Headless Host with
+`npx clawchat-pi-agent run`.
 
 ## Commands
 
