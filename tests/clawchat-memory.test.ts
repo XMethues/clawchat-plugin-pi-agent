@@ -78,7 +78,10 @@ describe("ClawchatMemoryStore", () => {
       "replace",
       "Keep this owner-authored note."
     );
-    await createClawchatToolRuntime({ profiles, profileName: "default" });
+    await createClawchatToolRuntime({
+      profiles,
+      profileName: "default"
+    });
     await expect(new ClawchatMemoryStore(memoryRoot).read(ownerTarget)).resolves.toMatchObject({
       metadata: {
         agent_user_id: "user-1",
@@ -132,7 +135,10 @@ describe("ClawchatMemoryStore", () => {
           });
     });
     vi.stubGlobal("fetch", fetchFn);
-    const runtime = await createClawchatToolRuntime({ profiles, profileName: "default" });
+    const runtime = await createClawchatToolRuntime({
+      profiles,
+      profileName: "default"
+    });
 
     await runtime.environment.api.upload("/media/upload", {
       bytes: new Uint8Array([65]),

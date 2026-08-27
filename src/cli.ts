@@ -4,6 +4,7 @@ import { DEFAULT_MEDIA_URL, DEFAULT_REST_URL, DEFAULT_WEBSOCKET_URL } from "./co
 import { GatewayStore } from "./gateway-store.js";
 import { HeadlessPiHost } from "./headless-host.js";
 import { HostProfileRepository } from "./host-profile.js";
+import { LivewareCliInstaller, livewareInstallDirectory } from "./liveware-installer.js";
 
 export interface CliDependencies {
   profiles?: HostProfileRepository;
@@ -28,6 +29,28 @@ export async function runCli(args: string[], dependencies: CliDependencies = {})
     ((profileName: string, status: (line: string) => void) =>
       runHostUntilSignal(profileName, profiles, status));
   const [command, ...rest] = args;
+  if (command === "liveware") {
+    const [action, ...unexpected] = rest;
+    if ((action !== "install" && action !== "status") || unexpected.length > 0) {
+      throw new Error("Usage: clawchat-pi liveware install|status");
+    }
+    const installer = new LivewareCliInstaller({
+      installDirectory: livewareInstallDirectory(profiles.profileDirectory("default")),
+      environment
+    });
+    if (action === "install") {
+      const executable = await installer.ensure();
+      write(`Liveware CLI installed: ${executable}`);
+      return 0;
+    }
+    const status = await installer.status();
+    write(`Liveware CLI: ${status.available ? "available" : "not installed"}`);
+    write(`Platform: ${status.platform}/${status.arch}`);
+    if (status.path) write(`Path: ${status.path}`);
+    if (status.downloadUrl) write(`Download: ${status.downloadUrl}`);
+    return status.available ? 0 : 1;
+  }
+
 
   if (command === "activate") {
     const parsed = parseCommand(rest, { positional: "invite-code", requireCwd: true });
@@ -161,7 +184,9 @@ function usage(): string {
     "Usage:",
     "  clawchat-pi activate <invite-code> --cwd <path> [--profile <name>]",
     "  clawchat-pi run [--profile <name>]",
-    "  clawchat-pi status [--profile <name>]"
+    "  clawchat-pi status [--profile <name>]",
+    "  clawchat-pi liveware install",
+    "  clawchat-pi liveware status"
   ].join("\n");
 }
 
@@ -182,13 +207,13 @@ async function runHostUntilSignal(
 }
 
 function waitForShutdownSignal(): Promise<void> {
-  return new Promise((resolve) => {
-    const finish = () => {
-      process.off("SIGINT", finish);
-      process.off("SIGTERM", finish);
-      resolve();
-    };
-    process.once("SIGINT", finish);
-    process.once("SIGTERM", finish);
-  });
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const finish = () => {
+    process.off("SIGINT", finish);
+    process.off("SIGTERM", finish);
+    resolve();
+  };
+  process.once("SIGINT", finish);
+  process.once("SIGTERM", finish);
+  return promise;
 }

@@ -50,7 +50,11 @@ by Hosted Session Bindings. The complete runtime contract is specified in
   separation, safe atomic writes, search, and bounded turn context.
 - `clawchat-tools.ts` registers the pinned ClawChat default tool set, validates
   Active ClawChat Turn mutations, maps permission gates, and records audits.
-- `clawchat-runtime.ts` binds a Host Profile to its API and memory runtime.
+- `clawchat-runtime.ts` binds a Host Profile to its API, memory, and Liveware
+  runtime.
+- `liveware-installer.ts` discovers or atomically installs the platform CLI in
+  the Agent Directory behind one ensure/status interface; failures disable only
+  Liveware operations.
 - `headless-extension.ts` projects one SDK runtime's Pi lifecycle and tools,
   including explicit user and Awareness Hosted Session Bindings, without opening
   a per-session WebSocket.

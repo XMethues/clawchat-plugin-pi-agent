@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -201,5 +201,30 @@ describe("clawchat-pi CLI", () => {
     await expect(runCli(["run", "--profile", "work"], { runHost })).resolves.toBe(0);
 
     expect(runHost).toHaveBeenCalledWith("work", expect.any(Function));
+  });
+
+  it("installs and reports the Liveware CLI through the published command", async () => {
+    const agentDir = await mkdtemp(join(tmpdir(), "clawchat-pi-liveware-cli-"));
+    const pathDirectory = join(agentDir, "path");
+    await mkdir(pathDirectory);
+    const executable = join(pathDirectory, process.platform === "win32" ? "liveware.exe" : "liveware");
+    await writeFile(executable, "existing");
+    await chmod(executable, 0o755);
+    const profiles = new HostProfileRepository({ agentDir });
+    const output: string[] = [];
+    const environment = { PATH: pathDirectory };
+
+    await expect(runCli(
+      ["liveware", "install"],
+      { profiles, environment, write: (line) => output.push(line) }
+    )).resolves.toBe(0);
+    await expect(runCli(
+      ["liveware", "status"],
+      { profiles, environment, write: (line) => output.push(line) }
+    )).resolves.toBe(0);
+
+    expect(output).toContain(`Liveware CLI installed: ${executable}`);
+    expect(output).toContain("Liveware CLI: available");
+    expect(output).toContain(`Path: ${executable}`);
   });
 });

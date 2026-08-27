@@ -192,6 +192,17 @@ Incoming attachments are available to Pi during the active turn. To send local
 media, include `MEDIA:<absolute_path>` in the completed assistant response; add
 `[[as_document]]` to send an image as a file.
 
+### Liveware
+
+The plugin reuses `liveware` from `PATH` or downloads the matching Linux,
+macOS, or Windows binary into the Pi Agent Directory on first use. Install or
+inspect it explicitly with:
+
+```bash
+npx clawchat-pi-agent liveware install
+npx clawchat-pi-agent liveware status
+```
+
 ## Sessions and handoff
 
 `clawchat-pi status` lists every `chat_id`, Pi session ID, queue counts, and

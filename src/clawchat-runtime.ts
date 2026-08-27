@@ -2,7 +2,9 @@ import { join } from "node:path";
 import { ClawchatApiClient } from "./clawchat-api.js";
 import { ClawchatMemoryStore, clawchatMemoryTarget } from "./clawchat-memory.js";
 import type { ClawchatToolEnvironment } from "./clawchat-tools.js";
-import { HostProfileRepository, type HostProfile } from "./host-profile.js";
+import { HostProfileRepository } from "./host-profile.js";
+import type { HostProfile } from "./host-profile.js";
+import { LivewareCliInstaller, livewareInstallDirectory } from "./liveware-installer.js";
 
 export interface ClawchatToolRuntime {
   environment: ClawchatToolEnvironment;
@@ -56,6 +58,9 @@ export async function createClawchatToolRuntime(options: {
     agent_user_id: profile.agent.userId,
     agent_owner_id: profile.agent.ownerId
   });
+  const liveware = new LivewareCliInstaller({
+    installDirectory: livewareInstallDirectory(options.profiles.profileDirectory(options.profileName))
+  });
 
   return {
     profile: () => profile,
@@ -63,7 +68,8 @@ export async function createClawchatToolRuntime(options: {
     environment: {
       profile: () => profile,
       api,
-      memory
+      memory,
+      ensureLivewareExecutable: () => liveware.ensure()
     }
   };
 }

@@ -45,6 +45,7 @@ export interface ClawchatToolEnvironment {
   onTerminalSend?: () => void;
   onConversationLeft?: (chatId: string) => Promise<void>;
   livewareExecutable?: string;
+  ensureLivewareExecutable?: () => Promise<string>;
   now?: () => number;
   idFactory?: () => string;
 }
@@ -813,7 +814,7 @@ async function uploadLocalFile(
 }
 
 async function livewareLogin(env: ClawchatToolEnvironment): Promise<unknown> {
-  const executable = env.livewareExecutable ?? "liveware";
+  const executable = env.livewareExecutable ?? await env.ensureLivewareExecutable?.() ?? "liveware";
   const token = env.profile().accessToken;
   const { promise, resolve } = Promise.withResolvers<unknown>();
   const child = spawn(executable, ["login", "--access-token", token], { stdio: ["ignore", "pipe", "pipe"] });

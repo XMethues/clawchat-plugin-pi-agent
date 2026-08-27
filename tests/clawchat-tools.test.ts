@@ -1,3 +1,6 @@
+import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import { ClawchatApiError } from "../src/clawchat-api.js";
@@ -176,6 +179,25 @@ describe("registerClawchatTools", () => {
     const rejected = await sendMessage.execute("call-4", {});
     expect(rejected.details).toMatchObject({ error: "validation" });
     expect(sendFrame).toHaveBeenCalledTimes(3);
+  });
+
+  it("resolves and logs in with an installed Liveware CLI", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "clawchat-liveware-tool-"));
+    const executable = join(directory, "liveware");
+    await writeFile(
+      executable,
+      "#!/usr/bin/env node\nprocess.exit(process.argv.slice(2).join(' ').startsWith('login --access-token ') ? 0 : 1);\n"
+    );
+    await chmod(executable, 0o755);
+    const ensureLivewareExecutable = vi.fn(async () => executable);
+    const tools = new Map<string, RegisteredTool>();
+    const pi = { registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool) } as unknown as ExtensionAPI;
+    registerClawchatTools(pi, toolEnvironment({ ensureLivewareExecutable }));
+
+    const result = await tools.get("clawchat_liveware_login")!.execute("call-liveware", {});
+
+    expect(result.details).toEqual({ ok: true });
+    expect(ensureLivewareExecutable).toHaveBeenCalledOnce();
   });
 
   it("returns pending permission outcomes as terminal non-retryable results and audits the call", async () => {
