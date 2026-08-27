@@ -133,55 +133,18 @@ manager when automatic restart is required.
 
 ## Pi Extension
 
-The package declares a Pi extension at `./dist/src/extension.js`.
+`pi install npm:clawchat-pi-agent` loads this package's Pi Extension, ClawChat
+tools, and skills into Pi.
 
-The extension defaults to the same production ClawChat endpoints used by the
-OpenClaw and Hermes plugins:
+### Core commands
 
-- REST: `https://app.clawling.com`
-- WebSocket: `wss://app.clawling.com/ws`
-- Media: `https://app.clawling.com`
-
-Set `CLAWCHAT_BASE_URL`, `CLAWCHAT_WS_URL`, and `CLAWCHAT_MEDIA_URL` to
-independent endpoints for a custom deployment. REST and Media values must be
-absolute HTTP(S) origins; the WebSocket value must be an absolute `ws:` or
-`wss:` URL. The Host Profile stores and `status` prints all three separately;
-Media is never derived from WebSocket state. Legacy profiles with custom
-endpoints require `CLAWCHAT_MEDIA_URL` for migration. Legacy profiles without
-the structured agent ID, agent-user ID, and owner ID must be activated again.
-Bearer access and refresh credentials are opaque strings: the package never
-decodes them to obtain identity or endpoint authority.
-
-Inside Pi, run `/clawchat-activate <connect-code>` once. Activated profiles
-initialize REST and local tools automatically on `session_start`; `/clawchat`
-is not a startup prerequisite. The ordinary Pi Extension is management-only:
-it never opens a WebSocket or receives remote turns. `clawchat-pi run`
-exclusively owns the profile's Gateway.
-
-CLI and Management Extension Activation acquire the same exclusive Host
-Profile operation lease used by `run` before reading profile state. The lease
-is held through invite redemption, any Profile Rebinding reset, profile commit,
-and output-setting restoration, then released on success or failure. Activation
-therefore fails before its remote request while the Host owns the profile, and
-Host startup fails while Activation is in progress.
-
-Profile state is stored below Pi's agent directory:
+Activate from an interactive Pi session:
 
 ```text
-<agent-dir>/clawchat/profiles/<profile>/profile.json
-<agent-dir>/clawchat/profiles/<profile>/gateway.sqlite
-<agent-dir>/clawchat/profiles/<profile>/memory/{owner.md,users/,groups/}
-<agent-dir>/clawchat/profiles/<profile>/skills/
-<agent-dir>/clawchat/profiles/<profile>/run.lock
+/clawchat-activate <connect-code>
 ```
 
-A second explicit Activation of an existing profile is a Profile Rebinding.
-It preserves the profile's device ID and Workspace but deletes the prior
-Gateway state, tool memory/audit state, profile-local skills, chat mappings,
-queues, and mapped Pi session history before saving the new credentials.
-
-Each ClawChat conversation owns an isolated set of Pi sessions with one active
-session. The Agent owner can manage that set from the conversation:
+Manage sessions from a ClawChat conversation:
 
 ```text
 /new
@@ -192,17 +155,7 @@ session. The Agent owner can manage that set from the conversation:
 /stop
 ```
 
-`/new` starts a fresh active session while retaining any used session as local
-history. `/session` reports metadata and usage statistics without message
-content. `/resume` lists only history owned by the current conversation, and a
-session ID from another conversation is rejected. These transitions are ordered
-with ordinary messages in the conversation's durable FIFO. `/stop` instead
-mirrors Pi's Escape behavior: it aborts the active turn and cancels work queued
-before the command without undoing completed tool effects; later messages remain
-eligible. Empty sessions replaced by `/new` or `/resume` are deleted.
-
-ClawChat output defaults to `normal`. From the current ClawChat conversation
-handled by the Headless Pi Host, set a per-chat override with:
+Set the conversation's output mode:
 
 ```text
 /clawchat-output minimal
@@ -211,29 +164,7 @@ handled by the Headless Pi Host, set a per-chat override with:
 /clawchat-output inherit
 ```
 
-The command reply reports the effective mode, the Host Profile default, and the
-chat override. `inherit` removes the per-chat override and follows the Host
-Profile default. A command in one chat does not change another chat.
-
-For example, when asked about the weather, Pi might emit an intermediate
-assistant message, call a weather tool, and then emit the final forecast:
-
-- `minimal` buffers assistant text until the turn ends and sends only the last
-  non-empty assistant text—the final forecast. Thinking, tool output, and an
-  intermediate “I’ll check the weather” message are not sent.
-- `normal` sends every completed assistant text block, including both “I’ll
-  check the weather” and the final forecast, but sends no thinking or tool
-  output.
-- `full` sends those assistant text blocks plus completed thinking and completed
-  tool output. Thinking uses a Markdown heading and fenced code block; tool
-  details use an emoji-labelled heading and fenced code blocks. Their protocol
-  modes remain `thinking` and `tool`.
-
-The modes control only what ClawChat displays. They do not enable, disable, or
-otherwise change Pi tool execution. Thinking can be emitted only when Pi's
-native thinking level produces it.
-
-Groups default to structured mention dispatch. From a group chat, use:
+Set dispatch behavior from a group conversation:
 
 ```text
 /clawchat-group mention
@@ -241,81 +172,25 @@ Groups default to structured mention dispatch. From a group chat, use:
 /clawchat-group muted
 ```
 
-Control commands are durably accepted before group filtering, so a muted group
-can unmute itself. Direct messages always dispatch.
+`mention` is the default group mode. Direct messages always dispatch.
 
-The extension does not use ClawChat streaming lifecycle frames. Every output
-selected by the effective mode is sent as a complete materialized message while
-`typing.update` represents active work.
+### Running the Host
 
-### Agent Conformance Profile
+Activation prepares the Host Profile; it does not keep the remote connection
+online. Start the Headless Host with:
 
-The running Headless Host advertises only the Protocol v2 behavior it implements:
-`multi_device`, `device_replay`, `reliable_delivery`,
-`reliable_delivery_v2`, `delivery_receipt`, and plaintext `history_sync`;
-profiles with owner-awareness support also advertise `chat_meta_events` and
-`notify_signals`. It does **not** advertise E2EE or `permission_events`, does not
-subscribe to presence, does not emit production streaming lifecycle frames, and
-does not produce read cursors (`message.read`). Streaming lifecycle downlinks
-may be consumed and materialized after `message.done`; that does not make the
-Host a streaming producer. History Sync remains plaintext-only.
+```bash
+npx clawchat-pi-agent run
+```
 
-On exact `authentication failed`, the Gateway permits one single-flight token
-refresh since the previous successful `hello-ok`; another healthy connection
-resets that allowance. An immediately rejected replacement cannot hot-loop.
-Exact `nonce mismatch` and remote-auth-service failures reconnect with normal
-backoff and reuse the current opaque token.
+Use `npx clawchat-pi-agent status` to inspect the active profile, process,
+sessions, queues, and pending delivery state.
 
-The package also declares `skills/clawchat-core` and
-`skills/clawchat-liveware` as Pi skill resources. Both ordinary and Headless Pi
-runtimes discover them with the extension. Owner memory is injected on every
-ClawChat turn. A first Group Chat Turn durably creates current-group memory from
-its WebSocket identity before Pi runs and enriches it with authoritative group
-details and member IDs; reconnect recovery also materializes newly listed
-groups. User memory is available only through explicit memory tools.
+### Media
 
-### Inbound media
-
-The Headless Pi Host materializes incoming ClawChat media only when its admitted
-Chat Turn begins:
-
-- images use Pi 0.84.1's native conversion and resizing and are passed to a
-  vision-capable current model. A non-vision model still receives numbered
-  placeholders and metadata, but cannot inspect pixels unless it chooses normal
-  tools on a leased local path where one is available; the integration does not
-  add OCR or switch models;
-- recognized text candidates enter the Turn in full only after strict UTF-8 or
-  BOM-marked UTF-16LE/BE and binary-content validation, as complete Pi-style
-  `<file name="private-local-path">...</file>` blocks without truncation or
-  summarization. Invalid or misleading text falls back to generic handoff; and
-- PDF, Office, audio, video, and other generic attachments become numbered
-  descriptors with safe names, metadata, byte size, and a private local path.
-  Pi's normal tools and configured Agent Directory Packages or skills may use
-  that path; the integration does not automatically parse or interpret it.
-
-Download defaults are 100 MiB per attachment and 256 MiB per Turn, with 30
-seconds each for connection and no progress, two minutes per attachment, and
-five minutes per Turn. Network failures and HTTP 408, 429, or 5xx responses
-retry at most once after 250 ms; downloads follow at most five redirects.
-
-Only HTTPS URLs on `clawling.com`, `clawling.chat`, or their subdomains are
-accepted, and every redirect is checked against the same boundary. The remote
-URL remains only in private Gateway Store state: it is never placed in Pi or
-provider-facing prompt text, Reply Delivery, status output, or logs.
-
-Original names are sanitized, made collision-safe, and capped at 120 UTF-8
-bytes. Originals stay outside the Workspace in a private Turn lease and are
-removed after success, failure, cancellation, or Host stop; the next startup
-clears stale leases only after acquiring exclusive Host Profile ownership.
-A Host restart is required after Package installation or any other Agent
-Directory resource change; resources are not hot-reloaded.
-
-### Outbound media
-
-To attach local media, include one or more `MEDIA:<absolute_path>` markers in a
-completed assistant reply. Other text becomes the caption. Images, audio,
-video, and files are uploaded to ClawChat and emitted as native fragments; add
-`[[as_document]]` to force an image to a file fragment.
+Incoming attachments are available to Pi during the active turn. To send local
+media, include `MEDIA:<absolute_path>` in the completed assistant response; add
+`[[as_document]]` to send an image as a file.
 
 ## Sessions and handoff
 
