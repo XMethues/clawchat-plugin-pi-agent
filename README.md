@@ -59,6 +59,63 @@ globally:
 npm install --global clawchat-pi-agent
 ```
 
+## Activation
+
+### Get a Connect Code
+
+1. Open the ClawChat app and go to **Contacts**.
+2. Click **Register Agent**.
+3. Click **Get Connect Code Only**.
+4. Copy the generated Connect Code. A Connect Code is single-use and may
+   expire; generate a fresh code instead of retrying a failed one.
+
+### Option 1: Activate a ClawChat Nest Agent
+
+1. In ClawChat Nest, open the cloned Pi Agent that you want to connect.
+2. Open **Agent Management**, then click **Terminal**.
+3. Confirm that the terminal is in `/opt/app`:
+
+   ```bash
+   cd /opt/app
+   pwd
+   ```
+
+4. Run `init` with the copied Connect Code:
+
+   ```bash
+   ./init <connect-code>
+   ```
+
+The Nest `run` service starts automatically with the container. Before
+Activation it checks for a profile at most three times and then waits without
+polling. A successful `init` notifies that waiting service, which starts
+`clawchat-pi run` without requiring a container restart. Re-running `init`
+after Activation keeps the existing identity and ignores an extra code.
+
+### Option 2: Activate a Local Pi Agent
+
+Install Pi and the package as described above, then enter the Workspace that
+the agent may access:
+
+```bash
+cd /absolute/path/to/workspace
+```
+
+Use the CLI installed in Pi's managed npm directory:
+
+```bash
+CLAWCHAT_PI="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/npm/node_modules/.bin/clawchat-pi"
+"$CLAWCHAT_PI" activate <connect-code> --cwd "$PWD"
+"$CLAWCHAT_PI" run
+```
+
+`activate` binds the default Host Profile to the canonical current Workspace;
+use a different `--profile` for another Workspace. `run` is a foreground
+process, so use the operating system's process manager when it must restart
+automatically. Alternatively, start `pi` in the target Workspace and run
+`/clawchat-activate <connect-code>`, then use the same managed CLI to start the
+Headless Host.
+
 ## Commands
 
 ```bash
@@ -73,7 +130,7 @@ Activate a profile bound to one project Workspace, then run it in the
 foreground:
 
 ```bash
-clawchat-pi activate <invite-code> --cwd /absolute/path/to/project
+clawchat-pi activate <connect-code> --cwd /absolute/path/to/project
 clawchat-pi run
 clawchat-pi status
 ```
@@ -82,7 +139,7 @@ For multiple projects, create one profile per Workspace and run each profile
 as a separate process:
 
 ```bash
-clawchat-pi activate <invite-code> --cwd /path/to/project-a --profile project-a
+clawchat-pi activate <connect-code> --cwd /path/to/project-a --profile project-a
 clawchat-pi run --profile project-a
 ```
 
@@ -111,7 +168,7 @@ the structured agent ID, agent-user ID, and owner ID must be activated again.
 Bearer access and refresh credentials are opaque strings: the package never
 decodes them to obtain identity or endpoint authority.
 
-Inside Pi, run `/clawchat-activate <invite-code>` once. Activated profiles
+Inside Pi, run `/clawchat-activate <connect-code>` once. Activated profiles
 initialize REST and local tools automatically on `session_start`; `/clawchat`
 is not a startup prerequisite. The ordinary Pi Extension is management-only:
 it never opens a WebSocket or receives remote turns. `clawchat-pi run`
