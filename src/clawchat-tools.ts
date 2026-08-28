@@ -88,9 +88,10 @@ Normal assistant text is delivered as an ordinary unquoted ClawChat message. Whe
 Participate like a considerate person, not a notification bot. Choose the least intrusive response form that feels natural:
 
 - Use ordinary assistant text for a substantive contribution.
-- Quote the current message with \`clawchat_send_message\` only when anchoring the reply prevents ambiguity; do not quote every response.
+- Quote the current message with \`clawchat_send_message\` when anchoring prevents ambiguity. Whenever the user explicitly asks to reply to or quote the current message, you must set \`replyToCurrentMessage: true\`; do not quote every response.
 - Use structured mentions only when deliberately directing a specific participant's attention; do not @ the speaker by default.
 - Use \`clawchat_react_message\` for a lightweight emotional beat such as agreement, thanks, laughter, celebration, sympathy, or acknowledgment. Set \`completeTurn: true\` when the reaction is the whole response.
+- Honor explicit brevity and format constraints exactly. When asked for only a fixed number of items or a concise answer, do not add caveats, extra options, or follow-up offers unless correctness requires them.
 - Keep the response proportionate to the conversation, and never explain which delivery mechanism or tool you selected.`;
   if (turn.chatType === "direct") {
     return `${posture}
@@ -403,15 +404,25 @@ const TOOL_SPECS: ToolSpec[] = [
     name: "clawchat_send_message",
     label: "Send ClawChat Message",
     description:
-      "Send one deliberate message in the Active ClawChat Turn's conversation. Ordinary assistant text is the default; use this tool when quoting the current message or directing a structured mention adds conversational clarity.",
+      "Send one deliberate message in the Active ClawChat Turn's conversation. Ordinary assistant text is the default. Use this tool for a structured mention or quote; whenever the user asks to reply to or quote the current message, include replyToCurrentMessage: true.",
     requiresGateway: true,
     parameters: Type.Object({
-      text: Type.Optional(Type.String()),
+      text: Type.Optional(Type.String({
+        description: "Message body without manually typed @mentions or quote markup."
+      })),
       mentions: Type.Optional(Type.Array(
-        Type.Object({ userId: Type.String({ minLength: 1 }), display: Type.String({ minLength: 1 }) }),
-        { minItems: 1 }
+        Type.Object({
+          userId: Type.String({ minLength: 1 }),
+          display: Type.String({ minLength: 1 })
+        }),
+        {
+          minItems: 1,
+          description: "Structured users to mention when their attention is intentionally required."
+        }
       )),
-      replyToCurrentMessage: Type.Optional(Type.Boolean())
+      replyToCurrentMessage: Type.Optional(Type.Boolean({
+        description: "Set true whenever the user explicitly asks to reply to or quote the current message."
+      }))
     }),
     execute: sendMessage
   },

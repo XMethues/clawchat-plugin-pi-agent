@@ -1,6 +1,6 @@
 {
   "name": "clawchat-pi-agent",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "ClawChat Protocol v2 extension and headless multi-session host for Pi.",
   "repository": {
     "type": "git",
