@@ -224,6 +224,47 @@ describe("registerClawchatTools", () => {
     }
   });
 
+  it("can complete a turn with an emoji reaction and no follow-up text", async () => {
+    const tools = new Map<string, RegisteredTool>();
+    const sendFrame = vi.fn(async (_frame: Record<string, unknown>) => undefined);
+    const onTerminalCompletion = vi.fn();
+    const pi = { registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool) } as unknown as ExtensionAPI;
+    registerClawchatTools(pi, toolEnvironment({ sendFrame, onTerminalCompletion }));
+    const react = tools.get("clawchat_react_message")!;
+
+    const complete = await react.execute("call-reaction-complete", {
+      chatId: "chat-1",
+      emoji: "👍",
+      completeTurn: true
+    });
+    const nonTerminal = await react.execute("call-reaction-continue", {
+      chatId: "chat-1",
+      emoji: "❤️"
+    });
+
+    expect(sendFrame.mock.calls[0]?.[0]).toMatchObject({
+      event: "message.reaction",
+      chat_id: "chat-1",
+      payload: {
+        target_message_id: "message-1",
+        emoji: "👍",
+        removed: false
+      }
+    });
+    expect(complete.details).toMatchObject({
+      reacted: true,
+      terminal: true,
+      noFollowupReply: true
+    });
+    expect(nonTerminal.details).toEqual({
+      reacted: true,
+      targetMessageId: "message-1",
+      emoji: "❤️",
+      removed: false
+    });
+    expect(onTerminalCompletion).toHaveBeenCalledOnce();
+  });
+
   it("resolves and logs in with an installed Liveware CLI", async () => {
     const directory = await mkdtemp(join(tmpdir(), "clawchat-liveware-tool-"));
     const executable = join(directory, "liveware");

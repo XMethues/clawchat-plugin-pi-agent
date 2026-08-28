@@ -30,6 +30,8 @@ describe("Headless ClawChat Pi Extension", () => {
 
     await controller.beginTurn(inboundMessage());
     const directPrompt = await handlers.get("before_agent_start")!({ systemPrompt: "base" });
+    expect(directPrompt.systemPrompt).toContain("## Conversation posture");
+    expect(directPrompt.systemPrompt).toContain("Set `completeTurn: true` when the reaction is the whole response");
     expect(directPrompt.systemPrompt).not.toContain("## Group response policy");
     expect(directPrompt.systemPrompt).not.toContain("[SILENT]");
     await handlers.get("message_end")!({
@@ -169,7 +171,7 @@ describe("Headless ClawChat Pi Extension", () => {
   });
 
   it.each([
-    [[{ user_id: "agent-user-1" }], "directly mentions you. You must respond", false],
+    [[{ user_id: "agent-user-1" }], "directly mentions you. You must give a visible response", false],
     [[{ user_id: "all" }], "group-wide @everyone mention", true],
     [[], "does not mention you. Default to listening", true]
   ] as const)("injects authoritative group reply policy for mentions %j", async (mentions, expected, allowsSilence) => {
@@ -198,6 +200,7 @@ describe("Headless ClawChat Pi Extension", () => {
 
     expect(prompt.systemPrompt).toContain("## Group response policy");
     expect(prompt.systemPrompt).toContain(expected);
+    expect(prompt.systemPrompt).toContain("Choose the least intrusive response form that feels natural");
     if (allowsSilence) {
       expect(prompt.systemPrompt).toContain("prefer `clawchat_no_reply` as the first and only action");
       expect(prompt.systemPrompt).toContain("output exactly `[SILENT]` as the only assistant text");

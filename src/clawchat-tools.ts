@@ -79,26 +79,43 @@ export function appendClawchatSystemPrompt(
 This runtime includes the inherited \`clawchat-core\` and \`clawchat-liveware\` skills plus registered \`clawchat_*\` tools. Use those tools directly for supported ClawChat operations. Never bypass them with shell commands, curl, scripts, or handwritten HTTP clients. Tool schemas are authoritative; if a named tool is unavailable in this runtime, report that limitation instead of bypassing it.
 
 Normal assistant text is delivered as an ordinary unquoted ClawChat message. When the conversation calls for an explicit reply to the current message, a structured mention, or both, use \`clawchat_send_message\`; a successful call sends the response and suppresses a duplicate normal follow-up.`;
-  if (turn?.chatType !== "group") return capabilities;
+  if (!turn) return capabilities;
+
+  const posture = `${capabilities}
+
+## Conversation posture
+
+Participate like a considerate person, not a notification bot. Choose the least intrusive response form that feels natural:
+
+- Use ordinary assistant text for a substantive contribution.
+- Quote the current message with \`clawchat_send_message\` only when anchoring the reply prevents ambiguity; do not quote every response.
+- Use structured mentions only when deliberately directing a specific participant's attention; do not @ the speaker by default.
+- Use \`clawchat_react_message\` for a lightweight emotional beat such as agreement, thanks, laughter, celebration, sympathy, or acknowledgment. Set \`completeTurn: true\` when the reaction is the whole response.
+- Keep the response proportionate to the conversation, and never explain which delivery mechanism or tool you selected.`;
+  if (turn.chatType === "direct") {
+    return `${posture}
+
+Private chats require a visible response. Do not call \`clawchat_no_reply\` or use the Silent Marker.`;
+  }
 
   const mentionKind = turn.mentionKind ?? "none";
   if (mentionKind === "direct") {
-    return `${capabilities}
+    return `${posture}
 
 ## Group response policy
 
-This message directly mentions you. You must respond normally and must not call \`clawchat_no_reply\` or use the Silent Marker.`;
+This message directly mentions you. You must give a visible response—text, an appropriate reaction, or an explicit reply—and must not call \`clawchat_no_reply\` or use the Silent Marker.`;
   }
   const mentionRule = mentionKind === "everyone"
     ? "This message contains a group-wide @everyone mention. You may still choose a Silent Turn."
     : "This message does not mention you. Default to listening unless a response would add clear value.";
-  return `${capabilities}
+  return `${posture}
 
 ## Group response policy
 
 Before producing assistant text or calling any tool, decide whether this group message needs a response. ${mentionRule}
 
-When the message is unrelated, belongs to the human conversation, or needs no useful response, prefer \`clawchat_no_reply\` as the first and only action. Do not produce assistant text or call another tool. Only if \`clawchat_no_reply\` is unavailable, call no tools and output exactly \`[SILENT]\` as the only assistant text. The marker is uppercase and must contain no other text. Otherwise respond normally.`;
+When the message is unrelated, belongs to the human conversation, or needs no useful response, prefer \`clawchat_no_reply\` as the first and only action. Do not produce assistant text or call another tool. Only if \`clawchat_no_reply\` is unavailable, call no tools and output exactly \`[SILENT]\` as the only assistant text. The marker is uppercase and must contain no other text. Otherwise choose the most natural visible response form above.`;
 }
 
 export async function appendClawchatMemoryPrompt(
@@ -377,7 +394,7 @@ const TOOL_SPECS: ToolSpec[] = [
     name: "clawchat_no_reply",
     label: "Complete ClawChat Turn Without Reply",
     description:
-      "Complete the Active Group Chat Turn without sending a ClawChat message. Use before producing text or calling another tool when no response is useful.",
+      "Stay quiet like a considerate group participant when speaking would add no value. Complete the Active Group Chat Turn without sending a ClawChat message; call this before producing text or using another tool.",
     requiresGateway: true,
     parameters: EMPTY,
     execute: completeWithoutReply
@@ -386,7 +403,7 @@ const TOOL_SPECS: ToolSpec[] = [
     name: "clawchat_send_message",
     label: "Send ClawChat Message",
     description:
-      "Send one message in the Active ClawChat Turn's conversation. Omit replyToCurrentMessage for an ordinary message; set it for an explicit reply; include mentions for structured mentions.",
+      "Send one deliberate message in the Active ClawChat Turn's conversation. Ordinary assistant text is the default; use this tool when quoting the current message or directing a structured mention adds conversational clarity.",
     requiresGateway: true,
     parameters: Type.Object({
       text: Type.Optional(Type.String()),
@@ -401,13 +418,15 @@ const TOOL_SPECS: ToolSpec[] = [
   {
     name: "clawchat_react_message",
     label: "React to ClawChat Message",
-    description: "Add or remove an emoji reaction on a message in the Active ClawChat Turn.",
+    description:
+      "Add or remove an emoji reaction as a lightweight, human acknowledgment. Set completeTurn when the reaction should be the whole response with no follow-up text.",
     requiresGateway: true,
     parameters: Type.Object({
       chatId: Type.String({ minLength: 1 }),
       emoji: Type.String({ minLength: 1 }),
       targetMessageId: Type.Optional(Type.String()),
-      remove: Type.Optional(Type.Boolean())
+      remove: Type.Optional(Type.Boolean()),
+      completeTurn: Type.Optional(Type.Boolean())
     }),
     execute: sendReaction
   },
@@ -827,10 +846,15 @@ async function sendReaction(args: Record<string, unknown>, env: ClawchatToolEnvi
   const turn = requireActiveTurn(env);
   const chatId = requiredString(args.chatId, "chatId");
   if (chatId !== turn.chatId) throw new Error("chatId must match the Active ClawChat Turn");
+  if (args.completeTurn !== undefined && typeof args.completeTurn !== "boolean") {
+    throw new Error("completeTurn must be a boolean");
+  }
   const targetMessageId = typeof args.targetMessageId === "string" && args.targetMessageId.trim()
     ? args.targetMessageId.trim()
     : requiredString(turn.messageId, "targetMessageId");
   const emoji = requiredString(args.emoji, "emoji");
+  const removed = args.remove === true;
+  const completeTurn = args.completeTurn === true;
   await env.sendFrame?.({
     version: "2",
     event: "message.reaction",
@@ -838,9 +862,21 @@ async function sendReaction(args: Record<string, unknown>, env: ClawchatToolEnvi
     emitted_at: env.now?.() ?? Date.now(),
     chat_id: chatId,
     to: { id: chatId, type: turn.chatType },
-    payload: { target_message_id: targetMessageId, emoji, removed: args.remove === true }
+    payload: { target_message_id: targetMessageId, emoji, removed }
   });
-  return { reacted: true, targetMessageId, emoji, removed: args.remove === true };
+  return {
+    reacted: true,
+    targetMessageId,
+    emoji,
+    removed,
+    ...(completeTurn
+      ? {
+          terminal: true,
+          noFollowupReply: true,
+          instruction: "Reaction sent as the complete response. Do not produce assistant text or call another tool."
+        }
+      : {})
+  };
 }
 
 function requireActiveTurn(env: ClawchatToolEnvironment): ActiveClawchatTurn {

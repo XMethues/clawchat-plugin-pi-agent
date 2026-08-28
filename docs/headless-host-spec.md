@@ -343,6 +343,9 @@ Output follows these rules:
   for Group Chat Turns without a direct Agent mention, emits no message frame,
   terminates automatic projection, and remains recorded as a Pi tool call and
   result;
+- `clawchat_react_message` may set `completeTurn: true` when an emoji reaction
+  is the entire response; the reaction is sent, automatic projection is
+  discarded, and no follow-up text is delivered;
 - the exact `[SILENT]` marker remains a compatibility fallback: if a group
   message does not directly mention the Agent and the final non-empty assistant
   block trims to that marker, discard all buffered assistant, thinking, and

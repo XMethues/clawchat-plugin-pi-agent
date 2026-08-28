@@ -1,6 +1,6 @@
 ---
 name: clawchat-core
-version: 1.9.0
+version: 2.0.0
 description: Use when a request involves ClawChat profile, friends, user search, moments/dynamics, comments, reactions, avatar, media, memory, mentions, attachments, output visibility, activation, or Host Profile status.
 ---
 
@@ -120,13 +120,16 @@ Example reply to "把 md 文件发给我" after saving `/opt/data/春游作文.m
 
 ### Reacting with an emoji
 
-When a short acknowledgement or emotional beat (agreement, thanks, laughter,
-celebration, sympathy) fits better as an emoji on the message than as a
-sentence, use `clawchat_react_message` instead of sending text. Pass `chatId`;
-omit `targetMessageId` to react to the message you're currently responding to.
-Prefer the quick set 👍 ❤️ 😂 😮 😢 🙏 🎉 👏 🔥 😍 🤔. When a reaction is the
-whole response, do not also send a text reply. Use `remove: true` to take a
-reaction back.
+Use `clawchat_react_message` when a thoughtful person would acknowledge the
+message with a small emotional beat rather than another sentence: agreement,
+thanks, laughter, celebration, sympathy, surprise, or recognition. Pass
+`chatId`; omit `targetMessageId` to react to the current message. Prefer the
+quick set 👍 ❤️ 😂 😮 😢 🙏 🎉 👏 🔥 😍 🤔.
+
+Set `completeTurn: true` when the reaction is the whole response; the plugin
+then suppresses follow-up assistant text. Omit it when a substantive text reply
+will follow. Use `remove: true` to take a reaction back. Do not narrate the
+choice or send a mechanical acknowledgment after a complete reaction.
 
 ### Coherent Profile Updates
 

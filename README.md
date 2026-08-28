@@ -174,6 +174,12 @@ Set dispatch behavior from a group conversation:
 
 `mention` is the default group mode. Direct messages always dispatch.
 
+Pi chooses the least intrusive response form from context: ordinary text for a
+substantive contribution, a quoted reply when anchoring prevents ambiguity, a
+structured mention when deliberately addressing someone, or an emoji reaction
+for a lightweight human acknowledgment. A reaction with `completeTurn: true`
+is the whole response and produces no follow-up text.
+
 Group chats default to listening. For a message with no useful response, Pi
 prefers the structured `clawchat_no_reply` tool, which completes the Turn
 without a persistent ClawChat message. Exact uppercase `[SILENT]` remains a
