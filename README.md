@@ -175,12 +175,14 @@ Set dispatch behavior from a group conversation:
 `mention` is the default group mode. Direct messages always dispatch.
 
 Group chats default to listening. For a message with no useful response, Pi
-produces the exact uppercase marker `[SILENT]`; the plugin retains that Turn in
-Pi history but sends no persistent ClawChat message. A direct structured
-mention of the Agent always requires a response, while `@everyone` may remain
-silent. Group `minimal`, `normal`, and `full` output is delivered only after
-the Turn settles so a Silent Turn can suppress the complete automatic output;
-private chats keep their existing immediate behavior.
+prefers the structured `clawchat_no_reply` tool, which completes the Turn
+without a persistent ClawChat message. Exact uppercase `[SILENT]` remains a
+compatibility fallback when the tool is unavailable; both paths remain visible
+in Pi history. A direct structured mention of the Agent always requires a
+response, while `@everyone` may remain silent. Group `minimal`, `normal`, and
+`full` output is delivered only after the Turn settles so a Silent Turn can
+suppress the complete automatic output; private chats keep their existing
+immediate behavior.
 
 ### Running the Host
 

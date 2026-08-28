@@ -60,14 +60,14 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
   });
   let active: ActiveHostedSessionBinding | undefined;
   let piApi: ExtensionAPI | undefined;
-  let terminalReplySent = false;
+  let terminalCompletion = false;
 
   const activate = async (binding: ActiveHostedSessionBinding): Promise<void> => {
     if (active) {
       throw new Error(`A Hosted Session Binding is already active for ${active.target.chatId}`);
     }
     active = binding;
-    terminalReplySent = false;
+    terminalCompletion = false;
     if (!binding.projectOutput) return;
     try {
       await projector.beginTurn(binding.target);
@@ -86,7 +86,7 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
       if (active.projectOutput) await projector.endTurn();
     } finally {
       active = undefined;
-      terminalReplySent = false;
+      terminalCompletion = false;
     }
   };
 
@@ -135,7 +135,7 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
     event: MessageEndEvent | ToolExecutionStartEvent | ToolExecutionEndEvent
   ): Promise<void> => {
     if (!active || !active.projectOutput || !piApi) return;
-    if (terminalReplySent && (event.type === "message_end" || event.type === "tool_execution_end")) return;
+    if (terminalCompletion && (event.type === "message_end" || event.type === "tool_execution_end")) return;
     try {
       await projector.handle(event as PiOutputEvent, active.outputMode);
     } catch (error: unknown) {
@@ -167,8 +167,8 @@ export function createHeadlessClawchatPiExtension(options: HeadlessClawchatPiExt
                 }
               : {})
           }),
-        onTerminalSend: () => {
-          terminalReplySent = true;
+        onTerminalCompletion: () => {
+          terminalCompletion = true;
           projector.discardPendingOutput();
         }
       });

@@ -128,11 +128,51 @@ describe("Headless ClawChat Pi Extension", () => {
     expect(sent.filter((message) => message.event === "message.send")).toHaveLength(0);
   });
 
+  it("discards buffered group output after the no-reply tool completes the turn", async () => {
+    const handlers = new Map<string, Function>();
+    const registeredTools = new Map<string, { execute: (id: string, args: unknown) => Promise<{ details: unknown }> }>();
+    const sent: ClawchatOutboundMessage[] = [];
+    const sendFrame = vi.fn(async () => undefined);
+    const { extension, controller } = createHeadlessClawchatPiExtension({
+      transport: { send: async (message) => { sent.push(message); } },
+      outputMode: () => "normal",
+      tools: {
+        api: {},
+        memory: {},
+        profile: () => ({ agent: { userId: "agent-user-1" } }),
+        sendFrame
+      } as never
+    });
+    extension({
+      on: (event: string, handler: Function) => handlers.set(event, handler),
+      registerTool: (tool: {
+        name: string;
+        execute: (id: string, args: unknown) => Promise<{ details: unknown }>;
+      }) => registeredTools.set(tool.name, tool)
+    } as never);
+    const inbound = inboundMessage();
+    inbound.chat_type = "group";
+    inbound.sender.type = "group";
+    inbound.payload.message.context = { mentions: [], reply: null };
+
+    await controller.beginTurn(inbound);
+    await handlers.get("message_end")!({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "buffered" }] }
+    });
+    const result = await registeredTools.get("clawchat_no_reply")!.execute("call-silent", {});
+    await handlers.get("agent_settled")!({ type: "agent_settled" });
+
+    expect(result.details).toMatchObject({ ok: true, silent: true, terminal: true });
+    expect(sendFrame).not.toHaveBeenCalled();
+    expect(sent.map((message) => message.event)).toEqual(["typing.update", "typing.update"]);
+  });
+
   it.each([
-    [[{ user_id: "agent-user-1" }], "directly mentions you. You must respond"],
-    [[{ user_id: "all" }], "group-wide @everyone mention"],
-    [[], "does not mention you. Default to listening"]
-  ] as const)("injects authoritative group reply policy for mentions %j", async (mentions, expected) => {
+    [[{ user_id: "agent-user-1" }], "directly mentions you. You must respond", false],
+    [[{ user_id: "all" }], "group-wide @everyone mention", true],
+    [[], "does not mention you. Default to listening", true]
+  ] as const)("injects authoritative group reply policy for mentions %j", async (mentions, expected, allowsSilence) => {
     const handlers = new Map<string, Function>();
     const { extension, controller } = createHeadlessClawchatPiExtension({
       transport: { send: async () => undefined },
@@ -158,7 +198,13 @@ describe("Headless ClawChat Pi Extension", () => {
 
     expect(prompt.systemPrompt).toContain("## Group response policy");
     expect(prompt.systemPrompt).toContain(expected);
-    expect(prompt.systemPrompt).toContain("output exactly `[SILENT]` as the only assistant text");
+    if (allowsSilence) {
+      expect(prompt.systemPrompt).toContain("prefer `clawchat_no_reply` as the first and only action");
+      expect(prompt.systemPrompt).toContain("output exactly `[SILENT]` as the only assistant text");
+    } else {
+      expect(prompt.systemPrompt).toContain("must not call `clawchat_no_reply`");
+      expect(prompt.systemPrompt).not.toContain("[SILENT]");
+    }
   });
 
   it("binds an Awareness Turn to owner memory and tools without projecting model text", async () => {

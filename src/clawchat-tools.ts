@@ -44,7 +44,7 @@ export interface ClawchatToolEnvironment {
   activeTurn?: () => ActiveClawchatTurn | undefined;
   sendFrame?: (frame: Record<string, unknown>) => Promise<void>;
   recordToolCall?: (record: ClawchatToolCallRecord) => void;
-  onTerminalSend?: () => void;
+  onTerminalCompletion?: () => void;
   onConversationLeft?: (chatId: string) => Promise<void>;
   livewareExecutable?: string;
   ensureLivewareExecutable?: () => Promise<string>;
@@ -82,18 +82,23 @@ Normal assistant text is delivered as an ordinary unquoted ClawChat message. Whe
   if (turn?.chatType !== "group") return capabilities;
 
   const mentionKind = turn.mentionKind ?? "none";
-  const mentionRule = mentionKind === "direct"
-    ? "This message directly mentions you. You must respond and must not use the Silent Marker."
-    : mentionKind === "everyone"
-      ? "This message contains a group-wide @everyone mention. You may still choose a Silent Turn."
-      : "This message does not mention you. Default to listening unless a response would add clear value.";
+  if (mentionKind === "direct") {
+    return `${capabilities}
+
+## Group response policy
+
+This message directly mentions you. You must respond normally and must not call \`clawchat_no_reply\` or use the Silent Marker.`;
+  }
+  const mentionRule = mentionKind === "everyone"
+    ? "This message contains a group-wide @everyone mention. You may still choose a Silent Turn."
+    : "This message does not mention you. Default to listening unless a response would add clear value.";
   return `${capabilities}
 
 ## Group response policy
 
 Before producing assistant text or calling any tool, decide whether this group message needs a response. ${mentionRule}
 
-When the message is unrelated, belongs to the human conversation, or needs no useful response, call no tools and output exactly \`[SILENT]\` as the only assistant text. The marker is uppercase and must contain no other text. Otherwise respond normally.`;
+When the message is unrelated, belongs to the human conversation, or needs no useful response, prefer \`clawchat_no_reply\` as the first and only action. Do not produce assistant text or call another tool. Only if \`clawchat_no_reply\` is unavailable, call no tools and output exactly \`[SILENT]\` as the only assistant text. The marker is uppercase and must contain no other text. Otherwise respond normally.`;
 }
 
 export async function appendClawchatMemoryPrompt(
@@ -124,7 +129,7 @@ export function registerClawchatTools(pi: ExtensionAPI, environment: ClawchatToo
         const startedAt = Date.now();
         try {
           const result = await spec.execute(args, environment);
-          if (isUnknownRecord(result) && result.terminal === true) environment.onTerminalSend?.();
+          if (isUnknownRecord(result) && result.terminal === true) environment.onTerminalCompletion?.();
           recordToolCallSafely(environment, {
             toolName: spec.name,
             args,
@@ -368,6 +373,15 @@ const TOOL_SPECS: ToolSpec[] = [
         user_id: requiredString(args.userId, "userId")
       })
   ),
+  {
+    name: "clawchat_no_reply",
+    label: "Complete ClawChat Turn Without Reply",
+    description:
+      "Complete the Active Group Chat Turn without sending a ClawChat message. Use before producing text or calling another tool when no response is useful.",
+    requiresGateway: true,
+    parameters: EMPTY,
+    execute: completeWithoutReply
+  },
   {
     name: "clawchat_send_message",
     label: "Send ClawChat Message",
@@ -709,6 +723,25 @@ async function pullGroupMetadata(
     ...target,
     metadata: current.metadata,
     partialFailures: failures
+  };
+}
+
+async function completeWithoutReply(
+  _args: Record<string, unknown>,
+  env: ClawchatToolEnvironment
+): Promise<unknown> {
+  const turn = requireActiveTurn(env);
+  if (turn.chatType !== "group" || turn.mentionKind === "direct") {
+    throw new Error(
+      "clawchat_no_reply is available only for group messages that do not directly mention the Agent"
+    );
+  }
+  return {
+    ok: true,
+    silent: true,
+    terminal: true,
+    noFollowupReply: true,
+    instruction: "Silent Turn selected. Do not produce assistant text or call another tool."
   };
 }
 

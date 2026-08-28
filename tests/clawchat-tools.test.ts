@@ -21,11 +21,12 @@ describe("registerClawchatTools", () => {
 
     const names = registerClawchatTools(pi, environment);
 
-    expect(names).toHaveLength(34);
+    expect(names).toHaveLength(35);
     expect(names).toEqual(expect.arrayContaining([
       "clawchat_memory_search",
       "clawchat_metadata_update",
       "clawchat_send_friend_request",
+      "clawchat_no_reply",
       "clawchat_send_message",
       "clawchat_react_message",
       "clawchat_liveware_login"
@@ -104,9 +105,9 @@ describe("registerClawchatTools", () => {
   it("sends ordinary, reply, and mention messages into the Active ClawChat Turn", async () => {
     const tools = new Map<string, RegisteredTool>();
     const sendFrame = vi.fn(async (_frame: Record<string, unknown>) => undefined);
-    const onTerminalSend = vi.fn();
+    const onTerminalCompletion = vi.fn();
     const pi = { registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool) } as unknown as ExtensionAPI;
-    registerClawchatTools(pi, toolEnvironment({ sendFrame, onTerminalSend }));
+    registerClawchatTools(pi, toolEnvironment({ sendFrame, onTerminalCompletion }));
     const sendMessage = tools.get("clawchat_send_message")!;
 
     const ordinary = await sendMessage.execute("call-1", { text: "ordinary answer" });
@@ -174,11 +175,53 @@ describe("registerClawchatTools", () => {
       noFollowupReply: true,
       traceId: "pi-tool-trace-1"
     });
-    expect(onTerminalSend).toHaveBeenCalledTimes(3);
+    expect(onTerminalCompletion).toHaveBeenCalledTimes(3);
 
     const rejected = await sendMessage.execute("call-4", {});
     expect(rejected.details).toMatchObject({ error: "validation" });
     expect(sendFrame).toHaveBeenCalledTimes(3);
+  });
+
+  it("completes eligible group turns without sending and rejects required replies", async () => {
+    const tools = new Map<string, RegisteredTool>();
+    const sendFrame = vi.fn(async (_frame: Record<string, unknown>) => undefined);
+    const onTerminalCompletion = vi.fn();
+    const pi = { registerTool: (tool: RegisteredTool) => tools.set(tool.name, tool) } as unknown as ExtensionAPI;
+    registerClawchatTools(pi, toolEnvironment({ sendFrame, onTerminalCompletion }));
+
+    const result = await tools.get("clawchat_no_reply")!.execute("call-silent", {});
+
+    expect(result.details).toEqual({
+      ok: true,
+      silent: true,
+      terminal: true,
+      noFollowupReply: true,
+      instruction: "Silent Turn selected. Do not produce assistant text or call another tool."
+    });
+    expect(sendFrame).not.toHaveBeenCalled();
+    expect(onTerminalCompletion).toHaveBeenCalledOnce();
+
+    for (const activeTurn of [
+      { chatId: "chat-1", chatType: "group" as const, mentionKind: "direct" as const },
+      { chatId: "chat-1", chatType: "direct" as const }
+    ]) {
+      const rejectedTools = new Map<string, RegisteredTool>();
+      const rejectedPi = {
+        registerTool: (tool: RegisteredTool) => rejectedTools.set(tool.name, tool)
+      } as unknown as ExtensionAPI;
+      const rejectedCompletion = vi.fn();
+      registerClawchatTools(rejectedPi, toolEnvironment({
+        activeTurn: () => activeTurn,
+        sendFrame,
+        onTerminalCompletion: rejectedCompletion
+      }));
+      const rejected = await rejectedTools.get("clawchat_no_reply")!.execute("call-rejected", {});
+      expect(rejected.details).toMatchObject({
+        error: "validation",
+        message: "clawchat_no_reply is available only for group messages that do not directly mention the Agent"
+      });
+      expect(rejectedCompletion).not.toHaveBeenCalled();
+    }
   });
 
   it("resolves and logs in with an installed Liveware CLI", async () => {

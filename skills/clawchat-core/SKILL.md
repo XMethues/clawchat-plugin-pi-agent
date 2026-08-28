@@ -1,6 +1,6 @@
 ---
 name: clawchat-core
-version: 1.8.0
+version: 1.9.0
 description: Use when a request involves ClawChat profile, friends, user search, moments/dynamics, comments, reactions, avatar, media, memory, mentions, attachments, output visibility, activation, or Host Profile status.
 ---
 
@@ -97,9 +97,10 @@ For moments/dynamics, list first when the user refers to "this", "latest", "that
 In group chats, default to listening and decide before producing text or
 calling any tool. A direct structured mention of this Agent requires a normal
 response. For an unrelated message, human-to-human conversation, or message
-that needs no useful response, call no tools and output exact uppercase
-`[SILENT]` as the only assistant text. A group-wide `@everyone` mention may
-still be silent. Never use the marker in a direct chat.
+that needs no useful response, call `clawchat_no_reply` as the first and only
+action. If that registered tool is unavailable, call no tools and output exact
+uppercase `[SILENT]` as the only assistant text. A group-wide `@everyone`
+mention may still be silent. Never use either silent path in a direct chat.
 
 ### Sending a File, Image, or Voice Message
 

@@ -339,11 +339,16 @@ Output follows these rules:
   completed tool output;
 - direct chats retain their current projection timing, while group chats buffer
   every automatically selected event until the Turn settles;
-- if a group message does not directly mention the Agent and the final
-  non-empty assistant block trims to exact uppercase `[SILENT]`, discard all
-  buffered assistant, thinking, and tool projection while retaining Pi session
-  history; also suppress the observed truncated form `[SILENT` as a narrow
-  marker-leak safety fallback without changing the model contract;
+- `clawchat_no_reply` is the preferred Silent Turn interface: it succeeds only
+  for Group Chat Turns without a direct Agent mention, emits no message frame,
+  terminates automatic projection, and remains recorded as a Pi tool call and
+  result;
+- the exact `[SILENT]` marker remains a compatibility fallback: if a group
+  message does not directly mention the Agent and the final non-empty assistant
+  block trims to that marker, discard all buffered assistant, thinking, and
+  tool projection while retaining Pi session history; also suppress the
+  observed truncated form `[SILENT` narrowly without changing the model
+  contract;
 - a direct Agent mention is ineligible for a Silent Turn, so an erroneous
   `[SILENT]` marker is projected as ordinary assistant text;
 - group Turn abort discards all buffered projection; `typing.update` remains
