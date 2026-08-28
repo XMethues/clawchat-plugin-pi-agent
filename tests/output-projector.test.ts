@@ -351,6 +351,24 @@ describe("ClawchatOutputProjector", () => {
     expect(sent.map((message) => message.event)).toEqual(["typing.update", "typing.update"]);
   });
 
+  it("suppresses the observed SILENT marker missing its closing bracket", async () => {
+    const sent: ClawchatOutboundMessage[] = [];
+    const projector = new ClawchatOutputProjector({
+      transport: { send: async (message) => { sent.push(message); } }
+    });
+    const inbound = inboundMessage();
+    inbound.chat_type = "group";
+    inbound.sender.type = "group";
+    await projector.beginTurn(outputTurnFromInbound(inbound));
+    await projector.handle({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "[SILENT" }] }
+    } as unknown as MessageEndEvent, "normal");
+    await projector.endTurn();
+
+    expect(sent.map((message) => message.event)).toEqual(["typing.update", "typing.update"]);
+  });
+
   it("does not silence a direct Agent mention or a lowercase marker", async () => {
     const directMentionSent: ClawchatOutboundMessage[] = [];
     const directMentionProjector = new ClawchatOutputProjector({

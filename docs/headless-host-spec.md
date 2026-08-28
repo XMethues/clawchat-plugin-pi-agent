@@ -342,7 +342,8 @@ Output follows these rules:
 - if a group message does not directly mention the Agent and the final
   non-empty assistant block trims to exact uppercase `[SILENT]`, discard all
   buffered assistant, thinking, and tool projection while retaining Pi session
-  history;
+  history; also suppress the observed truncated form `[SILENT` as a narrow
+  marker-leak safety fallback without changing the model contract;
 - a direct Agent mention is ineligible for a Silent Turn, so an erroneous
   `[SILENT]` marker is projected as ordinary assistant text;
 - group Turn abort discards all buffered projection; `typing.update` remains

@@ -246,7 +246,7 @@ function isSilentGroupTurn(
     const event = output[index]!.event;
     if (event.type !== "message_end") continue;
     const text = assistantText(event).trim();
-    if (text) return text === "[SILENT]";
+    if (text) return text === "[SILENT]" || text === "[SILENT";
   }
   return false;
 }
